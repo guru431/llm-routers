@@ -41,7 +41,7 @@ module.exports = async function router(req, config) {
     return `opencode,${model}`;
   }
 
-  // Claude name (claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5, etc.)
+  // Claude name (claude-opus-4-8, claude-sonnet-4-6, claude-haiku-4-5, etc.)
   // → fall back to built-in routing (Router.default / .background / .think etc.)
   return null;
 }

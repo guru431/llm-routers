@@ -165,7 +165,7 @@ def main():
     lines.append(f"**Запущен с:** локальная Windows-машина")
     lines.append(f"**Моделей:** {len(rows)} ({sum(1 for r in rows if not r.get('skip'))} активных)")
     lines.append(f"**Задач:** {len(tasks)} (RU-edit, YT-summary EN/RU, JSON-extract, RU→EN translate, classify, bash one-liner, Python function)")
-    lines.append(f"**Judge:** claude-opus-4-7 (через agent server, температура 0)")
+    lines.append(f"**Judge:** claude-opus-4-8 (через agent server, температура 0)")
     lines.append("")
 
     # === TL;DR ===

@@ -8,7 +8,7 @@ Endpoints:
     DELETE /cache              — Очистить response cache
 
 Env:
-    CLAUDE_AGENT_MODEL      — модель (default: claude-opus-4-7)
+    CLAUDE_AGENT_MODEL      — модель (default: claude-opus-4-8)
     CLAUDE_AGENT_PORT       — порт (default: 8765)
     CLAUDE_AGENT_CACHE      — '1'/'0' включить response cache (default: '1')
     CLAUDE_AGENT_CACHE_SIZE — макс. записей в кэше (default: 256, LRU eviction)
@@ -39,9 +39,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("claude-agent-server")
 
-MODEL = os.getenv("CLAUDE_AGENT_MODEL", "claude-opus-4-7")
+MODEL = os.getenv("CLAUDE_AGENT_MODEL", "claude-opus-4-8")
 MODELS = [
-    "claude-opus-4-7",
+    "claude-opus-4-8",
     "claude-sonnet-4-6",
     "claude-haiku-4-5-20251001",
 ]

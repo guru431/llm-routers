@@ -57,7 +57,7 @@
     {"id": "ollama-gpt-oss-20b",  "provider": "ollama",     "endpoint": "http://localhost:11434", "model": "gpt-oss:20b",         "auth_env": null, "api": "ollama"},
     {"id": "ollama-qwen3-vl-8b",  "provider": "ollama",     "endpoint": "http://localhost:11434", "model": "qwen3-vl:8b-instruct","auth_env": null, "api": "ollama"},
 
-    {"id": "claude-opus-4-7",     "provider": "claude_agent", "endpoint": "http://localhost:8765/v1", "model": "claude-opus-4-7",         "auth_env": null},
+    {"id": "claude-opus-4-8",     "provider": "claude_agent", "endpoint": "http://localhost:8765/v1", "model": "claude-opus-4-8",         "auth_env": null},
     {"id": "claude-sonnet-4-6",   "provider": "claude_agent", "endpoint": "http://localhost:8765/v1", "model": "claude-sonnet-4-6",       "auth_env": null},
     {"id": "claude-haiku-4-5",    "provider": "claude_agent", "endpoint": "http://localhost:8765/v1", "model": "claude-haiku-4-5-20251001","auth_env": null}
   ]

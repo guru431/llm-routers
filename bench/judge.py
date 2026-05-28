@@ -1,6 +1,6 @@
 """LLM-as-judge scoring for benchmark results.
 
-For each (task, model_response) pair, asks claude-opus-4-7 via agent server
+For each (task, model_response) pair, asks claude-opus-4-8 via agent server
 to score the response 0-5 with brief reasoning. Writes scores to
 bench/results/_judge.jsonl (key: model_id+task_id).
 
@@ -27,7 +27,7 @@ RESULTS = ROOT / "results"
 JUDGE_FILE = RESULTS / "_judge.jsonl"
 
 JUDGE_ENDPOINT = os.environ.get("JUDGE_ENDPOINT", "http://localhost:8765/v1/chat/completions")
-JUDGE_MODEL = "claude-opus-4-7"
+JUDGE_MODEL = "claude-opus-4-8"
 
 RUBRIC = {
     "edit": "Оцени правку русской устной речи. 5=идеально (пунктуация, без слов-паразитов, смысл не изменён), 3=ok с минорами, 1=серьёзные искажения смысла, 0=мусор/пусто/отказ.",

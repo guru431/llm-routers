@@ -70,7 +70,7 @@ curl -X POST http://localhost:8765/v1/chat/completions \
 {
   "id": "chatcmpl-abc123",
   "object": "chat.completion",
-  "model": "claude-opus-4-7",
+  "model": "claude-opus-4-8",
   "choices": [{
     "index": 0,
     "message": {"role": "assistant", "content": "Привет, мир"},
@@ -82,7 +82,7 @@ curl -X POST http://localhost:8765/v1/chat/completions \
 
 Параметры в body:
 - `messages` (required) — массив `{role, content}`. Роли: `system`, `user`, `assistant`, `tool`
-- `model` (optional) — `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` (см. `/v1/models`)
+- `model` (optional) — `claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` (см. `/v1/models`)
 - `tools` (optional) — массив определений функций в OpenAI-формате; вызовы парсятся из `<tool_call>` блоков ответа
 - `timeout` (optional) — таймаут в секундах (default 300)
 
@@ -98,7 +98,7 @@ curl http://localhost:8765/v1/models
 
 ```bash
 curl http://localhost:8765/health
-# {"status": "ok", "model": "claude-opus-4-7", "uptime": 3600}
+# {"status": "ok", "model": "claude-opus-4-8", "uptime": 3600}
 ```
 
 ## Конфигурация
@@ -107,7 +107,7 @@ curl http://localhost:8765/health
 
 | Переменная | По умолчанию | Описание |
 |---|---|---|
-| `CLAUDE_AGENT_MODEL` | `claude-opus-4-7` | Модель по умолчанию |
+| `CLAUDE_AGENT_MODEL` | `claude-opus-4-8` | Модель по умолчанию |
 | `CLAUDE_AGENT_PORT` | `8765` | Порт сервера |
 
 ## Использование
@@ -119,7 +119,7 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:8765/v1", api_key="unused")
 resp = client.chat.completions.create(
-    model="claude-opus-4-7",
+    model="claude-opus-4-8",
     messages=[{"role": "user", "content": "Привет"}],
 )
 print(resp.choices[0].message.content)
@@ -156,7 +156,7 @@ Tool calling эмулируется через prompt injection: описани�
 
 ```python
 client.chat.completions.create(
-    model="claude-opus-4-7",
+    model="claude-opus-4-8",
     messages=[{"role": "user", "content": "Какая погода в Москве?"}],
     tools=[{
         "type": "function",
