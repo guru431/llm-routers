@@ -1,0 +1,40 @@
+ {
+   "LOG": true,
+   "LOG_LEVEL": "debug",
+   "HOST": "0.0.0.0",
+   "PORT": 3456,
+   "APIKEY": "<CCR_APIKEY_HERE>",
+   "API_TIMEOUT_MS": "600000",
+   "Providers": [
+	{
+   	"name": "opencode",
+   	"api_base_url": "https://opencode.ai/zen/go/v1/chat/completions",
+   	"api_key": "<OPENCODE_GO_KEY_HERE>",
+   	"models": [
+     	"glm-5.1",
+     	"glm-5",
+     	"kimi-k2.5",
+     	"kimi-k2.6",
+     	"mimo-v2-pro",
+     	"mimo-v2-omni",
+     	"mimo-v2.5-pro",
+     	"mimo-v2.5",
+     	"minimax-m2.7",
+     	"minimax-m2.5",
+     	"qwen3.6-plus",
+     	"qwen3.5-plus",
+     	"deepseek-v4-pro",
+     	"deepseek-v4-flash"
+   	]
+	}
+   ],
+   "Router": {
+	"default": "opencode,minimax-m2.7",
+	"background": "opencode,minimax-m2.7",
+	"think": "opencode,minimax-m2.7",
+	"longContext": "opencode,minimax-m2.7",
+	"longContextThreshold": 80000,
+	"webSearch": "opencode,minimax-m2.7"
+   },
+   "CUSTOM_ROUTER_PATH": "C:\\Users\\<USERNAME>\\.claude-code-router\\custom_router.js"
+ }

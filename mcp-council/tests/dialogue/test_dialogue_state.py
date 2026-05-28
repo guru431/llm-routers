@@ -1,0 +1,143 @@
+"""Tests for dialogue.state — DialogueState lifecycle, snapshot, cancel, caps."""
+
+import asyncio
+import time
+
+import pytest
+
+from dialogue import state as dialogue_state
+from dialogue.state import (
+    DialogueState,
+    MAX_ACTIVE_SESSIONS,
+    INACTIVE_TIMEOUT_SECONDS,
+    cancel_session,
+    create_session,
+    get_session,
+    list_sessions,
+    mark_phase,
+    snapshot,
+)
+
+
+async def test_create_session_returns_state_with_unique_id():
+    s1 = await create_session(mode="debate", question_preview="why X?", total_rounds=5)
+    s2 = await create_session(mode="panel", question_preview="why Y?", total_rounds=3)
+    assert s1.session_id.startswith("dlg-")
+    assert s1.session_id != s2.session_id
+    assert s1.mode == "debate"
+    assert s1.total_rounds == 5
+    assert s1.phase == "starting"
+    assert s1.current_round == 0
+
+
+async def test_get_session_returns_none_for_unknown():
+    assert await get_session("dlg-nope") is None
+
+
+async def test_get_session_returns_state_after_create():
+    s = await create_session(mode="socratic", question_preview="q", total_rounds=2)
+    got = await get_session(s.session_id)
+    assert got is s
+
+
+async def test_list_sessions_newest_first():
+    s1 = await create_session(mode="debate", question_preview="a", total_rounds=1)
+    await asyncio.sleep(0.01)
+    s2 = await create_session(mode="panel", question_preview="b", total_rounds=1)
+    items = await list_sessions(limit=10)
+    assert [s.session_id for s in items] == [s2.session_id, s1.session_id]
+
+
+async def test_mark_phase_updates_timestamps():
+    s = await create_session(mode="debate", question_preview="q", total_rounds=1)
+    assert s.started_at is None
+    mark_phase(s, "round_1_critique")
+    assert s.started_at is not None
+    assert s.phase == "round_1_critique"
+    mark_phase(s, "done")
+    assert s.finished_at is not None
+
+
+async def test_cancel_session_running_marks_cancelled():
+    s = await create_session(mode="debate", question_preview="q", total_rounds=1)
+    mark_phase(s, "round_1_critique")
+    ok = await cancel_session(s.session_id)
+    assert ok is True
+    assert s.phase == "cancelled"
+    assert s.finished_at is not None
+
+
+async def test_cancel_session_unknown_returns_false():
+    assert await cancel_session("dlg-nope") is False
+
+
+async def test_cancel_session_already_done_returns_false():
+    s = await create_session(mode="debate", question_preview="q", total_rounds=1)
+    mark_phase(s, "done")
+    assert await cancel_session(s.session_id) is False
+
+
+async def test_snapshot_basic_shape():
+    s = await create_session(mode="debate", question_preview="q", total_rounds=5)
+    s.participants = [
+        {"id": "glm", "model": "glm-5.1", "position": "X is better"},
+        {"id": "kimi", "model": "kimi-k2.6", "position": "Y is better"},
+    ]
+    s.current_round = 2
+    mark_phase(s, "round_2_response")
+    snap = snapshot(s)
+    assert snap["session_id"] == s.session_id
+    assert snap["mode"] == "debate"
+    assert snap["phase"] == "round_2_response"
+    assert snap["current_round"] == 2
+    assert snap["total_rounds"] == 5
+    assert len(snap["participants"]) == 2
+    assert snap["elapsed_ms"] is not None
+    assert snap["error"] is None
+
+
+async def test_active_sessions_hard_cap():
+    """When MAX_ACTIVE_SESSIONS reached, create_session raises."""
+    for _ in range(MAX_ACTIVE_SESSIONS):
+        await create_session(mode="debate", question_preview="q", total_rounds=1)
+    with pytest.raises(RuntimeError) as exc:
+        await create_session(mode="debate", question_preview="q", total_rounds=1)
+    assert "active sessions" in str(exc.value).lower()
+
+
+async def test_active_sessions_cap_releases_done_first():
+    """Done sessions count toward the cap until pruned, but pruning happens
+    opportunistically inside create_session. Verify that marking sessions done
+    + creating new ones works once over the threshold."""
+    sessions = []
+    for _ in range(MAX_ACTIVE_SESSIONS):
+        sessions.append(await create_session(mode="debate", question_preview="q", total_rounds=1))
+    # Mark half done (pruning happens on next create attempt)
+    for s in sessions[: MAX_ACTIVE_SESSIONS // 2]:
+        mark_phase(s, "done")
+        s.last_activity = time.time() - INACTIVE_TIMEOUT_SECONDS - 10  # make them stale
+    # New create should succeed because stale done sessions got GC'd.
+    new_s = await create_session(mode="debate", question_preview="q", total_rounds=1)
+    assert new_s.session_id.startswith("dlg-")
+
+
+async def test_attach_task_and_cancel_propagates():
+    """cancel_session should call task.cancel() on the bound asyncio.Task."""
+    s = await create_session(mode="debate", question_preview="q", total_rounds=1)
+    mark_phase(s, "round_1_critique")
+
+    cancelled_flag = {"v": False}
+
+    async def fake_long_running():
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled_flag["v"] = True
+            raise
+
+    task = asyncio.create_task(fake_long_running())
+    dialogue_state.attach_task(s, task)
+    await cancel_session(s.session_id)
+    # Give the event loop a tick to propagate the cancel
+    await asyncio.sleep(0.05)
+    assert cancelled_flag["v"] is True

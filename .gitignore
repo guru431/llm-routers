@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+logs/
+mcp-*/logs/
+
+# Claude Code local settings (могут содержать API-ключи)
+.claude/
+
+# CCR config содержит API-ключи (см. claude-code-router/README.md, template — config.example.json)
+claude-code-router/config.json
+
+# Key vault (если используете bench/ с локальным vault)
+secrets/
+
+# Internal design docs (kept local, not published)
+docs/

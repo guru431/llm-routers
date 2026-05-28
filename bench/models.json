@@ -1,0 +1,64 @@
+{
+  "_meta": {
+    "version": 1,
+    "date": "2026-05-15",
+    "note": "All endpoints OpenAI-compatible unless 'api' field overrides. Each entry: id, provider, endpoint, model, auth_env, api(default 'openai'), notes."
+  },
+  "models": [
+    {"id": "ocg-minimax-m2.7",    "provider": "opencode_go", "endpoint": "https://opencode.ai/zen/go/v1", "model": "minimax-m2.7",     "auth_env": "OPENCODE_GO_KEY"},
+    {"id": "ocg-minimax-m2.5",    "provider": "opencode_go", "endpoint": "https://opencode.ai/zen/go/v1", "model": "minimax-m2.5",     "auth_env": "OPENCODE_GO_KEY"},
+    {"id": "ocg-kimi-k2.6",       "provider": "opencode_go", "endpoint": "https://opencode.ai/zen/go/v1", "model": "kimi-k2.6",        "auth_env": "OPENCODE_GO_KEY"},
+    {"id": "ocg-kimi-k2.5",       "provider": "opencode_go", "endpoint": "https://opencode.ai/zen/go/v1", "model": "kimi-k2.5",        "auth_env": "OPENCODE_GO_KEY"},
+    {"id": "ocg-glm-5.1",         "provider": "opencode_go", "endpoint": "https://opencode.ai/zen/go/v1", "model": "glm-5.1",          "auth_env": "OPENCODE_GO_KEY"},
+    {"id": "ocg-glm-5",           "provider": "opencode_go", "endpoint": "https://opencode.ai/zen/go/v1", "model": "glm-5",            "auth_env": "OPENCODE_GO_KEY"},
+    {"id": "ocg-deepseek-v4-pro", "provider": "opencode_go", "endpoint": "https://opencode.ai/zen/go/v1", "model": "deepseek-v4-pro",  "auth_env": "OPENCODE_GO_KEY"},
+    {"id": "ocg-deepseek-v4-flash","provider": "opencode_go","endpoint": "https://opencode.ai/zen/go/v1", "model": "deepseek-v4-flash","auth_env": "OPENCODE_GO_KEY"},
+    {"id": "ocg-qwen3.6-plus",    "provider": "opencode_go", "endpoint": "https://opencode.ai/zen/go/v1", "model": "qwen3.6-plus",     "auth_env": "OPENCODE_GO_KEY"},
+    {"id": "ocg-qwen3.5-plus",    "provider": "opencode_go", "endpoint": "https://opencode.ai/zen/go/v1", "model": "qwen3.5-plus",     "auth_env": "OPENCODE_GO_KEY"},
+    {"id": "ocg-mimo-v2-pro",     "provider": "opencode_go", "endpoint": "https://opencode.ai/zen/go/v1", "model": "mimo-v2-pro",      "auth_env": "OPENCODE_GO_KEY"},
+    {"id": "ocg-mimo-v2-omni",    "provider": "opencode_go", "endpoint": "https://opencode.ai/zen/go/v1", "model": "mimo-v2-omni",     "auth_env": "OPENCODE_GO_KEY"},
+    {"id": "ocg-mimo-v2.5-pro",   "provider": "opencode_go", "endpoint": "https://opencode.ai/zen/go/v1", "model": "mimo-v2.5-pro",    "auth_env": "OPENCODE_GO_KEY"},
+    {"id": "ocg-mimo-v2.5",       "provider": "opencode_go", "endpoint": "https://opencode.ai/zen/go/v1", "model": "mimo-v2.5",        "auth_env": "OPENCODE_GO_KEY"},
+    {"id": "ocg-hy3-preview",     "provider": "opencode_go", "endpoint": "https://opencode.ai/zen/go/v1", "model": "hy3-preview",      "auth_env": "OPENCODE_GO_KEY"},
+
+    {"id": "or-qwen3-vl-30b",     "provider": "openrouter", "endpoint": "https://openrouter.ai/api/v1", "model": "qwen/qwen3-vl-30b-a3b-instruct", "auth_env": "OPENROUTER_API_KEY"},
+    {"id": "or-qwen3-235b",       "provider": "openrouter", "endpoint": "https://openrouter.ai/api/v1", "model": "qwen/qwen3-235b-a22b-2507",       "auth_env": "OPENROUTER_API_KEY"},
+    {"id": "or-gemini-2.5-flash", "provider": "openrouter", "endpoint": "https://openrouter.ai/api/v1", "model": "google/gemini-2.5-flash",         "auth_env": "OPENROUTER_API_KEY"},
+    {"id": "or-gemini-3-flash",   "provider": "openrouter", "endpoint": "https://openrouter.ai/api/v1", "model": "google/gemini-3-flash-preview",   "auth_env": "OPENROUTER_API_KEY"},
+    {"id": "or-claude-haiku-3.5", "provider": "openrouter", "endpoint": "https://openrouter.ai/api/v1", "model": "anthropic/claude-3.5-haiku",      "auth_env": "OPENROUTER_API_KEY"},
+    {"id": "or-kimi-k2",          "provider": "openrouter", "endpoint": "https://openrouter.ai/api/v1", "model": "moonshotai/kimi-k2",              "auth_env": "OPENROUTER_API_KEY"},
+    {"id": "or-mistral-large",    "provider": "openrouter", "endpoint": "https://openrouter.ai/api/v1", "model": "mistralai/mistral-large",         "auth_env": "OPENROUTER_API_KEY"},
+
+    {"id": "gemini-2.5-pro",      "provider": "gemini",     "endpoint": "https://generativelanguage.googleapis.com/v1beta", "model": "gemini-2.5-pro",   "auth_env": "GEMINI_KEY",      "api": "gemini"},
+    {"id": "gemini-2.5-flash",    "provider": "gemini",     "endpoint": "https://generativelanguage.googleapis.com/v1beta", "model": "gemini-2.5-flash", "auth_env": "GEMINI_KEY",      "api": "gemini"},
+    {"id": "gemini-2.0-flash",    "provider": "gemini",     "endpoint": "https://generativelanguage.googleapis.com/v1beta", "model": "gemini-2.0-flash", "auth_env": "GEMINI_PALM_KEY", "api": "gemini"},
+
+    {"id": "openai-gpt-5",        "provider": "openai",     "endpoint": "https://api.openai.com/v1", "model": "gpt-5",          "auth_env": "OPENAI_API_KEY", "skip_reason": "quota exhausted 2026-05-15"},
+    {"id": "openai-gpt-5-mini",   "provider": "openai",     "endpoint": "https://api.openai.com/v1", "model": "gpt-5-mini",     "auth_env": "OPENAI_API_KEY", "skip_reason": "quota exhausted 2026-05-15"},
+    {"id": "openai-gpt-4.1-mini", "provider": "openai",     "endpoint": "https://api.openai.com/v1", "model": "gpt-4.1-mini",   "auth_env": "OPENAI_API_KEY", "skip_reason": "quota exhausted 2026-05-15"},
+
+    {"id": "deepseek-chat",       "provider": "deepseek",   "endpoint": "https://api.deepseek.com/v1", "model": "deepseek-chat",     "auth_env": "DEEPSEEK_KEY", "skip_reason": "deprecated 2026/07/24, use v4-flash"},
+    {"id": "deepseek-reasoner",   "provider": "deepseek",   "endpoint": "https://api.deepseek.com/v1", "model": "deepseek-reasoner", "auth_env": "DEEPSEEK_KEY", "skip_reason": "deprecated 2026/07/24, use v4-flash"},
+    {"id": "deepseek-v4-flash-direct", "provider": "deepseek", "endpoint": "https://api.deepseek.com/v1", "model": "deepseek-v4-flash", "auth_env": "DEEPSEEK_KEY", "notes": "non-thinking mode (default for OpenAI-compat); добавлено 2026-05-17 для прямого сравнения с ocg-deepseek-v4-flash и MiniMax M2.7"},
+    {"id": "deepseek-v4-pro-direct",   "provider": "deepseek", "endpoint": "https://api.deepseek.com/v1", "model": "deepseek-v4-pro",   "auth_env": "DEEPSEEK_KEY", "notes": "non-thinking mode; для контекста — quality ceiling DeepSeek family"},
+
+    {"id": "groq-llama-3.3-70b",  "provider": "groq",       "endpoint": "https://api.groq.com/openai/v1", "model": "llama-3.3-70b-versatile",  "auth_env": "GROQ_KEY"},
+    {"id": "groq-kimi-k2",        "provider": "groq",       "endpoint": "https://api.groq.com/openai/v1", "model": "moonshotai/kimi-k2-instruct", "auth_env": "GROQ_KEY"},
+    {"id": "groq-qwen-32b",       "provider": "groq",       "endpoint": "https://api.groq.com/openai/v1", "model": "qwen/qwen3-32b",            "auth_env": "GROQ_KEY"},
+
+    {"id": "minimax-m2.7-direct",          "provider": "minimax", "endpoint": "https://api.minimax.io/v1", "model": "MiniMax-M2.7",           "auth_env": "MINIMAX_API_KEY"},
+    {"id": "minimax-m2.7-highspeed-direct","provider": "minimax", "endpoint": "https://api.minimax.io/v1", "model": "MiniMax-M2.7-highspeed", "auth_env": "MINIMAX_API_KEY"},
+    {"id": "minimax-m2.5-direct",          "provider": "minimax", "endpoint": "https://api.minimax.io/v1", "model": "MiniMax-M2.5",           "auth_env": "MINIMAX_API_KEY"},
+    {"id": "minimax-m2.5-highspeed-direct","provider": "minimax", "endpoint": "https://api.minimax.io/v1", "model": "MiniMax-M2.5-highspeed", "auth_env": "MINIMAX_API_KEY"},
+    {"id": "minimax-m2.1-direct",          "provider": "minimax", "endpoint": "https://api.minimax.io/v1", "model": "MiniMax-M2.1",           "auth_env": "MINIMAX_API_KEY"},
+
+    {"id": "ollama-gemma4-e4b",   "provider": "ollama",     "endpoint": "http://localhost:11434", "model": "gemma4:e4b",          "auth_env": null, "api": "ollama"},
+    {"id": "ollama-qwen3.5-9b",   "provider": "ollama",     "endpoint": "http://localhost:11434", "model": "qwen3.5:9b",          "auth_env": null, "api": "ollama"},
+    {"id": "ollama-gpt-oss-20b",  "provider": "ollama",     "endpoint": "http://localhost:11434", "model": "gpt-oss:20b",         "auth_env": null, "api": "ollama"},
+    {"id": "ollama-qwen3-vl-8b",  "provider": "ollama",     "endpoint": "http://localhost:11434", "model": "qwen3-vl:8b-instruct","auth_env": null, "api": "ollama"},
+
+    {"id": "claude-opus-4-7",     "provider": "claude_agent", "endpoint": "http://localhost:8765/v1", "model": "claude-opus-4-7",         "auth_env": null},
+    {"id": "claude-sonnet-4-6",   "provider": "claude_agent", "endpoint": "http://localhost:8765/v1", "model": "claude-sonnet-4-6",       "auth_env": null},
+    {"id": "claude-haiku-4-5",    "provider": "claude_agent", "endpoint": "http://localhost:8765/v1", "model": "claude-haiku-4-5-20251001","auth_env": null}
+  ]
+}

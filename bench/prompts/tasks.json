@@ -1,0 +1,65 @@
+{
+  "_meta": {
+    "max_output_tokens": 800,
+    "temperature": 0.2,
+    "note": "Same params for all models. user_text is the actual input; system is the instruction."
+  },
+  "tasks": [
+    {
+      "id": "T1_ru_edit_short",
+      "category": "edit",
+      "system": "Ты редактор устной речи. Расставь пунктуацию, убери слова-паразиты и повторы, не меняй смысл. Верни ОДНУ исправленную фразу, без пояснений.",
+      "user": "Я думаю что нужно завтра я ну скорее всего поехать в магазин купить хлеб молоко и яйца",
+      "expected_signal": "punctuation_added"
+    },
+    {
+      "id": "T2_yt_summary_en",
+      "category": "summarization",
+      "system": "You summarize YouTube transcripts. Output exactly 5 bullet points, each <= 20 words, no preamble.",
+      "user": "TRANSCRIPT: So today I want to talk about how neural networks actually learn. The fundamental idea is gradient descent. You have a loss function which measures how wrong your model is. The gradient tells you the direction of steepest increase of that loss with respect to each parameter. You take a small step in the opposite direction. That's it. The magic is that with millions of parameters and tons of data, this simple procedure produces models that can write code, translate, generate images. But there are tricks. Learning rate matters enormously - too high and you overshoot, too low and you crawl. Momentum helps you escape local minima. Adam optimizer adaptively scales updates per parameter. Batch size affects both speed and generalization. Smaller batches add noise which often helps. Regularization (weight decay, dropout) prevents memorization. The loss surface in high dimensions has way more saddle points than local minima, which is counterintuitive but true. Modern training uses mixed precision (bf16) to halve memory. Gradient checkpointing trades compute for memory. ZeRO and FSDP shard optimizer state across GPUs. The actual recipe for training a large language model is: data quality, tokenizer, architecture, scale, then RLHF for alignment. Pretraining is most of the cost.",
+      "expected_signal": "five_bullets"
+    },
+    {
+      "id": "T3_yt_summary_ru",
+      "category": "summarization",
+      "system": "Ты суммаризатор русских видео. Выдай РОВНО 5 буллетов, каждый <= 20 слов, без предисловий.",
+      "user": "ТРАНСКРИПТ: Сегодня поговорим про то, как нейросети на самом деле учатся. Базовая идея — градиентный спуск. У вас есть функция потерь, которая измеряет, насколько модель ошибается. Градиент показывает направление наискорейшего возрастания этой потери по каждому параметру. Вы делаете маленький шаг в противоположную сторону. Всё. Магия в том, что с миллионами параметров и кучей данных эта простая процедура даёт модели, которые пишут код, переводят, генерируют картинки. Но есть нюансы. Learning rate критичен — слишком большой и вы перелетаете, слишком маленький и вы ползёте. Momentum помогает выскочить из локальных минимумов. Adam оптимизатор адаптивно скалирует апдейты для каждого параметра. Размер батча влияет и на скорость, и на обобщение. Маленькие батчи добавляют шума, что часто помогает. Регуляризация (weight decay, dropout) защищает от запоминания. Поверхность потерь в высокой размерности содержит гораздо больше седловых точек чем локальных минимумов — это контринтуитивно, но факт. Современное обучение использует mixed precision (bf16) чтобы вдвое уменьшить память. Gradient checkpointing торгует compute за память. ZeRO и FSDP шардируют состояние оптимизатора между GPU. Реальный рецепт обучения большой языковой модели: качество данных, токенизатор, архитектура, масштаб, потом RLHF для выравнивания. Pretraining — основная стоимость.",
+      "expected_signal": "five_bullets"
+    },
+    {
+      "id": "T4_json_extract",
+      "category": "structured",
+      "system": "Извлеки структурированную информацию. Верни ТОЛЬКО валидный JSON-объект (без markdown-обёрток), с ключами person, date, time, action. Используй null если значение отсутствует.",
+      "user": "Напомни мне позвонить Ивану Петрову в среду 21 мая в 17:30 чтобы согласовать договор на поставку оборудования",
+      "expected_signal": "valid_json"
+    },
+    {
+      "id": "T5_translate_ru_en",
+      "category": "translate",
+      "system": "Translate Russian to English. Output only the translation, no comments.",
+      "user": "n8n — платформа автоматизации workflow с low-code интерфейсом. Поддерживает 400+ интеграций и self-hosting. В нашей инфраструктуре крутится в Docker на отдельном Debian-сервере и обслуживает 4 Telegram-бота, голосовую транскрипцию и автообновляемую базу знаний из YouTube.",
+      "expected_signal": "english_text"
+    },
+    {
+      "id": "T6_classify",
+      "category": "classify",
+      "system": "Определи категорию сообщения. Возможные категории: question, complaint, request, praise, spam, other. Ответ — ОДНО слово из списка, в нижнем регистре, без точки.",
+      "user": "Здравствуйте! Третий день не приходит уведомление о доставке, заказ #A-2415, разберитесь пожалуйста.",
+      "expected_signal": "one_word_category"
+    },
+    {
+      "id": "T7_bash_oneliner",
+      "category": "code",
+      "system": "Write a single bash one-liner. Output only the command, no explanation, no code fences.",
+      "user": "Найти все файлы *.log больше 100MB в /var/log и его подпапках, заархивировать каждый в gzip, и удалить оригинал.",
+      "expected_signal": "single_line_bash"
+    },
+    {
+      "id": "T8_python_function",
+      "category": "code",
+      "system": "Write a Python function. Output ONLY valid Python code (no markdown, no explanation). Include a short docstring.",
+      "user": "Функция parse_duration(s: str) -> int: принимает строку вида '2h30m', '45m', '1h', '90s', возвращает количество секунд. Невалидный ввод — ValueError.",
+      "expected_signal": "compilable_python"
+    }
+  ]
+}

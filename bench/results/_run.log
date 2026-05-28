@@ -1,0 +1,374 @@
+[1/320] ocg-minimax-m2.7 / T1_ru_edit_short... ttft=4.43s ttftR=— total=4.55s txt=62b rsn=0b status=200 ok
+[2/320] ocg-minimax-m2.7 / T2_yt_summary_en... ttft=8.51s ttftR=— total=8.75s txt=566b rsn=0b status=200 ok
+[3/320] ocg-minimax-m2.7 / T3_yt_summary_ru... ttft=11.62s ttftR=— total=11.67s txt=481b rsn=0b status=200 ok
+[4/320] ocg-minimax-m2.7 / T4_json_extract... ttft=4.65s ttftR=— total=4.74s txt=158b rsn=0b status=200 ok
+[5/320] ocg-minimax-m2.7 / T5_translate_ru_en... ttft=2.92s ttftR=— total=3.74s txt=280b rsn=0b status=200 ok
+[6/320] ocg-minimax-m2.7 / T6_classify... ttft=5.47s ttftR=— total=5.59s txt=9b rsn=0b status=200 ok
+[7/320] ocg-minimax-m2.7 / T7_bash_oneliner... ttft=31.00s ttftR=— total=31.16s txt=63b rsn=0b status=200 ok
+[8/320] ocg-minimax-m2.7 / T8_python_function... ttft=8.05s ttftR=— total=8.55s txt=1334b rsn=0b status=200 ok
+[9/320] ocg-minimax-m2.5 / T1_ru_edit_short... ttft=13.55s ttftR=11.38s total=13.79s txt=88b rsn=594b status=200 ok
+[10/320] ocg-minimax-m2.5 / T2_yt_summary_en... ttft=12.03s ttftR=7.12s total=12.99s txt=524b rsn=1879b status=200 ok
+[11/320] ocg-minimax-m2.5 / T3_yt_summary_ru... ttft=14.40s ttftR=9.43s total=16.39s txt=503b rsn=1156b status=200 ok
+[12/320] ocg-minimax-m2.5 / T4_json_extract... ttft=13.48s ttftR=9.86s total=14.44s txt=134b rsn=378b status=200 ok
+[13/320] ocg-minimax-m2.5 / T5_translate_ru_en... ttft=3.88s ttftR=3.47s total=4.09s txt=282b rsn=386b status=200 ok
+[14/320] ocg-minimax-m2.5 / T6_classify... ttft=9.78s ttftR=7.72s total=9.79s txt=11b rsn=393b status=200 ok
+[15/320] ocg-minimax-m2.5 / T7_bash_oneliner... ttft=15.07s ttftR=8.97s total=15.33s txt=58b rsn=1674b status=200 ok
+[16/320] ocg-minimax-m2.5 / T8_python_function... ttft=6.17s ttftR=5.20s total=8.79s txt=1004b rsn=486b status=200 ok
+[17/320] ocg-kimi-k2.6 / T1_ru_edit_short... ttft=38.26s ttftR=— total=39.29s txt=69b rsn=0b status=200 ok
+[18/320] ocg-kimi-k2.6 / T2_yt_summary_en... ttft=— ttftR=— total=24.73s txt=0b rsn=0b status=200 ok
+[19/320] ocg-kimi-k2.6 / T3_yt_summary_ru... ttft=9.04s ttftR=2.58s total=12.78s txt=565b rsn=1362b status=200 ok
+[20/320] ocg-kimi-k2.6 / T4_json_extract... ttft=46.95s ttftR=4.62s total=48.34s txt=128b rsn=5408b status=200 ok
+[21/320] ocg-kimi-k2.6 / T5_translate_ru_en... ttft=7.00s ttftR=— total=7.37s txt=281b rsn=0b status=200 ok
+[22/320] ocg-kimi-k2.6 / T6_classify... ttft=4.94s ttftR=— total=4.98s txt=9b rsn=0b status=200 ok
+[23/320] ocg-kimi-k2.6 / T7_bash_oneliner... ttft=24.75s ttftR=— total=25.32s txt=63b rsn=0b status=200 ok
+[24/320] ocg-kimi-k2.6 / T8_python_function... ttft=12.85s ttftR=— total=13.95s txt=553b rsn=0b status=200 ok
+[25/320] ocg-kimi-k2.5 / T1_ru_edit_short... ttft=47.62s ttftR=— total=48.60s txt=73b rsn=0b status=200 ok
+[26/320] ocg-kimi-k2.5 / T2_yt_summary_en... ttft=21.22s ttftR=— total=24.00s txt=555b rsn=0b status=200 ok
+[27/320] ocg-kimi-k2.5 / T3_yt_summary_ru... ttft=44.06s ttftR=— total=49.34s txt=497b rsn=0b status=200 ok
+[28/320] ocg-kimi-k2.5 / T4_json_extract... ttft=26.76s ttftR=— total=28.22s txt=140b rsn=0b status=200 ok
+[29/320] ocg-kimi-k2.5 / T5_translate_ru_en... ttft=31.41s ttftR=— total=33.11s txt=282b rsn=0b status=200 ok
+[30/320] ocg-kimi-k2.5 / T6_classify... ttft=10.81s ttftR=— total=10.83s txt=9b rsn=0b status=200 ok
+[31/320] ocg-kimi-k2.5 / T7_bash_oneliner... ttft=22.94s ttftR=— total=23.53s txt=63b rsn=0b status=200 ok
+[32/320] ocg-kimi-k2.5 / T8_python_function... ttft=— ttftR=— total=67.37s txt=0b rsn=0b status=200 ok
+[33/320] ocg-glm-5.1 / T1_ru_edit_short... ttft=28.71s ttftR=3.13s total=28.80s txt=86b rsn=5373b status=200 ok
+[34/320] ocg-glm-5.1 / T2_yt_summary_en... ttft=13.71s ttftR=2.74s total=14.50s txt=588b rsn=3584b status=200 ok
+[35/320] ocg-glm-5.1 / T3_yt_summary_ru... ttft=12.15s ttftR=2.65s total=13.23s txt=432b rsn=4159b status=200 ok
+[36/320] ocg-glm-5.1 / T4_json_extract... ttft=13.67s ttftR=5.32s total=14.32s txt=144b rsn=1810b status=200 ok
+[37/320] ocg-glm-5.1 / T5_translate_ru_en... ttft=19.43s ttftR=8.64s total=23.01s txt=280b rsn=3830b status=200 ok
+[38/320] ocg-glm-5.1 / T6_classify... ttft=19.62s ttftR=3.18s total=19.62s txt=9b rsn=3584b status=200 ok
+[39/320] ocg-glm-5.1 / T7_bash_oneliner... ttft=18.88s ttftR=1.92s total=19.00s txt=63b rsn=4749b status=200 ok
+[40/320] ocg-glm-5.1 / T8_python_function... ttft=13.41s ttftR=1.69s total=14.57s txt=573b rsn=4721b status=200 ok
+[41/320] ocg-glm-5 / T1_ru_edit_short... ttft=26.92s ttftR=2.11s total=27.14s txt=86b rsn=7975b status=200 ok
+[42/320] ocg-glm-5 / T2_yt_summary_en... ttft=9.54s ttftR=2.10s total=10.49s txt=563b rsn=2971b status=200 ok
+[43/320] ocg-glm-5 / T3_yt_summary_ru... ttft=33.02s ttftR=9.28s total=34.55s txt=464b rsn=5033b status=200 ok
+[44/320] ocg-glm-5 / T4_json_extract... ttft=7.14s ttftR=1.64s total=7.49s txt=145b rsn=1547b status=200 ok
+[45/320] ocg-glm-5 / T5_translate_ru_en... ttft=16.97s ttftR=1.80s total=17.46s txt=276b rsn=3768b status=200 ok
+[46/320] ocg-glm-5 / T6_classify... ttft=8.28s ttftR=2.08s total=8.32s txt=9b rsn=2382b status=200 ok
+[47/320] ocg-glm-5 / T7_bash_oneliner... ttft=13.39s ttftR=1.87s total=13.46s txt=64b rsn=3382b status=200 ok
+[48/320] ocg-glm-5 / T8_python_function... ttft=23.27s ttftR=1.80s total=24.24s txt=474b rsn=6066b status=200 ok
+[49/320] ocg-deepseek-v4-pro / T1_ru_edit_short... ttft=56.16s ttftR=2.70s total=57.11s txt=86b rsn=5075b status=200 ok
+[50/320] ocg-deepseek-v4-pro / T2_yt_summary_en... ttft=32.08s ttftR=2.54s total=33.86s txt=493b rsn=5794b status=200 ok
+[51/320] ocg-deepseek-v4-pro / T3_yt_summary_ru... ttft=40.80s ttftR=1.82s total=46.15s txt=673b rsn=4563b status=200 ok
+[52/320] ocg-deepseek-v4-pro / T4_json_extract... ttft=42.42s ttftR=3.32s total=43.69s txt=148b rsn=5093b status=200 ok
+[53/320] ocg-deepseek-v4-pro / T5_translate_ru_en... ttft=15.04s ttftR=3.14s total=16.71s txt=280b rsn=1545b status=200 ok
+[54/320] ocg-deepseek-v4-pro / T6_classify... ttft=31.65s ttftR=2.46s total=31.65s txt=7b rsn=3258b status=200 ok
+[55/320] ocg-deepseek-v4-pro / T7_bash_oneliner... ttft=41.12s ttftR=2.55s total=41.86s txt=63b rsn=4954b status=200 ok
+[56/320] ocg-deepseek-v4-pro / T8_python_function... ttft=41.66s ttftR=2.66s total=49.64s txt=976b rsn=4826b status=200 ok
+[57/320] ocg-deepseek-v4-flash / T1_ru_edit_short... ttft=6.46s ttftR=1.83s total=6.63s txt=73b rsn=1302b status=200 ok
+[58/320] ocg-deepseek-v4-flash / T2_yt_summary_en... ttft=10.46s ttftR=1.65s total=10.88s txt=357b rsn=3794b status=200 ok
+[59/320] ocg-deepseek-v4-flash / T3_yt_summary_ru... ttft=— ttftR=1.93s total=20.59s txt=0b rsn=7097b status=200 ok
+[60/320] ocg-deepseek-v4-flash / T4_json_extract... ttft=15.72s ttftR=1.78s total=16.04s txt=118b rsn=5399b status=200 ok
+[61/320] ocg-deepseek-v4-flash / T5_translate_ru_en... ttft=4.09s ttftR=1.93s total=4.42s txt=280b rsn=1194b status=200 ok
+[62/320] ocg-deepseek-v4-flash / T6_classify... ttft=7.86s ttftR=2.08s total=7.93s txt=9b rsn=2437b status=200 ok
+[63/320] ocg-deepseek-v4-flash / T7_bash_oneliner... ttft=6.17s ttftR=2.00s total=6.38s txt=56b rsn=1371b status=200 ok
+[64/320] ocg-deepseek-v4-flash / T8_python_function... ttft=— ttftR=1.77s total=27.02s txt=0b rsn=6939b status=200 ok
+[65/320] ocg-qwen3.6-plus / T1_ru_edit_short... ttft=66.29s ttftR=2.81s total=66.77s txt=87b rsn=13401b status=200 ok
+[66/320] ocg-qwen3.6-plus / T2_yt_summary_en... ttft=30.71s ttftR=1.92s total=32.62s txt=597b rsn=6946b status=200 ok
+[67/320] ocg-qwen3.6-plus / T3_yt_summary_ru... ttft=43.63s ttftR=1.91s total=45.91s txt=440b rsn=7828b status=200 ok
+[68/320] ocg-qwen3.6-plus / T4_json_extract... ttft=32.34s ttftR=2.82s total=33.09s txt=135b rsn=5505b status=200 ok
+[69/320] ocg-qwen3.6-plus / T5_translate_ru_en... ttft=31.39s ttftR=2.64s total=32.57s txt=280b rsn=6316b status=200 ok
+[70/320] ocg-qwen3.6-plus / T6_classify... ttft=26.29s ttftR=1.85s total=26.36s txt=9b rsn=5655b status=200 ok
+[71/320] ocg-qwen3.6-plus / T7_bash_oneliner... ttft=36.95s ttftR=3.19s total=37.54s txt=64b rsn=6052b status=200 ok
+[72/320] ocg-qwen3.6-plus / T8_python_function... ttft=87.25s ttftR=1.78s total=89.70s txt=353b rsn=14717b status=200 ok
+[73/320] ocg-qwen3.5-plus / T1_ru_edit_short... ttft=92.77s ttftR=2.67s total=93.09s txt=86b rsn=17346b status=200 ok
+[74/320] ocg-qwen3.5-plus / T2_yt_summary_en... ttft=46.51s ttftR=3.69s total=48.31s txt=567b rsn=8522b status=200 ok
+[75/320] ocg-qwen3.5-plus / T3_yt_summary_ru... ttft=— ttftR=— total=5.17s txt=0b rsn=0b status=429 HTTP 429: {"error":{"message":"Error from provider
+[76/320] ocg-qwen3.5-plus / T4_json_extract... ttft=30.02s ttftR=4.01s total=31.11s txt=144b rsn=4841b status=200 ok
+[77/320] ocg-qwen3.5-plus / T5_translate_ru_en... ttft=35.21s ttftR=2.21s total=36.32s txt=281b rsn=7038b status=200 ok
+[78/320] ocg-qwen3.5-plus / T6_classify... ttft=— ttftR=— total=4.86s txt=0b rsn=0b status=429 HTTP 429: {"error":{"message":"Error from provider
+[79/320] ocg-qwen3.5-plus / T7_bash_oneliner... ttft=— ttftR=— total=4.75s txt=0b rsn=0b status=429 HTTP 429: {"error":{"message":"Error from provider
+[80/320] ocg-qwen3.5-plus / T8_python_function... ttft=— ttftR=— total=4.72s txt=0b rsn=0b status=429 HTTP 429: {"error":{"message":"Error from provider
+[81/320] ocg-mimo-v2-pro / T1_ru_edit_short... ttft=3.59s ttftR=2.36s total=3.93s txt=86b rsn=304b status=200 ok
+[82/320] ocg-mimo-v2-pro / T2_yt_summary_en... ttft=5.07s ttftR=2.42s total=6.23s txt=462b rsn=897b status=200 ok
+[83/320] ocg-mimo-v2-pro / T3_yt_summary_ru... ttft=3.06s ttftR=2.41s total=5.34s txt=537b rsn=76b status=200 ok
+[84/320] ocg-mimo-v2-pro / T4_json_extract... ttft=3.98s ttftR=2.81s total=4.50s txt=156b rsn=318b status=200 ok
+[85/320] ocg-mimo-v2-pro / T5_translate_ru_en... ttft=2.72s ttftR=2.63s total=3.46s txt=282b rsn=55b status=200 ok
+[86/320] ocg-mimo-v2-pro / T6_classify... ttft=2.95s ttftR=2.54s total=3.04s txt=9b rsn=155b status=200 ok
+[87/320] ocg-mimo-v2-pro / T7_bash_oneliner... ttft=2.83s ttftR=2.40s total=3.09s txt=64b rsn=155b status=200 ok
+[88/320] ocg-mimo-v2-pro / T8_python_function... ttft=3.76s ttftR=1.57s total=6.79s txt=905b rsn=533b status=200 ok
+[89/320] ocg-mimo-v2-omni / T1_ru_edit_short... ttft=4.69s ttftR=2.33s total=5.03s txt=79b rsn=604b status=200 ok
+[90/320] ocg-mimo-v2-omni / T2_yt_summary_en... ttft=3.58s ttftR=1.96s total=4.52s txt=539b rsn=828b status=200 ok
+[91/320] ocg-mimo-v2-omni / T3_yt_summary_ru... ttft=4.96s ttftR=2.21s total=6.74s txt=615b rsn=757b status=200 ok
+[92/320] ocg-mimo-v2-omni / T4_json_extract... ttft=12.73s ttftR=1.78s total=13.17s txt=162b rsn=3715b status=200 ok
+[93/320] ocg-mimo-v2-omni / T5_translate_ru_en... ttft=2.27s ttftR=2.18s total=2.77s txt=279b rsn=55b status=200 ok
+[94/320] ocg-mimo-v2-omni / T6_classify... ttft=3.09s ttftR=2.26s total=3.10s txt=9b rsn=236b status=200 ok
+[95/320] ocg-mimo-v2-omni / T7_bash_oneliner... ttft=2.58s ttftR=2.12s total=3.01s txt=90b rsn=159b status=200 ok
+[96/320] ocg-mimo-v2-omni / T8_python_function... ttft=— ttftR=3.30s total=21.62s txt=0b rsn=7611b status=200 ok
+[97/320] ocg-mimo-v2.5-pro / T1_ru_edit_short... ttft=3.40s ttftR=2.14s total=3.66s txt=86b rsn=347b status=200 ok
+[98/320] ocg-mimo-v2.5-pro / T2_yt_summary_en... ttft=10.00s ttftR=2.54s total=11.34s txt=495b rsn=2398b status=200 ok
+[99/320] ocg-mimo-v2.5-pro / T3_yt_summary_ru... ttft=2.39s ttftR=1.97s total=5.08s txt=495b rsn=118b status=200 ok
+[100/320] ocg-mimo-v2.5-pro / T4_json_extract... ttft=2.38s ttftR=2.17s total=3.05s txt=158b rsn=80b status=200 ok
+[101/320] ocg-mimo-v2.5-pro / T5_translate_ru_en... ttft=2.81s ttftR=2.63s total=3.78s txt=282b rsn=59b status=200 ok
+[102/320] ocg-mimo-v2.5-pro / T6_classify... ttft=3.87s ttftR=3.18s total=4.06s txt=9b rsn=181b status=200 ok
+[103/320] ocg-mimo-v2.5-pro / T7_bash_oneliner... ttft=3.96s ttftR=3.35s total=4.22s txt=56b rsn=144b status=200 ok
+[104/320] ocg-mimo-v2.5-pro / T8_python_function... ttft=13.77s ttftR=2.17s total=16.30s txt=870b rsn=2735b status=200 ok
+[105/320] ocg-mimo-v2.5 / T1_ru_edit_short... ttft=3.81s ttftR=2.13s total=4.62s txt=67b rsn=405b status=200 ok
+[106/320] ocg-mimo-v2.5 / T2_yt_summary_en... ttft=2.82s ttftR=2.49s total=4.25s txt=660b rsn=118b status=200 ok
+[107/320] ocg-mimo-v2.5 / T3_yt_summary_ru... ttft=2.48s ttftR=2.25s total=4.21s txt=562b rsn=91b status=200 ok
+[108/320] ocg-mimo-v2.5 / T4_json_extract... ttft=2.59s ttftR=2.44s total=3.03s txt=149b rsn=112b status=200 ok
+[109/320] ocg-mimo-v2.5 / T5_translate_ru_en... ttft=2.40s ttftR=2.25s total=2.93s txt=289b rsn=59b status=200 ok
+[110/320] ocg-mimo-v2.5 / T6_classify... ttft=3.70s ttftR=2.19s total=3.70s txt=9b rsn=359b status=200 ok
+[111/320] ocg-mimo-v2.5 / T7_bash_oneliner... ttft=3.61s ttftR=2.16s total=3.75s txt=56b rsn=514b status=200 ok
+[112/320] ocg-mimo-v2.5 / T8_python_function... ttft=21.10s ttftR=1.86s total=22.29s txt=318b rsn=7280b status=200 ok
+[113/320] ocg-hy3-preview / T1_ru_edit_short... ttft=12.11s ttftR=— total=12.39s txt=86b rsn=0b status=200 ok
+[114/320] ocg-hy3-preview / T2_yt_summary_en... ttft=— ttftR=— total=13.84s txt=0b rsn=0b status=200 ok
+[115/320] ocg-hy3-preview / T3_yt_summary_ru... ttft=13.86s ttftR=— total=15.83s txt=593b rsn=0b status=200 ok
+[116/320] ocg-hy3-preview / T4_json_extract... ttft=7.53s ttftR=— total=7.64s txt=148b rsn=0b status=200 ok
+[117/320] ocg-hy3-preview / T5_translate_ru_en... ttft=11.85s ttftR=— total=11.90s txt=288b rsn=0b status=200 ok
+[118/320] ocg-hy3-preview / T6_classify... ttft=— ttftR=— total=24.76s txt=0b rsn=0b status=200 ok
+[119/320] ocg-hy3-preview / T7_bash_oneliner... ttft=11.03s ttftR=— total=11.29s txt=63b rsn=0b status=200 ok
+[120/320] ocg-hy3-preview / T8_python_function... ttft=— ttftR=— total=54.50s txt=0b rsn=0b status=200 ok
+[121/320] or-qwen3-vl-30b / T1_ru_edit_short... ttft=2.07s ttftR=— total=2.51s txt=86b rsn=0b status=200 ok
+[122/320] or-qwen3-vl-30b / T2_yt_summary_en... ttft=1.83s ttftR=— total=2.59s txt=486b rsn=0b status=200 ok
+[123/320] or-qwen3-vl-30b / T3_yt_summary_ru... ttft=1.58s ttftR=— total=3.38s txt=378b rsn=0b status=200 ok
+[124/320] or-qwen3-vl-30b / T4_json_extract... ttft=1.85s ttftR=— total=2.34s txt=135b rsn=0b status=200 ok
+[125/320] or-qwen3-vl-30b / T5_translate_ru_en... ttft=1.37s ttftR=— total=1.98s txt=281b rsn=0b status=200 ok
+[126/320] or-qwen3-vl-30b / T6_classify... ttft=1.51s ttftR=— total=1.56s txt=9b rsn=0b status=200 ok
+[127/320] or-qwen3-vl-30b / T7_bash_oneliner... ttft=2.48s ttftR=— total=3.31s txt=72b rsn=0b status=200 ok
+[128/320] or-qwen3-vl-30b / T8_python_function... ttft=1.38s ttftR=— total=9.88s txt=1604b rsn=0b status=200 ok
+[129/320] or-qwen3-235b / T1_ru_edit_short... ttft=1.32s ttftR=— total=3.23s txt=73b rsn=0b status=200 ok
+[130/320] or-qwen3-235b / T2_yt_summary_en... ttft=1.57s ttftR=— total=2.89s txt=387b rsn=0b status=200 ok
+[131/320] or-qwen3-235b / T3_yt_summary_ru... ttft=1.55s ttftR=— total=3.53s txt=379b rsn=0b status=200 ok
+[132/320] or-qwen3-235b / T4_json_extract... ttft=1.71s ttftR=— total=3.67s txt=128b rsn=0b status=200 ok
+[133/320] or-qwen3-235b / T5_translate_ru_en... ttft=2.31s ttftR=— total=3.05s txt=281b rsn=0b status=200 ok
+[134/320] or-qwen3-235b / T6_classify... ttft=1.36s ttftR=— total=1.50s txt=9b rsn=0b status=200 ok
+[135/320] or-qwen3-235b / T7_bash_oneliner... ttft=1.39s ttftR=— total=2.25s txt=77b rsn=0b status=200 ok
+[136/320] or-qwen3-235b / T8_python_function... ttft=1.30s ttftR=— total=6.49s txt=1142b rsn=0b status=200 ok
+[137/320] or-gemini-2.5-flash / T1_ru_edit_short... ttft=— ttftR=— total=1.15s txt=0b rsn=0b status=403 HTTP 403: {"error":{"message":"The request is proh
+[138/320] or-gemini-2.5-flash / T2_yt_summary_en... ttft=— ttftR=— total=0.94s txt=0b rsn=0b status=403 HTTP 403: {"error":{"message":"The request is proh
+[139/320] or-gemini-2.5-flash / T3_yt_summary_ru... ttft=— ttftR=— total=0.99s txt=0b rsn=0b status=403 HTTP 403: {"error":{"message":"The request is proh
+[140/320] or-gemini-2.5-flash / T4_json_extract... ttft=— ttftR=— total=1.24s txt=0b rsn=0b status=403 HTTP 403: {"error":{"message":"The request is proh
+[141/320] or-gemini-2.5-flash / T5_translate_ru_en... ttft=— ttftR=— total=1.20s txt=0b rsn=0b status=403 HTTP 403: {"error":{"message":"The request is proh
+[142/320] or-gemini-2.5-flash / T6_classify... ttft=— ttftR=— total=1.06s txt=0b rsn=0b status=403 HTTP 403: {"error":{"message":"The request is proh
+[143/320] or-gemini-2.5-flash / T7_bash_oneliner... ttft=— ttftR=— total=0.86s txt=0b rsn=0b status=403 HTTP 403: {"error":{"message":"The request is proh
+[144/320] or-gemini-2.5-flash / T8_python_function... ttft=— ttftR=— total=0.84s txt=0b rsn=0b status=403 HTTP 403: {"error":{"message":"The request is proh
+[145/320] or-gemini-3-flash / T1_ru_edit_short... ttft=— ttftR=— total=0.77s txt=0b rsn=0b status=403 HTTP 403: {"error":{"message":"The request is proh
+[146/320] or-gemini-3-flash / T2_yt_summary_en... ttft=— ttftR=— total=1.06s txt=0b rsn=0b status=403 HTTP 403: {"error":{"message":"The request is proh
+[147/320] or-gemini-3-flash / T3_yt_summary_ru... ttft=— ttftR=— total=0.99s txt=0b rsn=0b status=403 HTTP 403: {"error":{"message":"The request is proh
+[148/320] or-gemini-3-flash / T4_json_extract... ttft=— ttftR=— total=0.93s txt=0b rsn=0b status=403 HTTP 403: {"error":{"message":"The request is proh
+[149/320] or-gemini-3-flash / T5_translate_ru_en... ttft=— ttftR=— total=1.21s txt=0b rsn=0b status=403 HTTP 403: {"error":{"message":"The request is proh
+[150/320] or-gemini-3-flash / T6_classify... ttft=— ttftR=— total=0.88s txt=0b rsn=0b status=403 HTTP 403: {"error":{"message":"The request is proh
+[151/320] or-gemini-3-flash / T7_bash_oneliner... ttft=— ttftR=— total=0.71s txt=0b rsn=0b status=403 HTTP 403: {"error":{"message":"The request is proh
+[152/320] or-gemini-3-flash / T8_python_function... ttft=— ttftR=— total=1.40s txt=0b rsn=0b status=403 HTTP 403: {"error":{"message":"The request is proh
+[153/320] or-claude-haiku-3.5 / T1_ru_edit_short... ttft=— ttftR=— total=0.91s txt=0b rsn=0b status=403 HTTP 403: {"error":{"message":"The request is proh
+[154/320] or-claude-haiku-3.5 / T2_yt_summary_en... ttft=— ttftR=— total=0.86s txt=0b rsn=0b status=403 HTTP 403: {"error":{"message":"The request is proh
+[155/320] or-claude-haiku-3.5 / T3_yt_summary_ru... ttft=— ttftR=— total=0.99s txt=0b rsn=0b status=403 HTTP 403: {"error":{"message":"The request is proh
+[156/320] or-claude-haiku-3.5 / T4_json_extract... ttft=— ttftR=— total=0.97s txt=0b rsn=0b status=403 HTTP 403: {"error":{"message":"The request is proh
+[157/320] or-claude-haiku-3.5 / T5_translate_ru_en... ttft=— ttftR=— total=1.06s txt=0b rsn=0b status=403 HTTP 403: {"error":{"message":"The request is proh
+[158/320] or-claude-haiku-3.5 / T6_classify... ttft=— ttftR=— total=0.90s txt=0b rsn=0b status=403 HTTP 403: {"error":{"message":"The request is proh
+[159/320] or-claude-haiku-3.5 / T7_bash_oneliner... ttft=— ttftR=— total=0.93s txt=0b rsn=0b status=403 HTTP 403: {"error":{"message":"The request is proh
+[160/320] or-claude-haiku-3.5 / T8_python_function... ttft=— ttftR=— total=0.87s txt=0b rsn=0b status=403 HTTP 403: {"error":{"message":"The request is proh
+[161/320] or-kimi-k2 / T1_ru_edit_short... ttft=2.63s ttftR=— total=5.16s txt=69b rsn=0b status=200 ok
+[162/320] or-kimi-k2 / T2_yt_summary_en... ttft=2.52s ttftR=— total=6.34s txt=415b rsn=0b status=200 ok
+[163/320] or-kimi-k2 / T3_yt_summary_ru... ttft=3.05s ttftR=— total=8.39s txt=383b rsn=0b status=200 ok
+[164/320] or-kimi-k2 / T4_json_extract... ttft=2.89s ttftR=— total=4.12s txt=80b rsn=0b status=200 ok
+[165/320] or-kimi-k2 / T5_translate_ru_en... ttft=2.46s ttftR=— total=4.98s txt=281b rsn=0b status=200 ok
+[166/320] or-kimi-k2 / T6_classify... ttft=2.65s ttftR=— total=2.76s txt=9b rsn=0b status=200 ok
+[167/320] or-kimi-k2 / T7_bash_oneliner... ttft=2.64s ttftR=— total=3.49s txt=64b rsn=0b status=200 ok
+[168/320] or-kimi-k2 / T8_python_function... ttft=2.95s ttftR=— total=9.04s txt=563b rsn=0b status=200 ok
+[169/320] or-mistral-large / T1_ru_edit_short... ttft=1.48s ttftR=— total=2.04s txt=67b rsn=0b status=200 ok
+[170/320] or-mistral-large / T2_yt_summary_en... ttft=1.49s ttftR=— total=3.10s txt=410b rsn=0b status=200 ok
+[171/320] or-mistral-large / T3_yt_summary_ru... ttft=1.47s ttftR=— total=4.41s txt=449b rsn=0b status=200 ok
+[172/320] or-mistral-large / T4_json_extract... ttft=1.27s ttftR=— total=2.18s txt=160b rsn=0b status=200 ok
+[173/320] or-mistral-large / T5_translate_ru_en... ttft=1.42s ttftR=— total=2.43s txt=280b rsn=0b status=200 ok
+[174/320] or-mistral-large / T6_classify... ttft=1.33s ttftR=— total=1.43s txt=9b rsn=0b status=200 ok
+[175/320] or-mistral-large / T7_bash_oneliner... ttft=1.76s ttftR=— total=2.43s txt=85b rsn=0b status=200 ok
+[176/320] or-mistral-large / T8_python_function... ttft=1.35s ttftR=— total=4.80s txt=1034b rsn=0b status=200 ok
+[177/320] gemini-2.5-pro / T1_ru_edit_short... ttft=— ttftR=— total=0.71s txt=0b rsn=0b status=429 HTTP 429: {
+  "error": {
+    "code": 429,
+    "mes
+[178/320] gemini-2.5-pro / T2_yt_summary_en... ttft=— ttftR=— total=0.74s txt=0b rsn=0b status=429 HTTP 429: {
+  "error": {
+    "code": 429,
+    "mes
+[179/320] gemini-2.5-pro / T3_yt_summary_ru... ttft=— ttftR=— total=0.65s txt=0b rsn=0b status=429 HTTP 429: {
+  "error": {
+    "code": 429,
+    "mes
+[180/320] gemini-2.5-pro / T4_json_extract... ttft=— ttftR=— total=0.87s txt=0b rsn=0b status=429 HTTP 429: {
+  "error": {
+    "code": 429,
+    "mes
+[181/320] gemini-2.5-pro / T5_translate_ru_en... ttft=— ttftR=— total=0.77s txt=0b rsn=0b status=429 HTTP 429: {
+  "error": {
+    "code": 429,
+    "mes
+[182/320] gemini-2.5-pro / T6_classify... ttft=— ttftR=— total=0.67s txt=0b rsn=0b status=429 HTTP 429: {
+  "error": {
+    "code": 429,
+    "mes
+[183/320] gemini-2.5-pro / T7_bash_oneliner... ttft=— ttftR=— total=0.70s txt=0b rsn=0b status=429 HTTP 429: {
+  "error": {
+    "code": 429,
+    "mes
+[184/320] gemini-2.5-pro / T8_python_function... ttft=— ttftR=— total=1.07s txt=0b rsn=0b status=429 HTTP 429: {
+  "error": {
+    "code": 429,
+    "mes
+[185/320] gemini-2.5-flash / T1_ru_edit_short... ttft=7.64s ttftR=— total=7.64s txt=81b rsn=0b status=200 ok
+[186/320] gemini-2.5-flash / T2_yt_summary_en... ttft=3.90s ttftR=— total=4.23s txt=563b rsn=0b status=200 ok
+[187/320] gemini-2.5-flash / T3_yt_summary_ru... ttft=3.07s ttftR=— total=3.43s txt=499b rsn=0b status=200 ok
+[188/320] gemini-2.5-flash / T4_json_extract... ttft=1.47s ttftR=— total=1.60s txt=140b rsn=0b status=200 ok
+[189/320] gemini-2.5-flash / T5_translate_ru_en... ttft=2.79s ttftR=— total=2.82s txt=279b rsn=0b status=200 ok
+[190/320] gemini-2.5-flash / T6_classify... ttft=1.59s ttftR=— total=1.59s txt=9b rsn=0b status=200 ok
+[191/320] gemini-2.5-flash / T7_bash_oneliner... ttft=— ttftR=— total=0.84s txt=0b rsn=0b status=429 HTTP 429: {
+  "error": {
+    "code": 429,
+    "mes
+[192/320] gemini-2.5-flash / T8_python_function... ttft=— ttftR=— total=0.77s txt=0b rsn=0b status=429 HTTP 429: {
+  "error": {
+    "code": 429,
+    "mes
+[193/320] gemini-2.0-flash / T1_ru_edit_short... ttft=— ttftR=— total=0.77s txt=0b rsn=0b status=429 HTTP 429: {
+  "error": {
+    "code": 429,
+    "mes
+[194/320] gemini-2.0-flash / T2_yt_summary_en... ttft=— ttftR=— total=0.65s txt=0b rsn=0b status=429 HTTP 429: {
+  "error": {
+    "code": 429,
+    "mes
+[195/320] gemini-2.0-flash / T3_yt_summary_ru... ttft=— ttftR=— total=0.63s txt=0b rsn=0b status=429 HTTP 429: {
+  "error": {
+    "code": 429,
+    "mes
+[196/320] gemini-2.0-flash / T4_json_extract... ttft=— ttftR=— total=0.78s txt=0b rsn=0b status=429 HTTP 429: {
+  "error": {
+    "code": 429,
+    "mes
+[197/320] gemini-2.0-flash / T5_translate_ru_en... ttft=— ttftR=— total=0.74s txt=0b rsn=0b status=429 HTTP 429: {
+  "error": {
+    "code": 429,
+    "mes
+[198/320] gemini-2.0-flash / T6_classify... ttft=— ttftR=— total=0.73s txt=0b rsn=0b status=429 HTTP 429: {
+  "error": {
+    "code": 429,
+    "mes
+[199/320] gemini-2.0-flash / T7_bash_oneliner... ttft=— ttftR=— total=0.86s txt=0b rsn=0b status=429 HTTP 429: {
+  "error": {
+    "code": 429,
+    "mes
+[200/320] gemini-2.0-flash / T8_python_function... ttft=— ttftR=— total=0.77s txt=0b rsn=0b status=429 HTTP 429: {
+  "error": {
+    "code": 429,
+    "mes
+[201/320] groq-llama-3.3-70b / T1_ru_edit_short... ttft=0.98s ttftR=— total=1.14s txt=78b rsn=0b status=200 ok
+[202/320] groq-llama-3.3-70b / T2_yt_summary_en... ttft=1.33s ttftR=— total=1.43s txt=211b rsn=0b status=200 ok
+[203/320] groq-llama-3.3-70b / T3_yt_summary_ru... ttft=1.07s ttftR=— total=1.38s txt=230b rsn=0b status=200 ok
+[204/320] groq-llama-3.3-70b / T4_json_extract... ttft=0.67s ttftR=— total=0.86s txt=136b rsn=0b status=200 ok
+[205/320] groq-llama-3.3-70b / T5_translate_ru_en... ttft=0.82s ttftR=— total=1.02s txt=264b rsn=0b status=200 ok
+[206/320] groq-llama-3.3-70b / T6_classify... ttft=0.82s ttftR=— total=0.85s txt=9b rsn=0b status=200 ok
+[207/320] groq-llama-3.3-70b / T7_bash_oneliner... ttft=1.41s ttftR=— total=1.50s txt=79b rsn=0b status=200 ok
+[208/320] groq-llama-3.3-70b / T8_python_function... ttft=1.24s ttftR=— total=1.76s txt=900b rsn=0b status=200 ok
+[209/320] groq-kimi-k2 / T1_ru_edit_short... ttft=— ttftR=— total=1.67s txt=0b rsn=0b status=404 HTTP 404: {"error":{"message":"The model `moonshot
+[210/320] groq-kimi-k2 / T2_yt_summary_en... ttft=— ttftR=— total=0.77s txt=0b rsn=0b status=404 HTTP 404: {"error":{"message":"The model `moonshot
+[211/320] groq-kimi-k2 / T3_yt_summary_ru... ttft=— ttftR=— total=1.04s txt=0b rsn=0b status=404 HTTP 404: {"error":{"message":"The model `moonshot
+[212/320] groq-kimi-k2 / T4_json_extract... ttft=— ttftR=— total=0.71s txt=0b rsn=0b status=404 HTTP 404: {"error":{"message":"The model `moonshot
+[213/320] groq-kimi-k2 / T5_translate_ru_en... ttft=— ttftR=— total=0.89s txt=0b rsn=0b status=404 HTTP 404: {"error":{"message":"The model `moonshot
+[214/320] groq-kimi-k2 / T6_classify... ttft=— ttftR=— total=0.75s txt=0b rsn=0b status=404 HTTP 404: {"error":{"message":"The model `moonshot
+[215/320] groq-kimi-k2 / T7_bash_oneliner... ttft=— ttftR=— total=0.82s txt=0b rsn=0b status=404 HTTP 404: {"error":{"message":"The model `moonshot
+[216/320] groq-kimi-k2 / T8_python_function... ttft=— ttftR=— total=0.76s txt=0b rsn=0b status=404 HTTP 404: {"error":{"message":"The model `moonshot
+[217/320] groq-qwen-32b / T1_ru_edit_short... ttft=1.04s ttftR=— total=1.99s txt=1284b rsn=0b status=200 ok
+[218/320] groq-qwen-32b / T2_yt_summary_en... ttft=1.19s ttftR=— total=1.85s txt=1507b rsn=0b status=200 ok
+[219/320] groq-qwen-32b / T3_yt_summary_ru... ttft=— ttftR=— total=1.07s txt=0b rsn=0b status=429 HTTP 429: {"error":{"message":"Rate limit reached 
+[220/320] groq-qwen-32b / T4_json_extract... ttft=0.89s ttftR=— total=2.11s txt=1353b rsn=0b status=200 ok
+[221/320] groq-qwen-32b / T5_translate_ru_en... ttft=0.84s ttftR=— total=1.78s txt=2124b rsn=0b status=200 ok
+[222/320] groq-qwen-32b / T6_classify... ttft=— ttftR=— total=1.20s txt=0b rsn=0b status=429 HTTP 429: {"error":{"message":"Rate limit reached 
+[223/320] groq-qwen-32b / T7_bash_oneliner... ttft=0.90s ttftR=— total=4.91s txt=5332b rsn=0b status=200 ok
+[224/320] groq-qwen-32b / T8_python_function... ttft=— ttftR=— total=0.72s txt=0b rsn=0b status=429 HTTP 429: {"error":{"message":"Rate limit reached 
+[225/320] minimax-m2.7-direct / T1_ru_edit_short... ttft=2.69s ttftR=— total=8.09s txt=1091b rsn=0b status=200 ok
+[226/320] minimax-m2.7-direct / T2_yt_summary_en... ttft=1.80s ttftR=— total=8.27s txt=1938b rsn=0b status=200 ok
+[227/320] minimax-m2.7-direct / T3_yt_summary_ru... ttft=1.89s ttftR=— total=9.89s txt=2035b rsn=0b status=200 ok
+[228/320] minimax-m2.7-direct / T4_json_extract... ttft=5.48s ttftR=— total=10.15s txt=1053b rsn=0b status=200 ok
+[229/320] minimax-m2.7-direct / T5_translate_ru_en... ttft=2.05s ttftR=— total=2.52s txt=471b rsn=0b status=200 ok
+[230/320] minimax-m2.7-direct / T6_classify... ttft=1.62s ttftR=— total=2.80s txt=629b rsn=0b status=200 ok
+[231/320] minimax-m2.7-direct / T7_bash_oneliner... ttft=5.16s ttftR=— total=11.01s txt=1522b rsn=0b status=200 ok
+[232/320] minimax-m2.7-direct / T8_python_function... ttft=2.41s ttftR=— total=13.44s txt=2341b rsn=0b status=200 ok
+[233/320] minimax-m2.7-highspeed-direct / T1_ru_edit_short... ttft=— ttftR=— total=1.17s txt=0b rsn=0b status=429 HTTP 429: {"type":"error","error":{"type":"rate_li
+[234/320] minimax-m2.7-highspeed-direct / T2_yt_summary_en... ttft=— ttftR=— total=1.28s txt=0b rsn=0b status=429 HTTP 429: {"type":"error","error":{"type":"rate_li
+[235/320] minimax-m2.7-highspeed-direct / T3_yt_summary_ru... ttft=— ttftR=— total=1.37s txt=0b rsn=0b status=429 HTTP 429: {"type":"error","error":{"type":"rate_li
+[236/320] minimax-m2.7-highspeed-direct / T4_json_extract... ttft=— ttftR=— total=1.33s txt=0b rsn=0b status=429 HTTP 429: {"type":"error","error":{"type":"rate_li
+[237/320] minimax-m2.7-highspeed-direct / T5_translate_ru_en... ttft=— ttftR=— total=1.24s txt=0b rsn=0b status=429 HTTP 429: {"type":"error","error":{"type":"rate_li
+[238/320] minimax-m2.7-highspeed-direct / T6_classify... ttft=— ttftR=— total=1.41s txt=0b rsn=0b status=429 HTTP 429: {"type":"error","error":{"type":"rate_li
+[239/320] minimax-m2.7-highspeed-direct / T7_bash_oneliner... ttft=— ttftR=— total=1.23s txt=0b rsn=0b status=429 HTTP 429: {"type":"error","error":{"type":"rate_li
+[240/320] minimax-m2.7-highspeed-direct / T8_python_function... ttft=— ttftR=— total=1.36s txt=0b rsn=0b status=429 HTTP 429: {"type":"error","error":{"type":"rate_li
+[241/320] minimax-m2.5-direct / T1_ru_edit_short... ttft=1.75s ttftR=— total=2.61s txt=587b rsn=0b status=200 ok
+[242/320] minimax-m2.5-direct / T2_yt_summary_en... ttft=2.43s ttftR=— total=3.94s txt=2059b rsn=0b status=200 ok
+[243/320] minimax-m2.5-direct / T3_yt_summary_ru... ttft=1.84s ttftR=— total=4.61s txt=2062b rsn=0b status=200 ok
+[244/320] minimax-m2.5-direct / T4_json_extract... ttft=1.55s ttftR=— total=2.16s txt=509b rsn=0b status=200 ok
+[245/320] minimax-m2.5-direct / T5_translate_ru_en... ttft=1.66s ttftR=— total=2.34s txt=1004b rsn=0b status=200 ok
+[246/320] minimax-m2.5-direct / T6_classify... ttft=1.49s ttftR=— total=2.31s txt=535b rsn=0b status=200 ok
+[247/320] minimax-m2.5-direct / T7_bash_oneliner... ttft=2.19s ttftR=— total=4.28s txt=2237b rsn=0b status=200 ok
+[248/320] minimax-m2.5-direct / T8_python_function... ttft=1.72s ttftR=— total=4.31s txt=3544b rsn=0b status=200 ok
+[249/320] minimax-m2.5-highspeed-direct / T1_ru_edit_short... ttft=— ttftR=— total=1.22s txt=0b rsn=0b status=429 HTTP 429: {"type":"error","error":{"type":"rate_li
+[250/320] minimax-m2.5-highspeed-direct / T2_yt_summary_en... ttft=— ttftR=— total=1.72s txt=0b rsn=0b status=429 HTTP 429: {"type":"error","error":{"type":"rate_li
+[251/320] minimax-m2.5-highspeed-direct / T3_yt_summary_ru... ttft=— ttftR=— total=1.48s txt=0b rsn=0b status=429 HTTP 429: {"type":"error","error":{"type":"rate_li
+[252/320] minimax-m2.5-highspeed-direct / T4_json_extract... ttft=— ttftR=— total=1.23s txt=0b rsn=0b status=429 HTTP 429: {"type":"error","error":{"type":"rate_li
+[253/320] minimax-m2.5-highspeed-direct / T5_translate_ru_en... ttft=— ttftR=— total=1.88s txt=0b rsn=0b status=429 HTTP 429: {"type":"error","error":{"type":"rate_li
+[254/320] minimax-m2.5-highspeed-direct / T6_classify... ttft=— ttftR=— total=1.38s txt=0b rsn=0b status=429 HTTP 429: {"type":"error","error":{"type":"rate_li
+[255/320] minimax-m2.5-highspeed-direct / T7_bash_oneliner... ttft=— ttftR=— total=1.29s txt=0b rsn=0b status=429 HTTP 429: {"type":"error","error":{"type":"rate_li
+[256/320] minimax-m2.5-highspeed-direct / T8_python_function... ttft=— ttftR=— total=1.45s txt=0b rsn=0b status=429 HTTP 429: {"type":"error","error":{"type":"rate_li
+[257/320] minimax-m2.1-direct / T1_ru_edit_short... ttft=1.75s ttftR=— total=3.03s txt=789b rsn=0b status=200 ok
+[258/320] minimax-m2.1-direct / T2_yt_summary_en... ttft=1.59s ttftR=— total=4.02s txt=2419b rsn=0b status=200 ok
+[259/320] minimax-m2.1-direct / T3_yt_summary_ru... ttft=1.66s ttftR=— total=5.84s txt=3410b rsn=0b status=200 ok
+[260/320] minimax-m2.1-direct / T4_json_extract... ttft=1.86s ttftR=— total=3.11s txt=729b rsn=0b status=200 ok
+[261/320] minimax-m2.1-direct / T5_translate_ru_en... ttft=1.57s ttftR=— total=2.74s txt=1326b rsn=0b status=200 ok
+[262/320] minimax-m2.1-direct / T6_classify... ttft=1.54s ttftR=— total=2.54s txt=468b rsn=0b status=200 ok
+[263/320] minimax-m2.1-direct / T7_bash_oneliner... ttft=1.57s ttftR=— total=4.19s txt=1695b rsn=0b status=200 ok
+[264/320] minimax-m2.1-direct / T8_python_function... ttft=1.94s ttftR=— total=4.95s txt=4325b rsn=0b status=200 ok
+[265/320] ollama-gemma4-e4b / T1_ru_edit_short... ttft=9.11s ttftR=— total=9.47s txt=76b rsn=0b status=200 ok
+[266/320] ollama-gemma4-e4b / T2_yt_summary_en... ttft=7.56s ttftR=— total=8.56s txt=407b rsn=0b status=200 ok
+[267/320] ollama-gemma4-e4b / T3_yt_summary_ru... ttft=7.63s ttftR=— total=9.31s txt=494b rsn=0b status=200 ok
+[268/320] ollama-gemma4-e4b / T4_json_extract... ttft=1.15s ttftR=— total=1.67s txt=130b rsn=0b status=200 ok
+[269/320] ollama-gemma4-e4b / T5_translate_ru_en... ttft=1.25s ttftR=— total=1.93s txt=265b rsn=0b status=200 ok
+[270/320] ollama-gemma4-e4b / T6_classify... ttft=1.09s ttftR=— total=1.11s txt=9b rsn=0b status=200 ok
+[271/320] ollama-gemma4-e4b / T7_bash_oneliner... ttft=0.96s ttftR=— total=1.34s txt=79b rsn=0b status=200 ok
+[272/320] ollama-gemma4-e4b / T8_python_function... ttft=5.19s ttftR=— total=11.64s txt=2031b rsn=0b status=200 ok
+[273/320] ollama-qwen3.5-9b / T1_ru_edit_short... ttft=— ttftR=— total=48.58s txt=0b rsn=0b status=200 ok
+[274/320] ollama-qwen3.5-9b / T2_yt_summary_en... ttft=— ttftR=— total=37.01s txt=0b rsn=0b status=200 ok
+[275/320] ollama-qwen3.5-9b / T3_yt_summary_ru... ttft=— ttftR=— total=37.07s txt=0b rsn=0b status=200 ok
+[276/320] ollama-qwen3.5-9b / T4_json_extract... ttft=21.75s ttftR=— total=22.39s txt=83b rsn=0b status=200 ok
+[277/320] ollama-qwen3.5-9b / T5_translate_ru_en... ttft=22.38s ttftR=— total=23.40s txt=275b rsn=0b status=200 ok
+[278/320] ollama-qwen3.5-9b / T6_classify... ttft=— ttftR=— total=36.47s txt=0b rsn=0b status=200 ok
+[279/320] ollama-qwen3.5-9b / T7_bash_oneliner... ttft=— ttftR=— total=36.24s txt=0b rsn=0b status=200 ok
+[280/320] ollama-qwen3.5-9b / T8_python_function... ttft=— ttftR=— total=36.63s txt=0b rsn=0b status=200 ok
+[281/320] ollama-gpt-oss-20b / T1_ru_edit_short... ttft=11.13s ttftR=— total=11.40s txt=88b rsn=0b status=200 ok
+[282/320] ollama-gpt-oss-20b / T2_yt_summary_en... ttft=5.27s ttftR=— total=6.45s txt=454b rsn=0b status=200 ok
+[283/320] ollama-gpt-oss-20b / T3_yt_summary_ru... ttft=8.98s ttftR=— total=10.84s txt=577b rsn=0b status=200 ok
+[284/320] ollama-gpt-oss-20b / T4_json_extract... ttft=4.78s ttftR=— total=5.34s txt=92b rsn=0b status=200 ok
+[285/320] ollama-gpt-oss-20b / T5_translate_ru_en... ttft=5.66s ttftR=— total=6.52s txt=282b rsn=0b status=200 ok
+[286/320] ollama-gpt-oss-20b / T6_classify... ttft=2.88s ttftR=— total=2.90s txt=9b rsn=0b status=200 ok
+[287/320] ollama-gpt-oss-20b / T7_bash_oneliner... ttft=9.81s ttftR=— total=10.13s txt=63b rsn=0b status=200 ok
+[288/320] ollama-gpt-oss-20b / T8_python_function... ttft=13.93s ttftR=— total=18.05s txt=1081b rsn=0b status=200 ok
+[289/320] ollama-qwen3-vl-8b / T1_ru_edit_short... ttft=26.58s ttftR=— total=30.70s txt=79b rsn=0b status=200 ok
+[290/320] ollama-qwen3-vl-8b / T2_yt_summary_en... ttft=1.57s ttftR=— total=9.10s txt=414b rsn=0b status=200 ok
+[291/320] ollama-qwen3-vl-8b / T3_yt_summary_ru... ttft=1.51s ttftR=— total=16.16s txt=409b rsn=0b status=200 ok
+[292/320] ollama-qwen3-vl-8b / T4_json_extract... ttft=1.31s ttftR=— total=5.86s txt=132b rsn=0b status=200 ok
+[293/320] ollama-qwen3-vl-8b / T5_translate_ru_en... ttft=1.31s ttftR=— total=6.14s txt=280b rsn=0b status=200 ok
+[294/320] ollama-qwen3-vl-8b / T6_classify... ttft=1.20s ttftR=— total=1.32s txt=9b rsn=0b status=200 ok
+[295/320] ollama-qwen3-vl-8b / T7_bash_oneliner... ttft=1.01s ttftR=— total=2.79s txt=71b rsn=0b status=200 ok
+[296/320] ollama-qwen3-vl-8b / T8_python_function... ttft=1.00s ttftR=— total=11.06s txt=547b rsn=0b status=200 ok
+[297/320] claude-opus-4-7 / T1_ru_edit_short... ttft=18.13s ttftR=18.13s total=18.13s txt=92b rsn=0b status=200 ok
+[298/320] claude-opus-4-7 / T2_yt_summary_en... ttft=17.07s ttftR=17.07s total=17.07s txt=542b rsn=0b status=200 ok
+[299/320] claude-opus-4-7 / T3_yt_summary_ru... ttft=15.42s ttftR=15.42s total=15.42s txt=611b rsn=0b status=200 ok
+[300/320] claude-opus-4-7 / T4_json_extract... ttft=13.04s ttftR=13.04s total=13.04s txt=131b rsn=0b status=200 ok
+[301/320] claude-opus-4-7 / T5_translate_ru_en... ttft=14.20s ttftR=14.20s total=14.20s txt=281b rsn=0b status=200 ok
+[302/320] claude-opus-4-7 / T6_classify... ttft=12.41s ttftR=12.41s total=12.41s txt=9b rsn=0b status=200 ok
+[303/320] claude-opus-4-7 / T7_bash_oneliner... ttft=10.71s ttftR=10.71s total=10.71s txt=64b rsn=0b status=200 ok
+[304/320] claude-opus-4-7 / T8_python_function... ttft=15.94s ttftR=15.94s total=15.94s txt=743b rsn=0b status=200 ok
+[305/320] claude-sonnet-4-6 / T1_ru_edit_short... ttft=13.20s ttftR=13.20s total=13.20s txt=60b rsn=0b status=200 ok
+[306/320] claude-sonnet-4-6 / T2_yt_summary_en... ttft=14.40s ttftR=14.40s total=14.40s txt=504b rsn=0b status=200 ok
+[307/320] claude-sonnet-4-6 / T3_yt_summary_ru... ttft=14.71s ttftR=14.71s total=14.71s txt=546b rsn=0b status=200 ok
+[308/320] claude-sonnet-4-6 / T4_json_extract... ttft=12.17s ttftR=12.17s total=12.17s txt=160b rsn=0b status=200 ok
+[309/320] claude-sonnet-4-6 / T5_translate_ru_en... ttft=13.29s ttftR=13.29s total=13.29s txt=281b rsn=0b status=200 ok
+[310/320] claude-sonnet-4-6 / T6_classify... ttft=12.25s ttftR=12.25s total=12.25s txt=9b rsn=0b status=200 ok
+[311/320] claude-sonnet-4-6 / T7_bash_oneliner... ttft=14.37s ttftR=14.37s total=14.37s txt=56b rsn=0b status=200 ok
+[312/320] claude-sonnet-4-6 / T8_python_function... ttft=14.07s ttftR=14.07s total=14.07s txt=733b rsn=0b status=200 ok
+[313/320] claude-haiku-4-5 / T1_ru_edit_short... ttft=16.02s ttftR=16.02s total=16.02s txt=69b rsn=0b status=200 ok
+[314/320] claude-haiku-4-5 / T2_yt_summary_en... ttft=16.89s ttftR=16.89s total=16.89s txt=750b rsn=0b status=200 ok
+[315/320] claude-haiku-4-5 / T3_yt_summary_ru... ttft=17.21s ttftR=17.21s total=17.21s txt=597b rsn=0b status=200 ok
+[316/320] claude-haiku-4-5 / T4_json_extract... ttft=15.05s ttftR=15.05s total=15.05s txt=160b rsn=0b status=200 ok
+[317/320] claude-haiku-4-5 / T5_translate_ru_en... ttft=13.96s ttftR=13.96s total=13.96s txt=279b rsn=0b status=200 ok
+[318/320] claude-haiku-4-5 / T6_classify... ttft=13.67s ttftR=13.67s total=13.67s txt=9b rsn=0b status=200 ok
+[319/320] claude-haiku-4-5 / T7_bash_oneliner... ttft=17.06s ttftR=17.06s total=17.06s txt=56b rsn=0b status=200 ok
+[320/320] claude-haiku-4-5 / T8_python_function... ttft=22.23s ttftR=22.23s total=22.23s txt=1158b rsn=0b status=200 ok
