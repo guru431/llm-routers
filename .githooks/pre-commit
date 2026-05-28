@@ -1,0 +1,60 @@
+#!/bin/sh
+# pre-commit secret-guard for a PUBLIC repository.
+# Blocks commits that add sensitive files, high-entropy key formats, or
+# personal strings listed in an untracked .sanitize-patterns file.
+#
+# Activate once per clone:   git config core.hooksPath .githooks
+# Bypass a confirmed false positive:   git commit --no-verify
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+fail=0
+
+# 1) Block sensitive filenames being newly added (allow *.example* templates)
+added=$(git diff --cached --name-only --diff-filter=A || true)
+if [ -n "$added" ]; then
+  bad=$(printf '%s\n' "$added" \
+    | grep -iE '(^|/)(\.env(\.[A-Za-z0-9]+)?$|.*\.pem$|.*\.key$|.*\.p12$|.*\.pfx$|id_rsa|id_ed25519|id_dsa|vault\.env|\.sanitize-patterns$)' \
+    | grep -ivE '\.example(\.|$)' || true)
+  if [ -n "$bad" ]; then
+    echo "BLOCKED: refusing to commit sensitive file(s):"
+    printf '  %s\n' $bad
+    fail=1
+  fi
+fi
+
+# Collect staged diff once (exclude the hook itself to avoid self-matching)
+diff_content=$(git diff --cached --unified=0 -- . ':(exclude).githooks/' 2>/dev/null || git diff --cached --unified=0)
+
+# 2) High-confidence secret/token formats (generic, very low false-positive)
+generic='-----BEGIN [A-Z ]*PRIVATE KEY-----|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|gho_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9_-]{16,}|ccr-[A-Za-z0-9]{8,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+|[0-9]{8,10}:[A-Za-z0-9_-]{35}'
+hits=$(printf '%s\n' "$diff_content" | grep -nE -e "$generic" || true)
+if [ -n "$hits" ]; then
+  echo "BLOCKED: possible secret/token format in staged changes:"
+  printf '%s\n' "$hits" | sed 's/^/  /'
+  fail=1
+fi
+
+# 3) Personal denylist — concrete values from untracked .sanitize-patterns
+sp="$repo_root/.sanitize-patterns"
+if [ -f "$sp" ]; then
+  pat=$(mktemp 2>/dev/null || echo "$repo_root/.sanitize-patterns.tmp")
+  grep -vE '^[[:space:]]*$' "$sp" > "$pat" 2>/dev/null || true
+  if [ -s "$pat" ]; then
+    hits=$(printf '%s\n' "$diff_content" | grep -inEf "$pat" || true)
+    if [ -n "$hits" ]; then
+      echo "BLOCKED: personal data (matched .sanitize-patterns) in staged changes:"
+      printf '%s\n' "$hits" | sed 's/^/  /'
+      fail=1
+    fi
+  fi
+  rm -f "$pat"
+fi
+
+if [ "$fail" -ne 0 ]; then
+  echo ""
+  echo "Commit aborted — this is a PUBLIC repository."
+  echo "Fix the lines above, or for a confirmed false positive: git commit --no-verify"
+  exit 1
+fi
+exit 0

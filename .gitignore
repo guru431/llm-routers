@@ -22,3 +22,6 @@ secrets/
 
 # Internal design docs (kept local, not published)
 docs/
+
+# local-only secret denylist for pre-commit hook (never commit)
+.sanitize-patterns
