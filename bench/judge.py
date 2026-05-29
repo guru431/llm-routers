@@ -26,7 +26,22 @@ TASKS_JSON = ROOT / "prompts" / "tasks.json"
 RESULTS = ROOT / "results"
 JUDGE_FILE = RESULTS / "_judge.jsonl"
 
-JUDGE_ENDPOINT = os.environ.get("JUDGE_ENDPOINT", "http://localhost:8765/v1/chat/completions")
+
+def _vault() -> dict[str, str]:
+    """Read endpoint overrides / secrets from the gitignored secrets/vault.env."""
+    path = Path(os.environ.get("VAULT_PATH") or (ROOT.parent / "secrets" / "vault.env"))
+    env: dict[str, str] = {}
+    if path.exists():
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip().strip('"').strip("'")
+    return env
+
+
+JUDGE_ENDPOINT = (os.environ.get("JUDGE_ENDPOINT") or _vault().get("JUDGE_ENDPOINT")
+                  or "http://localhost:8765/v1/chat/completions")
 JUDGE_MODEL = "claude-opus-4-8"
 
 RUBRIC = {
