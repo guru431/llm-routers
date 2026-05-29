@@ -1,7 +1,7 @@
  {
    "LOG": true,
    "LOG_LEVEL": "debug",
-   "HOST": "0.0.0.0",
+   "HOST": "127.0.0.1",
    "PORT": 3456,
    "APIKEY": "<CCR_APIKEY_HERE>",
    "API_TIMEOUT_MS": "600000",

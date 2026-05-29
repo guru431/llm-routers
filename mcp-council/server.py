@@ -927,6 +927,9 @@ async def model_panel(
     moderator_seed = {"id": mon_cfg["id"], "model": mon_cfg["model"]}
 
     async def runner(state):
+        state.diversity_monitor = diversity_monitor
+        state.diversity_threshold = diversity_threshold
+        state.devils_advocate_rotation = devils_advocate_rotation
         await run_panel(
             state=state, question=question, participant_cfgs=part_cfgs,
             monitor_cfg=mon_cfg, rounds=rounds, max_tokens=max_tokens,
@@ -1158,26 +1161,31 @@ async def dialogue_continue(
             }
             start = s.current_round + 1
             for round_n in range(start, s.total_rounds + 1):
-                da_id = devils_advocate_for_round(s.participants, round_n)
-                rules = {da_id: DEVILS_ADVOCATE_RULE}
+                rules = None
+                if s.devils_advocate_rotation:
+                    da_id = devils_advocate_for_round(s.participants, round_n)
+                    rules = {da_id: DEVILS_ADVOCATE_RULE}
                 await run_round(
                     state=s, round_n=round_n, topic=s.question_preview,
                     role_descriptors=role_descriptors, max_tokens=max_tokens,
                     web_search=web_search, anti_agreement_rules=rules,
                     files_section=files_section, do_critique=True,
                 )
-                s.devils_advocates.append(da_id)
-                responses_this_round = {
-                    h["id"]: h["text"] for h in s.history
-                    if h["round"] == round_n and h["phase"] == "response" and h.get("status") == "ok"
-                }
-                score, agreers = await run_diversity_check(monitor_cfg=mod_cfg, responses=responses_this_round)
-                s.diversity_scores.append(score)
-                await _maybe_reprompt(
-                    state=s, round_n=round_n, participant_cfgs=part_cfgs,
-                    score=score, agreers=agreers, threshold=7, topic=s.question_preview,
-                    max_tokens=max_tokens, files_section=files_section,
-                )
+                if s.devils_advocate_rotation:
+                    s.devils_advocates.append(da_id)
+                if s.diversity_monitor:
+                    responses_this_round = {
+                        h["id"]: h["text"] for h in s.history
+                        if h["round"] == round_n and h["phase"] == "response" and h.get("status") == "ok"
+                    }
+                    score, agreers = await run_diversity_check(monitor_cfg=mod_cfg, responses=responses_this_round)
+                    s.diversity_scores.append(score)
+                    await _maybe_reprompt(
+                        state=s, round_n=round_n, participant_cfgs=part_cfgs,
+                        score=score, agreers=agreers, threshold=s.diversity_threshold,
+                        topic=s.question_preview,
+                        max_tokens=max_tokens, files_section=files_section,
+                    )
             dialogue_state.mark_phase(s, "summarizing")
             prompt = render_summary_prompt(topic=s.question_preview, history=s.history, mode="panel")
             r = await _run_turn(cfg=mod_cfg, prompt=prompt, max_tokens=max_tokens, web_search=False)

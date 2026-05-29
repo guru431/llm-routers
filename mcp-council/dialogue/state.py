@@ -54,6 +54,12 @@ class DialogueState:
     max_tokens: int = 4096
     context_paths: list[str] = field(default_factory=list)
 
+    # Panel-only anti-convergence settings; preserved so dialogue_continue
+    # resumes a panel with the same config instead of the hardcoded defaults.
+    diversity_monitor: bool = True
+    diversity_threshold: int = 7
+    devils_advocate_rotation: bool = True
+
     _task: asyncio.Task | None = field(default=None, repr=False)
 
 

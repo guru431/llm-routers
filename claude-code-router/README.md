@@ -2,7 +2,7 @@
 
 Кастомизация npm-пакета [`@musistudio/claude-code-router`](https://github.com/musistudio/claude-code-router) (`ccr`) — HTTP-прокси, который принимает Anthropic API-запросы от Claude Code и роутит их в произвольных LLM-провайдеров (OpenAI-совместимый upstream).
 
-В отличие от соседних пакетов `mcp-*` это **не MCP-сервер**, а отдельный сервис, слушающий `0.0.0.0:3456`.
+В отличие от соседних пакетов `mcp-*` это **не MCP-сервер**, а отдельный сервис, слушающий по умолчанию `127.0.0.1:3456` (loopback; для LAN-доступа явно выставить `HOST: 0.0.0.0` в конфиге).
 
 ## Состав
 
@@ -60,7 +60,7 @@ Get-Item "$env:USERPROFILE\.claude-code-router\custom_router.js" | Select-Object
 ## Запуск
 
 ```bash
-ccr start    # стартует HTTP-прокси на 0.0.0.0:3456
+ccr start    # стартует HTTP-прокси на 127.0.0.1:3456 (HOST из config.json)
 ccr stop
 ccr status
 ```
