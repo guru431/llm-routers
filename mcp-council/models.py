@@ -57,6 +57,17 @@ CATALOG: dict[str, dict] = {
         "env_key": "HELICONE_GATEWAY_KEY",
         "min_max_tokens": 30000,
     },
+    "codex": {
+        # codex-agent-server (local OpenAI-compatible wrapper over `codex exec`,
+        # ChatGPT subscription). `sandbox: read-only` forces pure text generation
+        # — без него дефолт сервера тоже read-only, но члену совета агентный режим
+        # не нужен ни при каких настройках сервера. Сервер должен быть запущен на
+        # :8766; CODEX_AGENT_TOKEN передаётся через окружение MCP-сервера.
+        "model": "gpt-5.5",
+        "base_url": "http://127.0.0.1:8766/v1",
+        "env_key": "CODEX_AGENT_TOKEN",
+        "extra": {"sandbox": "read-only"},
+    },
 
     # --- Routine workers (model_ask only) ---
     "deepseek-flash": {
@@ -80,6 +91,7 @@ COUNCIL_DEFAULT: list[str] = [
     "qwen",
     "minimax",
     "gemini",
+    "codex",
 ]
 
 

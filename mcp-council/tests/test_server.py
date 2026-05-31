@@ -228,7 +228,7 @@ def test_council_ask_default_models_passes_six_members(monkeypatch):
     asyncio.run(server._do_council_ask_async(
         question="q", context_paths=[], max_response_tokens=1024,
     ))
-    assert len(captured["members"]) == 6
+    assert len(captured["members"]) == 7
     fake_dump.unlink(missing_ok=True)
 
 

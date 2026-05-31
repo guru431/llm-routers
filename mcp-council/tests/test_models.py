@@ -11,9 +11,10 @@ from models import (
 )
 
 
-def test_council_default_has_six_members():
-    assert len(COUNCIL_DEFAULT) == 6
+def test_council_default_has_seven_members():
+    assert len(COUNCIL_DEFAULT) == 7
     assert "deepseek-pro" in COUNCIL_DEFAULT
+    assert "codex" in COUNCIL_DEFAULT
     assert "deepseek" not in COUNCIL_DEFAULT  # renamed
     for mid in COUNCIL_DEFAULT:
         assert mid in CATALOG

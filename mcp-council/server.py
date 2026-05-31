@@ -315,7 +315,7 @@ async def council_ask(
 
     Parameters:
       models — list[str] | None. Список model_id из CATALOG (например
-        ["glm","kimi","deepseek-pro"]). None → все 6 default-членов. ≥2.
+        ["glm","kimi","deepseek-pro"]). None → все 7 default-членов. ≥2.
       context_paths — опциональные файлы, прокидываются всем участникам (sandbox).
       synthesis — если True, добавляется stage 3 (auto-synthesis by chairman);
         если False, возвращаются только материалы stage1+stage2.
@@ -737,8 +737,8 @@ from dialogue.engine import write_dump, _run_turn
 DIALOGUE_DUMP_DIR = Path(__file__).parent / "logs" / "dialogues"
 DIALOGUE_ROUNDS_MAX = 20
 DIALOGUE_ROUNDS_MIN = 1
-DEFAULT_DEBATE_PARTICIPANTS = ["glm", "kimi"]
-DEFAULT_PANEL_PARTICIPANTS = ["glm", "kimi", "deepseek-pro", "qwen", "minimax", "gemini"]
+DEFAULT_DEBATE_PARTICIPANTS = ["glm", "kimi", "codex"]
+DEFAULT_PANEL_PARTICIPANTS = ["glm", "kimi", "deepseek-pro", "qwen", "minimax", "gemini", "codex"]
 DEFAULT_SOCRATIC_QUESTIONER = "deepseek-pro"
 DEFAULT_SOCRATIC_RESPONDENT = "glm"
 DEFAULT_MODERATOR = "deepseek-flash"
@@ -844,7 +844,7 @@ async def model_debate(
 
     Parameters:
       participants — list[str] | None. Минимум 2 distinct id из CATALOG.
-        Default: ["glm", "kimi"].
+        Default: ["glm", "kimi", "codex"].
       moderator — str | None. Default: "deepseek-flash" (дешёвая модель для
         разбиения вопроса и summary).
       rounds — 1..20. Default 5.
@@ -902,7 +902,7 @@ async def model_panel(
     обязан возражать) + diversity monitor (cheap LLM-вызов проверяет similarity,
     при score > threshold re-prompt согласившимся).
 
-    Default participants = COUNCIL_DEFAULT (6 моделей). Min 4 distinct.
+    Default participants = DEFAULT_PANEL_PARTICIPANTS (7 моделей, вкл. codex). Min 4 distinct.
     """
     rounds = _validate_rounds(rounds)
     ids = participants or DEFAULT_PANEL_PARTICIPANTS

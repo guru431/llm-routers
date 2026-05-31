@@ -1,0 +1,115 @@
+# Install Codex Agent Server as a Windows Scheduled Task (auto-start on boot).
+#
+# Usage:
+#   .\install_task.ps1                                  # interactive (asks for password)
+#   .\install_task.ps1 -ServerPath '<full UNC path>'    # override server.py location
+#   .\install_task.ps1 -BindHost 0.0.0.0                # expose on LAN (default 127.0.0.1 loopback-only)
+#   .\install_task.ps1 -Uninstall                       # remove the task
+#
+# SECURITY: default bind is 127.0.0.1 (loopback-only), matching server.py.
+# Pass -BindHost 0.0.0.0 to expose on the LAN — only do so deliberately, since
+# the agentic (workspace-write) mode lets requests write files. The server REQUIRES
+# CODEX_AGENT_TOKEN in its environment and refuses to start without it.
+# Set it (and CODEX_AGENT_WORKDIR for agentic use) before installing, e.g.:
+#   [Environment]::SetEnvironmentVariable('CODEX_AGENT_TOKEN','<token>','Machine')
+#   [Environment]::SetEnvironmentVariable('CODEX_AGENT_WORKDIR','C:\codex-workspace','Machine')
+# Machine-scope is recommended so the scheduled task picks it up at boot,
+# independent of any user logon. After setting, restart the task:
+#   schtasks /end /tn \codex_agent_server
+#   schtasks /run /tn \codex_agent_server
+#
+# NOTE: like claude_agent_server, this task is managed separately from any
+# central task registry (LogonType=Password; the registry syncer does not
+# store passwords). Do NOT add it to such a registry.
+
+param(
+    [switch]$Uninstall,
+    [string]$ServerPath,
+    [string]$BindHost = '127.0.0.1',
+    [int]$Port = 8766
+)
+
+$ErrorActionPreference = "Stop"
+
+$TaskPath = '\'
+$TaskName = 'codex_agent_server'
+$FullName = "$TaskPath$TaskName"
+
+if ($Uninstall) {
+    schtasks /delete /tn $FullName /f
+    Write-Host "Removed task $FullName" -ForegroundColor Green
+    return
+}
+
+# Discover pythonw.exe (preferred — no console window)
+$pythonw = (Get-Command pythonw.exe -ErrorAction SilentlyContinue).Source
+if (-not $pythonw) {
+    $pythonw = (Get-Command python.exe -ErrorAction SilentlyContinue).Source
+    if (-not $pythonw) {
+        Write-Error "Neither pythonw.exe nor python.exe found in PATH. Install Python 3.10+."
+        exit 1
+    }
+    Write-Warning "pythonw.exe not found, falling back to python.exe (will show a console window)"
+}
+
+# Resolve server.py path.
+# NOTE: Task Scheduler runs at boot, before any mapped network drive (e.g. S:\) is
+# mounted. If server.py lives on a mapped drive, pass an explicit UNC path via
+# -ServerPath (e.g. \\server\share\...\server.py). By default we use this script's
+# own folder, which works when the project sits on a local drive.
+if (-not $ServerPath) {
+    $ServerPath = Join-Path $PSScriptRoot 'server.py'
+}
+
+if (-not (Test-Path $ServerPath)) {
+    Write-Error "server.py not found at $ServerPath"
+    exit 1
+}
+
+# Refuse a mapped network drive (e.g. S:\): an onstart task runs in session 0
+# before logon, when such mappings don't exist — the task would silently fail to
+# find the script. Require a UNC (\\server\share\...) or local path instead.
+$root = [System.IO.Path]::GetPathRoot($ServerPath)
+if ($root -match '^[A-Za-z]:\\$') {
+    $drive = Get-PSDrive -Name $root.Substring(0,1) -ErrorAction SilentlyContinue
+    if ($drive -and $drive.DisplayRoot -like '\\*') {
+        Write-Error ("ServerPath is on mapped network drive $root ($($drive.DisplayRoot)). " +
+            "A boot task runs before logon when this mapping is absent and would fail to start. " +
+            "Pass -ServerPath with a UNC path, e.g. '$($drive.DisplayRoot)\...\server.py', or a local path.")
+        exit 1
+    }
+}
+
+# Build command. Quote each path independently so spaces in either pythonw or
+# server path don't break tokenization (schtasks /tr passes the string to cmd.exe).
+$Arguments = "`"$ServerPath`" --host $BindHost --port $Port"
+$TaskRun = "`"$pythonw`" $Arguments"
+
+Write-Host "Creating scheduled task: $FullName"
+Write-Host "  Exe:  $pythonw"
+Write-Host "  Args: $Arguments"
+Write-Host "  /tr:  $TaskRun"
+Write-Host ""
+
+schtasks /create /tn $FullName /rl highest /tr $TaskRun /sc onstart /f
+Set-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -Settings $(
+    New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -ExecutionTimeLimit 0 -DisallowHardTerminate
+)
+
+$user = "$env:USERDOMAIN\$env:USERNAME"
+Write-Host "Enter password for $user to allow the task to run when you are not logged in:"
+$cred = Get-Credential -Credential $user
+# Set-ScheduledTask -Password requires a plain string; the SecureString → plain
+# conversion is unavoidable (cmdlet API limitation). Mitigations:
+#   1. Get-Credential prompt — password never enters PS history.
+#   2. Plain string is inline, not stored in a named $password variable.
+#   3. $cred is nulled immediately after use to release the SecureString sooner.
+Set-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName `
+    -User $user -Password $cred.GetNetworkCredential().Password
+$cred = $null
+[System.GC]::Collect()
+
+Write-Host ""
+Write-Host "Done. Task will start automatically on next boot." -ForegroundColor Green
+Write-Host "Start it now with: schtasks /run /tn $FullName"
