@@ -113,6 +113,8 @@ curl http://localhost:8765/health
 | `CLAUDE_AGENT_CACHE` | `1` | Включить response cache (`0`/`false` — выключить) |
 | `CLAUDE_AGENT_CACHE_SIZE` | `256` | Макс. записей в кэше (LRU eviction) |
 | `CLAUDE_AGENT_CACHE_TTL` | `3600` | TTL записи в секундах |
+| `CLAUDE_AGENT_MAX_BODY` | `10485760` (10 MB) | Макс. размер тела запроса; больше → `413` |
+| `CLAUDE_AGENT_MAX_CONCURRENCY` | `4` | Макс. параллельных claude-вызовов; сверх → `429` |
 
 ## Использование
 

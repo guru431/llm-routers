@@ -25,6 +25,15 @@ JOB_TTL_SECONDS = 24 * 3600
 # finished jobs are dropped first, then oldest running. Pet-project scale.
 MAX_JOBS = 64
 
+# Hard cap on concurrently ACTIVE (non-terminal) jobs. Each council run fans out
+# to 6-7 upstream LLM calls (× rounds), so unbounded async jobs would exhaust the
+# connection pool / provider rate limits and silently burn paid balances
+# (DeepSeek PAYG, Exa, OCG). New jobs past this limit are rejected. Mirrors
+# dialogue's MAX_ACTIVE_SESSIONS.
+MAX_ACTIVE_JOBS = 16
+
+TERMINAL_PHASES = frozenset({"done", "error", "cancelled"})
+
 
 @dataclass
 class MemberProgress:
@@ -101,6 +110,12 @@ async def create_job(
     async with _jobs_lock:
         now = time.time()
         _gc_locked(now)
+        active = sum(1 for j in _jobs.values() if j.phase not in TERMINAL_PHASES)
+        if active >= MAX_ACTIVE_JOBS:
+            raise RuntimeError(
+                f"too many active council jobs ({active}/{MAX_ACTIVE_JOBS}); "
+                "wait for some to finish or call council_cancel on stale ones"
+            )
         jid = _new_job_id()
         state = JobState(
             job_id=jid,
@@ -122,6 +137,13 @@ async def list_jobs(limit: int = 20) -> list[JobState]:
     async with _jobs_lock:
         items = sorted(_jobs.values(), key=lambda j: j.created_at, reverse=True)
         return items[:limit]
+
+
+async def active_job_count() -> int:
+    """Number of non-terminal (queued/running) jobs — for surfacing the
+    MAX_ACTIVE_JOBS budget in council_status."""
+    async with _jobs_lock:
+        return sum(1 for j in _jobs.values() if j.phase not in TERMINAL_PHASES)
 
 
 async def cancel_job(job_id: str) -> bool:

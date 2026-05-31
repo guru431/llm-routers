@@ -566,7 +566,12 @@ async def council_status(job_id: str) -> dict:
     state = await job_state.get_job(job_id)
     if state is None:
         return {"error": f"unknown job_id: {job_id}"}
-    return job_state.snapshot(state)
+    snap = job_state.snapshot(state)
+    # Surface the global active-jobs budget so callers can see headroom before
+    # firing more council_ask_async calls (cap enforced in state.create_job).
+    snap["active_jobs"] = await job_state.active_job_count()
+    snap["max_active_jobs"] = job_state.MAX_ACTIVE_JOBS
+    return snap
 
 
 @mcp.tool()

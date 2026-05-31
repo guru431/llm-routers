@@ -160,6 +160,7 @@ print(resp.choices[0].message.content)
 - Bind по умолчанию `127.0.0.1`. Для LAN (`--host 0.0.0.0`) — bearer-токен обязателен (и так требуется).
 - `CODEX_AGENT_TOKEN` **обязателен** — без него сервер не стартует (exit 2). Все endpoint кроме `/health` требуют `Authorization: Bearer`.
 - **Агентный режим = HTTP-запрос может писать файлы и запускать shell.** Защита: обязательный токен, containment-проверка `workdir` внутри `CODEX_AGENT_WORKDIR_ROOT`, безопасный дефолт `read-only`.
+- **Реальный write-containment делегирован codex**, а не `-C`/realpath-проверке (та лишь выбирает cwd и отсекает запросы вне корня). На каждый агентный вызов сервер пиннит `-c sandbox_workspace_write.writable_roots=[<workdir>]`, чтобы границу записи enforce'ил сам `codex --sandbox workspace-write`, а не дефолтное поведение cwd.
 - Глобальные MCP-серверы Codex отключаются на каждом вызове (`-c mcp_servers={}`), чтобы сервис не триггерил сторонние интеграции.
 
 ## Тесты

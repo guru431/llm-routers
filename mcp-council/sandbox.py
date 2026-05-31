@@ -9,10 +9,26 @@ BLOCK_NAMES = frozenset({
     "credentials.json",
     "secrets.yaml",
     "secrets.yml",
+    # Token/credential files that carry no secret-y extension.
+    ".netrc",
+    ".npmrc",
+    ".pgpass",
+    ".dockercfg",
+    "kubeconfig",
+    # Common private-key basenames copied outside ~/.ssh (no extension).
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
 })
 
 BLOCK_NAME_PREFIXES = (".env.", ".credentials")
-BLOCK_NAME_SUFFIXES = (".pem", ".key")
+# Key/cert/keystore extensions. Deny-list is best-effort — the PEM content-sniff
+# in _has_secret_header() is the real safety net for renamed/extensionless keys.
+BLOCK_NAME_SUFFIXES = (
+    ".pem", ".key", ".p12", ".pfx", ".crt", ".cer",
+    ".kdbx", ".keystore", ".jks", ".ppk",
+)
 BLOCK_DIR_SEGMENTS = ("/.ssh/", "/.aws/", "/.gcp/")
 BLOCK_NAMES_IN_CLAUDE_DIR = frozenset({"settings.json", "settings.local.json"})
 
@@ -56,6 +72,30 @@ class SandboxError(Exception):
     """Любая нарушение sandbox-правил (blacklist, size, count, missing file)."""
 
 
+_SECRET_SNIFF_BYTES = 8192
+
+# Substrings that mark a file as a private key / credential regardless of its
+# name or extension. The deny-list above catches known *names*; this catches a
+# private key copied to /tmp/mykey, id_rsa renamed to backup, a .pem renamed to
+# .txt, etc. — the actual exfiltration risk when such a file is passed as a
+# context_path and shipped to a third-party LLM API.
+_SECRET_HEADER_MARKERS = (
+    b"PRIVATE KEY-----",        # -----BEGIN (RSA|EC|DSA|OPENSSH|generic) PRIVATE KEY-----
+    b"PuTTY-User-Key-File",     # PuTTY .ppk private key
+)
+
+
+def _has_secret_header(p: Path) -> bool:
+    """True if the file's first 8KB contain a private-key / credential header.
+    Content-sniff safety net for renamed or extensionless secrets."""
+    try:
+        with p.open("rb") as fh:
+            chunk = fh.read(_SECRET_SNIFF_BYTES)
+    except OSError:
+        return False
+    return any(marker in chunk for marker in _SECRET_HEADER_MARKERS)
+
+
 def resolve_and_validate(paths: list[str]) -> list[Path]:
     """Нормализовать и провалидировать список путей. Возвращает list[Path].
 
@@ -77,6 +117,8 @@ def resolve_and_validate(paths: list[str]) -> list[Path]:
         path = Path(os.path.expanduser(p)).resolve()
         if not path.is_file():
             raise SandboxError(f"not a file: {p}")
+        if _has_secret_header(path):
+            raise SandboxError(f"blocked by sandbox (private-key/credential content): {p}")
         resolved.append(path)
     return resolved
 

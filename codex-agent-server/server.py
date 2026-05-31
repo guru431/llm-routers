@@ -149,6 +149,13 @@ def resolve_workdir(req_workdir: str | None) -> str:
 
     Falls back to CODEX_AGENT_WORKDIR. The resolved real path must be inside
     CODEX_AGENT_WORKDIR_ROOT, else BadRequest.
+
+    Security note: this check picks *where* codex runs (its cwd) and rejects an
+    out-of-root request early. The actual write-containment boundary is enforced
+    by codex's own `--sandbox workspace-write`, not by this realpath check
+    (which a TOCTOU symlink swap could in principle defeat). run_codex pins
+    `sandbox_workspace_write.writable_roots` to this resolved path so the boundary
+    is enforced by codex itself.
     """
     # A configured root is required to containment-check; without one we cannot
     # safely allow file-writing requests. Guard first so a request-supplied
@@ -277,6 +284,13 @@ def run_codex(prompt: str, *, model_base: str, sandbox: str,
         cmd += ["-c", f"model_reasoning_effort={reasoning}"]
     if sandbox == "workspace-write" and workdir:
         cmd += ["-C", workdir]
+        # Real write-containment is enforced by codex's own `--sandbox
+        # workspace-write`, NOT by resolve_workdir()'s -C/realpath check (that
+        # check only picks the cwd). Pin the enforced writable root to the
+        # already-containment-checked workdir so codex itself — not just our
+        # choice of cwd — is the security boundary. json.dumps escapes Windows
+        # backslashes into valid JSON, which codex parses for the `-c` value.
+        cmd += ["-c", f"sandbox_workspace_write.writable_roots={json.dumps([workdir])}"]
 
     fd, outfile = tempfile.mkstemp(suffix=".txt", prefix="codex-out-")
     os.close(fd)
@@ -296,10 +310,18 @@ def run_codex(prompt: str, *, model_base: str, sandbox: str,
         with open(outfile, encoding="utf-8") as f:
             return f.read().strip()
     finally:
-        try:
-            os.remove(outfile)
-        except OSError:
-            pass
+        # On Windows the spawned codex process (or an AV scan) may still hold
+        # `outfile` for a moment after exit, making os.remove raise. Retry a few
+        # times with a short sleep — almost always clears within ~250ms — so the
+        # temp file doesn't leak. Mirrors dialogue/engine.py's replace-retry.
+        for _ in range(5):
+            try:
+                os.remove(outfile)
+                break
+            except FileNotFoundError:
+                break
+            except OSError:
+                time.sleep(0.05)
 
 
 def extract_content(content) -> str:
@@ -319,6 +341,13 @@ def extract_content(content) -> str:
 # ============================================================
 
 class Handler(BaseHTTPRequestHandler):
+    # Socket timeout (seconds), applied by StreamRequestHandler.setup() to the
+    # whole connection. Guards against a lying/partial Content-Length that pins
+    # a worker thread on a blocking rfile.read() forever. Only counts against
+    # idle socket ops, so it won't interrupt a long in-flight codex call (no
+    # socket I/O happens while the subprocess runs).
+    timeout = 60
+
     def log_message(self, format, *args):
         logger.info("%s %s", self.address_string(), format % args)
 

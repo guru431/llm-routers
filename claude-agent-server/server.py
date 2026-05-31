@@ -16,6 +16,8 @@ Env:
     CLAUDE_AGENT_CACHE      — '1'/'0' включить response cache (default: '1')
     CLAUDE_AGENT_CACHE_SIZE — макс. записей в кэше (default: 256, LRU eviction)
     CLAUDE_AGENT_CACHE_TTL  — TTL записи в секундах (default: 3600 = 1h)
+    CLAUDE_AGENT_MAX_BODY   — макс. размер тела запроса в байтах (default: 10 MB; >лимит → 413)
+    CLAUDE_AGENT_MAX_CONCURRENCY — макс. параллельных claude-вызовов (default: 4; сверх → 429)
 
 Caching:
     Сервер кэширует ответы по ключу (model, system_prompt, prompt). Запросы с
@@ -29,8 +31,10 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -53,6 +57,12 @@ MODELS = [
 # Suppress console windows on Windows when calling claude CLI (.cmd shim)
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+# Resolve the claude binary once. On Windows the npm shim is `claude.CMD`;
+# CreateProcess won't append PATHEXT, so `subprocess.run(["claude", ...])` fails
+# with FileNotFoundError. shutil.which() respects PATHEXT and returns the full
+# path subprocess can launch directly. Mirrors codex-agent-server's CODEX_BIN.
+CLAUDE_BIN = shutil.which("claude") or "claude"
+
 
 # ── Response cache ──────────────────────────────────────────────────────────
 
@@ -71,6 +81,23 @@ CACHE = ResponseCache(max_size=_CACHE_SIZE, ttl_seconds=_CACHE_TTL) if CACHE_ENA
 # Mandatory bearer auth. Server refuses to start without it; required on every
 # endpoint except /health.
 AUTH_TOKEN = os.getenv("CLAUDE_AGENT_TOKEN") or None
+
+# Reject oversized request bodies before reading them into memory (DoS guard).
+# Mirrors codex-agent-server's MAX_BODY_SIZE.
+try:
+    MAX_BODY_SIZE = max(1024, int(os.getenv("CLAUDE_AGENT_MAX_BODY", str(10 * 1024 * 1024))))
+except ValueError:
+    MAX_BODY_SIZE = 10 * 1024 * 1024
+
+# Cap concurrent claude invocations. Each request spawns a heavy `claude` CLI
+# subprocess (Opus on the Max plan); without a cap, many parallel authed
+# requests exhaust threads/processes and burn the Max quota. Excess → 429.
+# Mirrors codex-agent-server's MAX_CONCURRENCY.
+try:
+    MAX_CONCURRENCY = max(1, int(os.getenv("CLAUDE_AGENT_MAX_CONCURRENCY", "4")))
+except ValueError:
+    MAX_CONCURRENCY = 4
+_CLAUDE_SEM = threading.BoundedSemaphore(MAX_CONCURRENCY)
 
 
 # ============================================================
@@ -155,7 +182,7 @@ def run_claude(prompt: str, system_prompt: str | None = None,
     m = model or MODEL
     if m not in MODELS:
         raise ValueError(f"model not in whitelist: {m!r}")
-    cmd = ["claude", "--model", m, "-p", "-", "--output-format", "json"]
+    cmd = [CLAUDE_BIN, "--model", m, "-p", "-", "--output-format", "json"]
     if system_prompt:
         # `--system-prompt=VALUE` (single argv with `=`) prevents argument
         # injection: even if VALUE starts with `--`, argparse binds it as
@@ -199,6 +226,13 @@ def extract_content(content) -> str:
 # ============================================================
 
 class Handler(BaseHTTPRequestHandler):
+    # Socket timeout (seconds), applied by StreamRequestHandler.setup() to the
+    # whole connection. Guards against a lying/partial Content-Length that pins
+    # a worker thread on a blocking rfile.read() forever. Only counts against
+    # idle socket ops, so it won't interrupt a long in-flight claude call (no
+    # socket I/O happens while the subprocess runs).
+    timeout = 60
+
     def log_message(self, format, *args):
         logger.info("%s %s", self.address_string(), format % args)
 
@@ -346,8 +380,19 @@ class Handler(BaseHTTPRequestHandler):
             if cached is not None:
                 result = cached
             else:
-                result = run_claude(prompt, system_prompt=system_prompt,
-                                    model=model, timeout=timeout)
+                # Cap concurrent claude subprocesses: reject (429) rather than
+                # pile up processes and burn the Max quota under parallel load.
+                # Cache hits skip this — they don't spawn a subprocess.
+                if not _CLAUDE_SEM.acquire(blocking=False):
+                    self._send(429, {"error": {
+                        "message": f"server busy: >{MAX_CONCURRENCY} concurrent claude requests",
+                        "type": "rate_limit_error"}})
+                    return
+                try:
+                    result = run_claude(prompt, system_prompt=system_prompt,
+                                        model=model, timeout=timeout)
+                finally:
+                    _CLAUDE_SEM.release()
                 if cache_eligible and result:
                     CACHE.put(model or MODEL, system_prompt, prompt, result)
 
@@ -394,6 +439,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _read_body(self) -> dict | None:
         length = int(self.headers.get("Content-Length", 0))
+        if length > MAX_BODY_SIZE:
+            self._send(413, {"error": {
+                "message": f"request body too large ({length} > {MAX_BODY_SIZE} bytes)",
+                "type": "invalid_request_error"}})
+            return None
         try:
             return json.loads(self.rfile.read(length))
         except Exception:
@@ -433,7 +483,7 @@ def main():
         sys.exit(2)
 
     try:
-        subprocess.run(["claude", "--version"], capture_output=True, check=True, creationflags=CREATE_NO_WINDOW)
+        subprocess.run([CLAUDE_BIN, "--version"], capture_output=True, check=True, creationflags=CREATE_NO_WINDOW)
     except (FileNotFoundError, subprocess.CalledProcessError):
         logger.error("claude CLI not found. Install: https://claude.ai/code")
         sys.exit(1)
