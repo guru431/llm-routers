@@ -98,7 +98,7 @@ curl http://localhost:8765/v1/models
 
 ```bash
 curl http://localhost:8765/health
-# {"status": "ok", "model": "claude-opus-4-8", "uptime": 3600}
+# {"status": "ok", "model": "claude-opus-4-8", "uptime": 3600, "security": "authenticated", "cache": {...}}
 ```
 
 ## Конфигурация
@@ -109,6 +109,10 @@ curl http://localhost:8765/health
 |---|---|---|
 | `CLAUDE_AGENT_MODEL` | `claude-opus-4-8` | Модель по умолчанию |
 | `CLAUDE_AGENT_PORT` | `8765` | Порт сервера |
+| `CLAUDE_AGENT_TOKEN` | _(обязателен)_ | Bearer-токен. Сервер **не стартует** без него (exit 2). Обязателен в `Authorization: Bearer <token>` на всех endpoints кроме `/health`. |
+| `CLAUDE_AGENT_CACHE` | `1` | Включить response cache (`0`/`false` — выключить) |
+| `CLAUDE_AGENT_CACHE_SIZE` | `256` | Макс. записей в кэше (LRU eviction) |
+| `CLAUDE_AGENT_CACHE_TTL` | `3600` | TTL записи в секундах |
 
 ## Использование
 
@@ -175,11 +179,33 @@ client.chat.completions.create(
 
 ## Безопасность
 
-Сервер **не имеет аутентификации**. Биндится по умолчанию на `0.0.0.0` — доступен всем в сети. Рекомендации:
+Биндится по умолчанию на `0.0.0.0` — доступен всем в сети. Bearer-токен через `CLAUDE_AGENT_TOKEN` **обязателен** — без него сервер не стартует (exit 2):
 
-- В open Internet — не выставлять. Только LAN или за firewall.
-- Для локального использования — `--host 127.0.0.1`.
-- Если нужна аутентификация — поставить reverse proxy (nginx/caddy) с basic auth или token-проверкой.
+```bash
+export CLAUDE_AGENT_TOKEN='cas-<random hex>'
+python server.py
+```
+
+Все endpoints кроме `/health` требуют `Authorization: Bearer <token>` — иначе 401. `/health` всегда отдаёт `security: "authenticated"`.
+
+Клиент с токеном:
+
+```bash
+curl -X POST http://host:8765/v1/chat/completions \
+  -H "Authorization: Bearer $CLAUDE_AGENT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "Hi"}]}'
+```
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://host:8765/v1", api_key="sk-local-<random>")
+```
+
+Рекомендации:
+- В open Internet — не выставлять.
+- В LAN — задать `CLAUDE_AGENT_TOKEN`, либо поставить за reverse proxy (nginx/caddy) с собственной auth-логикой.
+- Для локальной разработки — `--host 127.0.0.1` (тогда токен не нужен).
 
 ## Тесты
 

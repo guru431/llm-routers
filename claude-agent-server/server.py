@@ -4,12 +4,15 @@ Claude Agent Server — универсальный HTTP-прокси для Clau
 Endpoints:
     POST /v1/chat/completions  — OpenAI-compatible (messages + tools)
     GET  /v1/models            — Model list (OpenAI-compatible)
-    GET  /health               — Healthcheck (включает cache stats)
+    GET  /health               — Healthcheck (включает cache stats, security mode)
     DELETE /cache              — Очистить response cache
 
 Env:
     CLAUDE_AGENT_MODEL      — модель (default: claude-opus-4-8)
     CLAUDE_AGENT_PORT       — порт (default: 8765)
+    CLAUDE_AGENT_TOKEN      — bearer-токен (ОБЯЗАТЕЛЕН — без него сервер
+                              не стартует). Требуется на всех endpoints
+                              кроме /health (Authorization: Bearer ...)
     CLAUDE_AGENT_CACHE      — '1'/'0' включить response cache (default: '1')
     CLAUDE_AGENT_CACHE_SIZE — макс. записей в кэше (default: 256, LRU eviction)
     CLAUDE_AGENT_CACHE_TTL  — TTL записи в секундах (default: 3600 = 1h)
@@ -21,6 +24,7 @@ Caching:
 """
 
 import argparse
+import hmac
 import json
 import logging
 import os
@@ -63,6 +67,10 @@ except ValueError:
     _CACHE_TTL = 3600.0
 
 CACHE = ResponseCache(max_size=_CACHE_SIZE, ttl_seconds=_CACHE_TTL) if CACHE_ENABLED else None
+
+# Mandatory bearer auth. Server refuses to start without it; required on every
+# endpoint except /health.
+AUTH_TOKEN = os.getenv("CLAUDE_AGENT_TOKEN") or None
 
 
 # ============================================================
@@ -194,12 +202,28 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         logger.info("%s %s", self.address_string(), format % args)
 
+    def _check_auth(self) -> bool:
+        """Enforce bearer-auth if CLAUDE_AGENT_TOKEN is configured.
+        Returns False after sending 401; caller must abort."""
+        if not AUTH_TOKEN:
+            return True
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Bearer "):
+            self._send(401, {"error": {"message": "missing bearer token", "type": "auth_error"}})
+            return False
+        presented = header[len("Bearer "):].strip()
+        if not hmac.compare_digest(presented.encode("utf-8"), AUTH_TOKEN.encode("utf-8")):
+            self._send(401, {"error": {"message": "invalid bearer token", "type": "auth_error"}})
+            return False
+        return True
+
     def do_GET(self):
         if self.path == "/health":
             payload = {
                 "status": "ok",
                 "model": MODEL,
                 "uptime": int(time.time() - SERVER_START),
+                "security": "authenticated" if AUTH_TOKEN else "unauthenticated",
             }
             if CACHE is not None:
                 payload["cache"] = CACHE.stats()
@@ -207,6 +231,8 @@ class Handler(BaseHTTPRequestHandler):
                 payload["cache"] = {"enabled": False}
             self._send(200, payload)
         elif self.path == "/v1/models":
+            if not self._check_auth():
+                return
             self._send(200, {
                 "object": "list",
                 "data": [{
@@ -220,16 +246,20 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "Not found"})
 
     def do_POST(self):
-        body = self._read_body()
-        if body is None:
-            return
         if self.path == "/v1/chat/completions":
+            if not self._check_auth():
+                return
+            body = self._read_body()
+            if body is None:
+                return
             self._handle_chat(body)
         else:
             self._send(404, {"error": "Not found"})
 
     def do_DELETE(self):
         if self.path == "/cache":
+            if not self._check_auth():
+                return
             if CACHE is None:
                 self._send(404, {"error": "cache disabled"})
                 return
@@ -393,6 +423,15 @@ def main():
     parser.add_argument("--port", type=int, default=int(os.getenv("CLAUDE_AGENT_PORT", "8765")))
     args = parser.parse_args()
 
+    if not AUTH_TOKEN:
+        logger.error(
+            "CLAUDE_AGENT_TOKEN env var is required — server refuses to start without "
+            "bearer auth. Set it via [Environment]::SetEnvironmentVariable(\"CLAUDE_AGENT_TOKEN\", "
+            "\"<token>\", \"Machine\") (Windows) or export CLAUDE_AGENT_TOKEN=<token> (POSIX) "
+            "and restart."
+        )
+        sys.exit(2)
+
     try:
         subprocess.run(["claude", "--version"], capture_output=True, check=True, creationflags=CREATE_NO_WINDOW)
     except (FileNotFoundError, subprocess.CalledProcessError):
@@ -406,6 +445,7 @@ def main():
         logger.info("Cache: enabled (max=%d entries, ttl=%.0fs)", _CACHE_SIZE, _CACHE_TTL)
     else:
         logger.info("Cache: disabled (CLAUDE_AGENT_CACHE=0)")
+    logger.info("Auth: bearer token required on /v1/* and DELETE /cache (token len=%d)", len(AUTH_TOKEN))
     logger.info("Endpoints: POST /v1/chat/completions, GET /v1/models, GET /health, DELETE /cache")
     try:
         server.serve_forever()
