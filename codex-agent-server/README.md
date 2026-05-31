@@ -88,6 +88,7 @@ curl -X POST http://localhost:8766/v1/chat/completions \
 - `workdir` / `cwd` (optional) — рабочий корень для агентного режима (внутри `CODEX_AGENT_WORKDIR_ROOT`).
 - `tools` (optional) — OpenAI-функции; форсят read-only, парсятся из `<tool_call>` блоков.
 - `timeout` (optional) — секунды, клампится в `[10, 600]` (default 300).
+- `reasoning` (optional) — `minimal|low|medium|high`; per-request override `model_reasoning_effort`. Default = env `CODEX_AGENT_REASONING` (medium). Невалидное → дефолт. Полезно токен-чувствительным потребителям (code-review шлёт `low`) без смены глобального дефолта для council/CCR.
 
 ### `GET /v1/models`
 

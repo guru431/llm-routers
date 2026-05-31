@@ -414,6 +414,14 @@ class Handler(BaseHTTPRequestHandler):
         timeout = max(10, min(timeout, 600))
         tools = body.get("tools")
 
+        # Per-request reasoning effort overrides the server default (REASONING).
+        # Token-sensitive consumers (code-review) can request 'low'/'minimal'
+        # без смены глобального дефолта для council/CCR. Невалидное → дефолт.
+        req_reasoning = body.get("reasoning")
+        if req_reasoning not in ("minimal", "low", "medium", "high"):
+            req_reasoning = None
+        effective_reasoning = req_reasoning or REASONING
+
         try:
             model_base, suffix_mode = resolve_model(body.get("model"))
             sandbox = resolve_sandbox(tools, body.get("sandbox"), suffix_mode)
@@ -475,7 +483,7 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             result = run_codex(prompt, model_base=model_base, sandbox=sandbox,
-                               workdir=workdir, reasoning=REASONING, timeout=timeout)
+                               workdir=workdir, reasoning=effective_reasoning, timeout=timeout)
 
             tool_calls = []
             content = result
