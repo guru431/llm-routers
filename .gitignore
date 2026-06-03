@@ -25,3 +25,7 @@ docs/
 
 # local-only secret denylist for pre-commit hook (never commit)
 .sanitize-patterns
+
+# Per-server runtime secrets (agent bearer tokens) — never commit
+.env
+*/.env

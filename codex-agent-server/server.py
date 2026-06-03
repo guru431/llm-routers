@@ -48,12 +48,35 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger("codex-agent-server")
+
+
+def _load_dotenv() -> None:
+    """Load KEY=VALUE pairs from a .env file next to this script into the
+    environment, without overwriting variables already set. Lets the server
+    read its token (and other config) from a co-located .env without a
+    python-dotenv dependency; an explicit env var still wins. Required for
+    boot-launched deployments where the process has no inherited shell env."""
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.is_file():
+        return
+    for raw in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key and key not in os.environ:
+            os.environ[key] = value.strip().strip('"').strip("'")
+
+
+_load_dotenv()
 
 # Suppress console windows on Windows when calling codex CLI (.cmd shim)
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
