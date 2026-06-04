@@ -1,5 +1,11 @@
 ﻿# Install Claude Agent Server as a Windows Scheduled Task (auto-start on boot).
 #
+# ⚠️ If a central task-registry/syncer manages this scheduled task on your machine,
+#    do NOT register it by hand here: re-registering drifts from the registry and the
+#    next sync reverts it. Change the schedule/delay/restart in your registry and
+#    re-sync instead. Use this script only for a STANDALONE deploy with no such
+#    central task management.
+#
 # Usage:
 #   .\install_task.ps1                                  # interactive (asks for password)
 #   .\install_task.ps1 -ServerPath '<full UNC path>'    # override server.py location
@@ -59,33 +65,56 @@ if (-not (Test-Path $ServerPath)) {
     exit 1
 }
 
-# Build command. Quote each path independently so spaces in either pythonw or
-# server path don't break tokenization (schtasks /tr passes the string to cmd.exe).
+# Refuse a mapped network drive (e.g. S:\): a boot task runs in session 0 before
+# logon, when such mappings don't exist — the task would silently fail to find the
+# script (observed: python exits 2, server never starts after reboot). Require a
+# UNC (\\server\share\...) or local path instead.
+$root = [System.IO.Path]::GetPathRoot($ServerPath)
+if ($root -match '^[A-Za-z]:\\$') {
+    $drive = Get-PSDrive -Name $root.Substring(0,1) -ErrorAction SilentlyContinue
+    if ($drive -and $drive.DisplayRoot -like '\\*') {
+        Write-Error ("ServerPath is on mapped network drive $root ($($drive.DisplayRoot)). " +
+            "A boot task runs before logon when this mapping is absent and would fail to start. " +
+            "Pass -ServerPath with a UNC path, e.g. '$($drive.DisplayRoot)\...\server.py', or a local path.")
+        exit 1
+    }
+}
+
+# Build the action argument. Quote the script path so spaces don't break it.
 $Arguments = "`"$ServerPath`" --host $BindHost --port $Port"
-$TaskRun = "`"$pythonw`" $Arguments"
 
 Write-Host "Creating scheduled task: $FullName"
 Write-Host "  Exe:  $pythonw"
 Write-Host "  Args: $Arguments"
-Write-Host "  /tr:  $TaskRun"
 Write-Host ""
 
-schtasks /create /tn $FullName /rl highest /tr $TaskRun /sc onstart /f
-Set-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -Settings $(
-    New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-        -ExecutionTimeLimit 0 -DisallowHardTerminate
-)
+# Boot trigger with a delay + restart-on-failure. Fixes the cold-boot race where
+# the BootTrigger fires before the network share holding server.py / .env is
+# mounted (observed: task fired 9s after boot, UNC not ready, python exited 2, so
+# the server never came up after a reboot). The delay lets the network mount;
+# RestartCount retries if it is still not ready. MultipleInstances=IgnoreNew plus
+# the server's own single-instance guard prevent duplicate listeners on the port.
+$action  = New-ScheduledTaskAction -Execute $pythonw -Argument $Arguments
+$trigger = New-ScheduledTaskTrigger -AtStartup
+$trigger.Delay = 'PT1M'
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -DisallowHardTerminate -StartWhenAvailable `
+    -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
+    -MultipleInstances IgnoreNew
+$settings.ExecutionTimeLimit = 'PT0S'   # no time limit (long-running server)
+$settings.Hidden = $true
 
 $user = "$env:USERDOMAIN\$env:USERNAME"
-Write-Host "Enter password for $user to allow the task to run when you are not logged in:"
+Write-Host "Enter password for $user — LogonType=Password is required so the task has"
+Write-Host "network credentials to reach the UNC share at boot (and runs before logon):"
+# Register-ScheduledTask -Password requires a plain string; the SecureString →
+# plain conversion is unavoidable (cmdlet API limitation). The Get-Credential
+# prompt keeps the password out of PS history; $cred is nulled right after use.
 $cred = Get-Credential -Credential $user
-# Set-ScheduledTask -Password requires a plain string; the SecureString → plain
-# conversion is unavoidable (cmdlet API limitation). Mitigations:
-#   1. Get-Credential prompt — password never enters PS history.
-#   2. Plain string is inline, not stored in a named $password variable.
-#   3. $cred is nulled immediately after use to release the SecureString sooner.
-Set-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName `
-    -User $user -Password $cred.GetNetworkCredential().Password
+Register-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName `
+    -Action $action -Trigger $trigger -Settings $settings `
+    -User $user -Password $cred.GetNetworkCredential().Password `
+    -RunLevel Highest -Force | Out-Null
 $cred = $null
 [System.GC]::Collect()
 

@@ -141,7 +141,6 @@ curl -X POST http://localhost:8766/v1/chat/completions \
 | Чат-клиент | модель `gpt-5.5` |
 | mcp-council | `extra: {"sandbox": "read-only"}` в `models.py::CATALOG` |
 | claude-code-router | provider config; `tools` форсят read-only |
-| _boss code-review | `WIKI_LLM_PROVIDER=codex` (ветка в `utils.py`) |
 
 ### Python (openai SDK)
 

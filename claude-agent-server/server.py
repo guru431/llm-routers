@@ -211,6 +211,10 @@ def run_claude(prompt: str, system_prompt: str | None = None,
         # injection: even if VALUE starts with `--`, argparse binds it as
         # the value of --system-prompt rather than parsing it as a new flag.
         cmd.append(f"--system-prompt={system_prompt}")
+    # Сигнал хукам Claude Code (~/.claude/settings.json: SessionStart/SessionEnd),
+    # что это headless-вызов сервера: тяжёлая инъекция wiki-контекста (~162K токенов,
+    # ~$3/вызов, упор в лимит Max → "claude exit code 1") должна быть пропущена.
+    child_env = {**os.environ, "CLAUDE_AGENT_SERVER": "1"}
     result = subprocess.run(
         cmd,
         input=prompt,
@@ -219,9 +223,14 @@ def run_claude(prompt: str, system_prompt: str | None = None,
         encoding="utf-8",
         timeout=timeout,
         creationflags=CREATE_NO_WINDOW,
+        env=child_env,
     )
     if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or f"claude exit code {result.returncode}")
+        raise RuntimeError(
+            result.stderr.strip()
+            or result.stdout.strip()[:800]
+            or f"claude exit code {result.returncode}"
+        )
     # Parse JSON output to extract result
     try:
         data = json.loads(result.stdout.strip())
@@ -482,6 +491,17 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+class SingleInstanceServer(ThreadingHTTPServer):
+    # HTTPServer sets allow_reuse_address=1 (SO_REUSEADDR). On Windows that lets
+    # a SECOND process bind the same port and the OS load-balances connections
+    # between them — restarts left stale instances live, so requests hit servers
+    # with different code intermittently (the "duplicate instance" bug). Disabling
+    # reuse makes a second bind fail fast (WSAEADDRINUSE) → only one instance ever
+    # listens on the port. A killed listener's socket is freed immediately (no
+    # TIME_WAIT on a non-connected listening socket), so restart-after-crash is fine.
+    allow_reuse_address = False
+
+
 SERVER_START = time.time()
 
 
@@ -511,7 +531,12 @@ def main():
         logger.error("claude CLI not found. Install: https://claude.ai/code")
         sys.exit(1)
 
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    try:
+        server = SingleInstanceServer((args.host, args.port), Handler)
+    except OSError as exc:
+        logger.error("cannot bind %s:%d — another instance already listening? (%s)",
+                     args.host, args.port, exc)
+        sys.exit(1)
     logger.info("Claude Agent Server started: http://%s:%d", args.host, args.port)
     logger.info("Model: %s", MODEL)
     if CACHE is not None:

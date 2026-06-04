@@ -569,6 +569,17 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+class SingleInstanceServer(ThreadingHTTPServer):
+    # HTTPServer sets allow_reuse_address=1 (SO_REUSEADDR). On Windows that lets
+    # a SECOND process bind the same port and the OS load-balances connections
+    # between them — restarts left stale instances live, so requests hit servers
+    # with different code intermittently (the "duplicate instance" bug). Disabling
+    # reuse makes a second bind fail fast (WSAEADDRINUSE) → only one instance ever
+    # listens on the port. A killed listener's socket is freed immediately (no
+    # TIME_WAIT on a non-connected listening socket), so restart-after-crash is fine.
+    allow_reuse_address = False
+
+
 SERVER_START = time.time()
 
 
@@ -598,7 +609,12 @@ def main():
         logger.error("codex CLI not found. Install: https://github.com/openai/codex")
         sys.exit(1)
 
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    try:
+        server = SingleInstanceServer((args.host, args.port), Handler)
+    except OSError as exc:
+        logger.error("cannot bind %s:%d — another instance already listening? (%s)",
+                     args.host, args.port, exc)
+        sys.exit(1)
     logger.info("Codex Agent Server started: http://%s:%d", args.host, args.port)
     logger.info("Models: %s", EXPOSED_MODELS)
     logger.info("Default sandbox: %s", DEFAULT_SANDBOX)

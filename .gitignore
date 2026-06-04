@@ -29,3 +29,6 @@ docs/
 # Per-server runtime secrets (agent bearer tokens) — never commit
 .env
 */.env
+
+# Agent-server runtime debug logs (may contain private IPs / prompt text)
+*/_srv_*.txt
