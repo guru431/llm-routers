@@ -33,6 +33,11 @@ class DialogueState:
     total_rounds: int
     created_at: float
 
+    # Full, untruncated topic. question_preview is only the first 120 chars for
+    # listings; dialogue_continue and the runners must use this so a >120-char
+    # question isn't silently resumed on a truncated task.
+    question: str = ""
+
     phase: str = "starting"
     current_round: int = 0
     participants: list[dict] = field(default_factory=list)
@@ -97,15 +102,20 @@ async def create_session(
     async with _sessions_lock:
         now = time.time()
         _gc_locked(now)
-        if len(_sessions) >= MAX_ACTIVE_SESSIONS:
+        # Count only non-terminal sessions toward the cap. Terminal sessions
+        # linger in _sessions until GC prunes them (2h), but they hold no
+        # resources, so they must not block new work once finished.
+        active = sum(1 for s in _sessions.values() if s.phase not in TERMINAL_PHASES)
+        if active >= MAX_ACTIVE_SESSIONS:
             raise RuntimeError(
-                f"too many active sessions ({len(_sessions)}/{MAX_ACTIVE_SESSIONS}); "
+                f"too many active sessions ({active}/{MAX_ACTIVE_SESSIONS}); "
                 "wait for some to finish or call dialogue_cancel on stale ones"
             )
         sid = _new_session_id()
         s = DialogueState(
             session_id=sid,
             mode=mode,  # type: ignore[arg-type]
+            question=question_preview,
             question_preview=question_preview[:120],
             total_rounds=total_rounds,
             created_at=now,

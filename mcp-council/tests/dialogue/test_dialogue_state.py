@@ -105,6 +105,25 @@ async def test_active_sessions_hard_cap():
     assert "active sessions" in str(exc.value).lower()
 
 
+async def test_terminal_sessions_do_not_block_cap():
+    """Completed (terminal) sessions must not count toward the active cap, even
+    when GC hasn't pruned them yet (last_activity still fresh)."""
+    for _ in range(MAX_ACTIVE_SESSIONS):
+        s = await create_session(mode="debate", question_preview="q", total_rounds=1)
+        mark_phase(s, "done")  # terminal but fresh -> not GC'd
+    # Zero active sessions -> a new one must succeed despite MAX terminal ones.
+    new_s = await create_session(mode="debate", question_preview="q", total_rounds=1)
+    assert new_s.phase == "starting"
+
+
+async def test_full_question_preserved_separately_from_preview():
+    """question keeps the full topic; question_preview is truncated to 120."""
+    long_q = "Z" * 300
+    s = await create_session(mode="debate", question_preview=long_q, total_rounds=1)
+    assert s.question == long_q
+    assert len(s.question_preview) == 120
+
+
 async def test_active_sessions_cap_releases_done_first():
     """Done sessions count toward the cap until pruned, but pruning happens
     opportunistically inside create_session. Verify that marking sessions done

@@ -72,6 +72,36 @@ class SandboxError(Exception):
     """Любая нарушение sandbox-правил (blacklist, size, count, missing file)."""
 
 
+# Optional allow-list root(s). The deny-list above is best-effort: a prompt-
+# injected context_path can still exfiltrate any non-blacklisted private file.
+# Set COUNCIL_CONTEXT_ROOTS (os.pathsep-separated, e.g. the repo/workspace dir)
+# to require every context file to resolve INSIDE one of those roots. Unset =
+# deny-list-only (backward compatible).
+_CONTEXT_ROOTS_ENV = "COUNCIL_CONTEXT_ROOTS"
+
+
+def _allowed_roots() -> list[Path]:
+    raw = os.environ.get(_CONTEXT_ROOTS_ENV, "").strip()
+    if not raw:
+        return []
+    roots: list[Path] = []
+    for part in raw.split(os.pathsep):
+        part = part.strip()
+        if part:
+            roots.append(Path(os.path.expanduser(part)).resolve())
+    return roots
+
+
+def _within_allowed_roots(path: Path, roots: list[Path]) -> bool:
+    for root in roots:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
 _SECRET_SNIFF_BYTES = 8192
 
 # Substrings that mark a file as a private key / credential regardless of its
@@ -110,11 +140,16 @@ def resolve_and_validate(paths: list[str]) -> list[Path]:
         raise SandboxError(
             f"file count limit exceeded: {len(paths)} > {MAX_FILE_COUNT}"
         )
+    roots = _allowed_roots()
     resolved: list[Path] = []
     for p in paths:
         if is_blocked(p):
             raise SandboxError(f"blocked by sandbox: {p}")
         path = Path(os.path.expanduser(p)).resolve()
+        if roots and not _within_allowed_roots(path, roots):
+            raise SandboxError(
+                f"path outside allowed roots ({_CONTEXT_ROOTS_ENV}): {p}"
+            )
         if not path.is_file():
             raise SandboxError(f"not a file: {p}")
         if _has_secret_header(path):

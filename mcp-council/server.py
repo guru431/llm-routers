@@ -1038,7 +1038,7 @@ async def dialogue_result(session_id: str) -> dict:
             "hint": "Call dialogue_status(session_id) for progress, retry later.",
         }
     if state.result_markdown is None and state.history:
-        state.result_markdown = format_dialogue_markdown(state, state.question_preview)
+        state.result_markdown = format_dialogue_markdown(state, state.question)
     return {
         "ready": True,
         "phase": state.phase,
@@ -1131,20 +1131,20 @@ async def dialogue_continue(
                 for p in s.participants
             }
             await run_dialogue(
-                state=s, topic=s.question_preview, role_descriptors=role_descriptors,
+                state=s, topic=s.question, role_descriptors=role_descriptors,
                 max_tokens=max_tokens, web_search=web_search, files_section=files_section,
                 do_critique=True, per_round_hook=None,
                 start_round=s.current_round + 1,
             )
             dialogue_state.mark_phase(s, "summarizing")
-            prompt = render_summary_prompt(topic=s.question_preview, history=s.history, mode="debate")
+            prompt = render_summary_prompt(topic=s.question, history=s.history, mode="debate")
             r = await _run_turn(cfg=mod_cfg, prompt=prompt, max_tokens=max_tokens, web_search=False)
             s.history.append({
                 "round": s.total_rounds, "phase": "summary", "id": mod_cfg["id"],
                 "text": r.text if r.status == "ok" else f"[summary failed: {r.error}]",
                 "latency_ms": r.latency_ms, "status": r.status,
             })
-            s.result_markdown = format_dialogue_markdown(s, s.question_preview)
+            s.result_markdown = format_dialogue_markdown(s, s.question)
             s.dump_path = str(write_dump(s, base_dir=DIALOGUE_DUMP_DIR))
             dialogue_state.mark_phase(s, "done")
 
@@ -1171,7 +1171,7 @@ async def dialogue_continue(
                     da_id = devils_advocate_for_round(s.participants, round_n)
                     rules = {da_id: DEVILS_ADVOCATE_RULE}
                 await run_round(
-                    state=s, round_n=round_n, topic=s.question_preview,
+                    state=s, round_n=round_n, topic=s.question,
                     role_descriptors=role_descriptors, max_tokens=max_tokens,
                     web_search=web_search, anti_agreement_rules=rules,
                     files_section=files_section, do_critique=True,
@@ -1188,18 +1188,18 @@ async def dialogue_continue(
                     await _maybe_reprompt(
                         state=s, round_n=round_n, participant_cfgs=part_cfgs,
                         score=score, agreers=agreers, threshold=s.diversity_threshold,
-                        topic=s.question_preview,
+                        topic=s.question,
                         max_tokens=max_tokens, files_section=files_section,
                     )
             dialogue_state.mark_phase(s, "summarizing")
-            prompt = render_summary_prompt(topic=s.question_preview, history=s.history, mode="panel")
+            prompt = render_summary_prompt(topic=s.question, history=s.history, mode="panel")
             r = await _run_turn(cfg=mod_cfg, prompt=prompt, max_tokens=max_tokens, web_search=False)
             s.history.append({
                 "round": s.total_rounds, "phase": "summary", "id": mod_cfg["id"],
                 "text": r.text if r.status == "ok" else f"[summary failed: {r.error}]",
                 "latency_ms": r.latency_ms, "status": r.status,
             })
-            s.result_markdown = format_dialogue_markdown(s, s.question_preview)
+            s.result_markdown = format_dialogue_markdown(s, s.question)
             s.dump_path = str(write_dump(s, base_dir=DIALOGUE_DUMP_DIR))
             dialogue_state.mark_phase(s, "done")
 
@@ -1209,7 +1209,7 @@ async def dialogue_continue(
             q_cfg = part_cfgs[0]
             r_cfg = part_cfgs[1]
             await run_socratic(
-                state=s, topic=s.question_preview, questioner_cfg=q_cfg,
+                state=s, topic=s.question, questioner_cfg=q_cfg,
                 respondent_cfg=r_cfg, moderator_cfg=mod_cfg,
                 rounds=s.total_rounds, max_tokens=max_tokens, web_search=web_search,
                 files_section=files_section,

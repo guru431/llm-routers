@@ -548,7 +548,14 @@ class Handler(BaseHTTPRequestHandler):
             _CODEX_SEM.release()
 
     def _read_body(self) -> dict | None:
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            self._send(400, {"error": "Invalid Content-Length"})
+            return None
+        if length < 0:
+            self._send(400, {"error": "Invalid Content-Length"})
+            return None
         if length > MAX_BODY_SIZE:
             self._send(413, {"error": {
                 "message": f"request body too large ({length} > {MAX_BODY_SIZE} bytes)",
