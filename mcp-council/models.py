@@ -36,9 +36,10 @@ CATALOG: dict[str, dict] = {
         "min_max_tokens": 30000,
     },
     "deepseek-pro": {
+        # via OCG-прокси с 2026-06-07 (DeepSeek direct PAYG исчерпан, вряд ли вернётся)
         "model": "deepseek-v4-pro",
-        "base_url": DS,
-        "env_key": "DEEPSEEK_KEY",
+        "base_url": OCG,
+        "env_key": "OPENCODE_GO_KEY",
     },
     "qwen": {
         "model": "qwen3.6-plus",
@@ -71,9 +72,10 @@ CATALOG: dict[str, dict] = {
 
     # --- Routine workers (model_ask only) ---
     "deepseek-flash": {
+        # via OCG-прокси с 2026-06-07 (DeepSeek direct PAYG исчерпан, вряд ли вернётся)
         "model": "deepseek-v4-flash",
-        "base_url": DS,
-        "env_key": "DEEPSEEK_KEY",
+        "base_url": OCG,
+        "env_key": "OPENCODE_GO_KEY",
     },
     "minimax-direct": {
         "model": "abab7-chat-preview",
