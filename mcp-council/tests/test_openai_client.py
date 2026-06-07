@@ -3,7 +3,17 @@
 import httpx
 import pytest
 
+import circuit_breaker
 from openai_client import CouncilHTTPError, _strip_think, call_openai_compat
+
+
+@pytest.fixture(autouse=True)
+def _reset_breaker():
+    # Failures simulated across tests must not leave a host's breaker open and
+    # short-circuit later tests.
+    circuit_breaker.reset()
+    yield
+    circuit_breaker.reset()
 
 
 def _make_response(status_code: int, json_data: dict | None = None, text: str | None = None):
@@ -54,6 +64,40 @@ def _ok_response():
             "usage": {"prompt_tokens": 10, "completion_tokens": 5},
         },
     )
+
+
+async def test_open_breaker_short_circuits_without_http(patch_httpx):
+    # Force the host's breaker open, then assert the call raises immediately and
+    # never touches the (would-be-failing) HTTP client.
+    host = "blocked.example.com"
+    for _ in range(circuit_breaker.FAILURE_THRESHOLD):
+        circuit_breaker.record_failure(host)
+    fake = _FakeClient([])  # no responses — a real request would RuntimeError
+    patch_httpx["client"] = fake
+    with pytest.raises(CouncilHTTPError, match="circuit_open"):
+        await call_openai_compat(
+            base_url=f"https://{host}/v1",
+            api_key="sk-test",
+            model="m",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=100,
+        )
+    assert fake.calls == []
+
+
+async def test_success_clears_breaker_failures(patch_httpx):
+    host = "flaky.example.com"
+    for _ in range(circuit_breaker.FAILURE_THRESHOLD - 1):
+        circuit_breaker.record_failure(host)
+    patch_httpx["client"] = _FakeClient([_ok_response()])
+    await call_openai_compat(
+        base_url=f"https://{host}/v1",
+        api_key="sk-test",
+        model="m",
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=100,
+    )
+    assert circuit_breaker.snapshot().get(host) is None  # streak reset on success
 
 
 async def test_call_returns_content_and_usage(patch_httpx):

@@ -10,18 +10,22 @@ Exposes two flavours of the council deliberation:
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from models import COUNCIL_DEFAULT, resolve_member, resolve_members
+from models import COUNCIL_DEFAULT, resolve_member, resolve_members, resolve_preset
 from council import _aggregate as _aggregate_helper  # noqa: F401 — re-exported for tests
 from council import run_council
 from single_call import run_single
 from logger import _new_call_id, log_call, write_full_dump
 from sandbox import SandboxError, read_files_with_limit, resolve_and_validate
+import sandbox
+import circuit_breaker
+from healthcheck import healthcheck_models
 import event_log
 import state as job_state
 
@@ -30,6 +34,21 @@ LOGS_DIR = Path(__file__).parent / "logs"
 MAX_RESPONSE_TOKENS_HARD_CAP = 16384
 
 mcp = FastMCP("mcp-council")
+
+
+def _resolve_models_arg(
+    models: list[str] | None, models_preset: str | None
+) -> list[str] | None:
+    """Resolve the effective model-id list from `models` / `models_preset`.
+
+    At most one may be set. Returns list[str] | None (None → default council).
+    Raises RuntimeError if both are set, UnknownPresetError on a bad name.
+    """
+    if models_preset is not None:
+        if models is not None:
+            raise RuntimeError("pass either models or models_preset, not both")
+        return resolve_preset(models_preset)
+    return models
 
 
 def _build_files_section(files: list[tuple[Path, str]]) -> str:
@@ -151,6 +170,39 @@ def format_markdown(question: str, result: dict) -> str:
     else:
         lines.append("- all members completed both stages successfully")
     lines.append("")
+
+    summary = result.get("summary")
+    usage = result.get("usage")
+    if summary or usage:
+        lines.append("## Verdict & usage")
+        lines.append("")
+        if summary:
+            win = summary.get("winner_model") or "—"
+            mean = summary.get("winner_mean_score")
+            mean_str = f" (mean {mean})" if mean is not None else ""
+            lines.append(f"- Winner: **{win}**{mean_str} · confidence: {summary.get('confidence')}")
+            failed = summary.get("failed_models") or []
+            if failed:
+                lines.append(
+                    "- Failed: " + ", ".join(f"{f['model']} ({f['stage']})" for f in failed)
+                )
+            dis = summary.get("top_disagreements") or []
+            if dis:
+                lines.append(
+                    "- Top disagreement: " + ", ".join(
+                        f"{d['model']} (spread {d['spread']})" for d in dis
+                    )
+                )
+            lines.append(f"- Next: {summary.get('recommended_next_action')}")
+        if usage:
+            lines.append(
+                f"- Usage: {usage.get('llm_calls')} LLM calls, "
+                f"{usage.get('tokens_in')}→{usage.get('tokens_out')} tokens, "
+                f"{usage.get('web_search_calls')} web searches, "
+                f"{usage.get('retries')} retries"
+            )
+        lines.append("")
+
     lines.append("---")
     if stage3 is not None and stage3["status"] == "ok":
         lines.append(
@@ -250,6 +302,8 @@ async def _do_council_ask_async(
         "aggregate": result["aggregate"],
         "stage3": result.get("stage3"),
         "notes": result["notes"],
+        "usage": result.get("usage"),
+        "summary": result.get("summary"),
     }
     dump_path = write_full_dump(call_id, dump)
     log_dump_rel = str(dump_path.relative_to(Path(__file__).parent))
@@ -300,6 +354,7 @@ async def council_ask(
     rounds: int = 1,
     web_search: bool = False,
     models: list[str] | None = None,
+    models_preset: str | None = None,
 ) -> str:
     """Спросить council по методу Karpathy: independent answers → anonymized
     peer-ranking → optional stage 3 synthesis. Synthesis off by default —
@@ -316,6 +371,9 @@ async def council_ask(
     Parameters:
       models — list[str] | None. Список model_id из CATALOG (например
         ["glm","kimi","deepseek-pro"]). None → все 7 default-членов. ≥2.
+      models_preset — str | None. Удобная альтернатива ручному `models`:
+        "best" (все 7), "balanced" (3 модели), "cheap" (2 дешёвых). Нельзя
+        задавать вместе с `models`.
       context_paths — опциональные файлы, прокидываются всем участникам (sandbox).
       synthesis — если True, добавляется stage 3 (auto-synthesis by chairman);
         если False, возвращаются только материалы stage1+stage2.
@@ -328,6 +386,7 @@ async def council_ask(
     Note: блокирующий вызов; для long-running неблокирующего паттерна
     используй council_ask_async / council_status / council_result.
     """
+    models = _resolve_models_arg(models, models_preset)
     return await _do_council_ask_async(
         question, context_paths or [], max_response_tokens, synthesis, rounds,
         web_search, models,
@@ -468,10 +527,13 @@ async def _run_job(
             "stage1": result["stage1"], "stage2": result["stage2"],
             "aggregate": result["aggregate"], "stage3": result.get("stage3"),
             "notes": result["notes"],
+            "usage": result.get("usage"), "summary": result.get("summary"),
         }
         dump_path = write_full_dump(call_id, dump)
         log_dump_rel = str(dump_path.relative_to(Path(__file__).parent))
         state.dump_path = log_dump_rel
+        state.usage = result.get("usage")
+        state.summary = result.get("summary")
         state.result_markdown = format_markdown(question, result)
         job_state.mark_phase(state, "done")
         # Emit a terminal event with a stable string so Monitor consumers can
@@ -504,6 +566,7 @@ async def council_ask_async(
     rounds: int = 1,
     web_search: bool = False,
     models: list[str] | None = None,
+    models_preset: str | None = None,
 ) -> dict:
     """Start a council deliberation in the background and return a job_id
     immediately (within ~50ms). Poll progress with `council_status(job_id)`
@@ -518,8 +581,11 @@ async def council_ask_async(
     Each extra round adds 2-8 minutes of wall-time.
 
     `models` — list[str] | None. Subset of CATALOG ids (≥2). None → default 6.
+    `models_preset` — str | None. "best" | "balanced" | "cheap" instead of a
+        hand-listed `models` (mutually exclusive with it).
     """
     # Validate + resolve BEFORE creating job state, so bad inputs fail fast.
+    models = _resolve_models_arg(models, models_preset)
     if models is not None and len(set(models)) < 2:
         raise RuntimeError(
             "council_ask_async requires at least 2 distinct models; "
@@ -585,6 +651,7 @@ async def council_result(job_id: str) -> dict:
     if state is None:
         return {"error": f"unknown job_id: {job_id}"}
     if state.phase != "done":
+        interrupted = state.phase == "interrupted"
         return {
             "ready": False,
             "phase": state.phase,
@@ -592,13 +659,23 @@ async def council_result(job_id: str) -> dict:
                 int((time.time() - state.started_at) * 1000)
                 if state.started_at else 0
             ),
-            "hint": "Call council_status(job_id) for live progress, retry later.",
+            "usage": state.usage,
+            "summary": state.summary,
+            "hint": (
+                "Job was interrupted by a server restart and is not resumable. "
+                "Call council_status(job_id) for the partial per-stage progress, "
+                "then re-run council_ask_async if you need a complete result."
+                if interrupted
+                else "Call council_status(job_id) for live progress, retry later."
+            ),
         }
     return {
         "ready": True,
         "phase": state.phase,
         "result_markdown": state.result_markdown,
         "dump_path": state.dump_path,
+        "usage": state.usage,
+        "summary": state.summary,
     }
 
 
@@ -615,6 +692,31 @@ async def council_list_jobs(limit: int = 20) -> list[dict]:
     the job_id from a previous turn."""
     jobs = await job_state.list_jobs(limit=limit)
     return [job_state.snapshot(j) for j in jobs]
+
+
+@mcp.tool()
+async def model_healthcheck(models: list[str] | None = None) -> dict:
+    """Ping every CATALOG model (or a subset) with a trivial prompt and report
+    per-model health: key present, HTTP status class, latency, empty-response.
+
+    Use this BEFORE a council run when something looks off, or to debug a member
+    that keeps erroring. Each model gets one cheap call (~"pong"); disabled
+    models are reported as status="disabled" (not called). `status` per model is
+    one of: ok | disabled | no_key | auth | insufficient_balance | rate_limited
+    | timeout | empty_response | network | error.
+
+    Also surfaces whether the COUNCIL_CONTEXT_ROOTS guardrail is configured.
+    """
+    rows = await healthcheck_models(models)
+    ok = sum(1 for r in rows if r["ok"])
+    return {
+        "checked": len(rows),
+        "ok": ok,
+        "failed": len(rows) - ok,
+        "context_roots_configured": sandbox.context_roots_configured(),
+        "circuit_breakers": circuit_breaker.snapshot(),
+        "models": rows,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1243,5 +1345,26 @@ async def dialogue_continue(
     }
 
 
+def _warn_if_context_roots_unset() -> None:
+    """Emit a startup guardrail warning to stderr when COUNCIL_CONTEXT_ROOTS is
+    unset. Stdout is the MCP transport — diagnostics must go to stderr."""
+    if not sandbox.context_roots_configured():
+        print(
+            "[mcp-council] WARNING: COUNCIL_CONTEXT_ROOTS is not set — context_paths "
+            "run deny-list-only. A prompt-injected path can exfiltrate any "
+            "non-blacklisted file to a third-party LLM. Set it to your "
+            "repo/workspace dir(s) to require every context file to resolve inside.",
+            file=sys.stderr,
+        )
+
+
 if __name__ == "__main__":
+    _warn_if_context_roots_unset()
+    _recovered = job_state.load_persisted_jobs()
+    if _recovered:
+        print(
+            f"[mcp-council] recovered {_recovered} persisted job(s); "
+            "non-terminal ones marked 'interrupted' (partial result via council_result).",
+            file=sys.stderr,
+        )
     mcp.run()

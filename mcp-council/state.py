@@ -12,9 +12,12 @@ opportunistically when a new job is created.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 
 # Jobs older than this (since creation) are GC'd. 24h is enough that the same
 # session can come back later and read its result, but not so long that an
@@ -32,7 +35,100 @@ MAX_JOBS = 64
 # dialogue's MAX_ACTIVE_SESSIONS.
 MAX_ACTIVE_JOBS = 16
 
-TERMINAL_PHASES = frozenset({"done", "error", "cancelled"})
+TERMINAL_PHASES = frozenset({"done", "error", "cancelled", "interrupted"})
+
+# Best-effort on-disk persistence so an MCP-server restart can surface jobs that
+# were mid-flight ("interrupted, partial result available") instead of silently
+# losing them. One JSON snapshot per job; written on every state change. Override
+# the location with COUNCIL_JOBS_DIR (read at call time so tests can isolate it).
+_DEFAULT_PERSIST_DIR = Path(__file__).parent / "logs" / "jobs"
+
+
+def _persist_dir() -> Path:
+    return Path(os.environ.get("COUNCIL_JOBS_DIR") or _DEFAULT_PERSIST_DIR)
+
+
+def _persist(state: "JobState") -> None:
+    """Write a job's current snapshot to disk. Best-effort — never raises into
+    a running council."""
+    try:
+        d = _persist_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        payload = snapshot(state)
+        payload["result_markdown"] = state.result_markdown
+        tmp = d / f"{state.job_id}.json.tmp"
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(d / f"{state.job_id}.json")
+    except OSError:
+        pass
+
+
+def _unlink_persisted(job_id: str) -> None:
+    try:
+        (_persist_dir() / f"{job_id}.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _state_from_snapshot(data: dict) -> "JobState":
+    """Rebuild a JobState from a persisted snapshot. Non-terminal persisted
+    phases become 'interrupted' (the run died with the previous process)."""
+    state = JobState(
+        job_id=data["job_id"],
+        question_preview=data.get("question_preview", ""),
+        created_at=data.get("created_at") or time.time(),
+        synthesis_requested=bool(data.get("synthesis_requested")),
+        rounds_requested=data.get("rounds_requested") or 1,
+    )
+    state.started_at = data.get("started_at")
+    state.finished_at = data.get("finished_at")
+    state.error = data.get("error")
+    state.dump_path = data.get("dump_path")
+    state.usage = data.get("usage")
+    state.summary = data.get("summary")
+    state.result_markdown = data.get("result_markdown")
+    for m in data.get("stage1") or []:
+        state.stage1[m["id"]] = MemberProgress(**m)
+    for m in data.get("stage2") or []:
+        state.stage2[m["id"]] = MemberProgress(**m)
+    s3 = data.get("stage3")
+    if s3:
+        state.stage3 = MemberProgress(**s3)
+    phase = data.get("phase") or "queued"
+    if phase not in TERMINAL_PHASES:
+        state.phase = "interrupted"
+        state.finished_at = state.finished_at or time.time()
+    else:
+        state.phase = phase
+    return state
+
+
+def load_persisted_jobs() -> int:
+    """Load persisted snapshots into memory at startup, marking non-terminal
+    jobs as 'interrupted'. Returns the number of jobs loaded. Synchronous —
+    intended to run once before the event loop starts serving."""
+    d = _persist_dir()
+    if not d.exists():
+        return 0
+    now = time.time()
+    loaded = 0
+    for f in d.glob("*.json"):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if now - (data.get("created_at") or 0) > JOB_TTL_SECONDS:
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+        jid = data.get("job_id")
+        if not jid or jid in _jobs:
+            continue
+        _jobs[jid] = _state_from_snapshot(data)
+        loaded += 1
+    return loaded
 
 
 @dataclass
@@ -69,6 +165,8 @@ class JobState:
     # Final outputs (populated when phase=done).
     result_markdown: str | None = None
     dump_path: str | None = None
+    usage: dict | None = None      # cost/usage accounting (see council._compute_usage)
+    summary: dict | None = None    # machine-readable verdict (see council._build_summary)
 
     # Internal: handle to the running asyncio.Task so we can cancel.
     _task: asyncio.Task | None = field(default=None, repr=False)
@@ -84,15 +182,17 @@ def _gc_locked(now: float) -> None:
     expired = [jid for jid, j in _jobs.items() if now - j.created_at > JOB_TTL_SECONDS]
     for jid in expired:
         del _jobs[jid]
+        _unlink_persisted(jid)
     if len(_jobs) <= MAX_JOBS:
         return
     finished = sorted(
-        ((jid, j) for jid, j in _jobs.items() if j.phase in {"done", "error", "cancelled"}),
+        ((jid, j) for jid, j in _jobs.items() if j.phase in TERMINAL_PHASES),
         key=lambda kv: kv[1].finished_at or kv[1].created_at,
     )
     while len(_jobs) > MAX_JOBS and finished:
         jid, _ = finished.pop(0)
         _jobs.pop(jid, None)
+        _unlink_persisted(jid)
 
 
 def _new_job_id() -> str:
@@ -161,7 +261,7 @@ async def cancel_job(job_id: str) -> bool:
         j = _jobs.get(job_id)
         if j is None:
             return False
-        if j.phase in {"done", "error", "cancelled"}:
+        if j.phase in TERMINAL_PHASES:
             return False
         task = j._task
     if task is not None and not task.done():
@@ -171,11 +271,12 @@ async def cancel_job(job_id: str) -> bool:
             await asyncio.wait_for(asyncio.shield(task), timeout=0.05)
         except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
             pass
-    if j.phase not in {"done", "error", "cancelled"}:
+    if j.phase not in TERMINAL_PHASES:
         # No handler ran (e.g. bare coroutine in tests) or it ran but didn't
         # call mark_phase — finalize synchronously.
         j.phase = "cancelled"
         j.finished_at = time.time()
+        _persist(j)
     return True
 
 
@@ -188,26 +289,30 @@ def mark_phase(state: JobState, phase: str) -> None:
     state.phase = phase
     if state.started_at is None and phase != "queued":
         state.started_at = time.time()
-    if phase in {"done", "error", "cancelled"}:
+    if phase in TERMINAL_PHASES:
         state.finished_at = time.time()
+    _persist(state)
 
 
 def update_member_stage1(state: JobState, *, id: str, model: str, status: str, error: str | None, latency_ms: int | None) -> None:
     state.stage1[id] = MemberProgress(
         id=id, model=model, status=status, error=error, latency_ms=latency_ms
     )
+    _persist(state)
 
 
 def update_member_stage2(state: JobState, *, id: str, model: str, status: str, error: str | None, latency_ms: int | None) -> None:
     state.stage2[id] = MemberProgress(
         id=id, model=model, status=status, error=error, latency_ms=latency_ms
     )
+    _persist(state)
 
 
 def update_stage3(state: JobState, *, id: str, model: str, status: str, error: str | None, latency_ms: int | None) -> None:
     state.stage3 = MemberProgress(
         id=id, model=model, status=status, error=error, latency_ms=latency_ms
     )
+    _persist(state)
 
 
 def snapshot(state: JobState) -> dict:
@@ -254,6 +359,8 @@ def snapshot(state: JobState) -> dict:
         ),
         "has_result": state.result_markdown is not None,
         "dump_path": state.dump_path,
+        "usage": state.usage,
+        "summary": state.summary,
     }
 
 
@@ -264,3 +371,8 @@ async def _reset_for_tests() -> None:
             if j._task is not None and not j._task.done():
                 j._task.cancel()
         _jobs.clear()
+    try:
+        for f in _persist_dir().glob("*.json*"):
+            f.unlink(missing_ok=True)
+    except OSError:
+        pass

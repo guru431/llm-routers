@@ -80,6 +80,16 @@ class SandboxError(Exception):
 _CONTEXT_ROOTS_ENV = "COUNCIL_CONTEXT_ROOTS"
 
 
+def context_roots_configured() -> bool:
+    """True if COUNCIL_CONTEXT_ROOTS is set to at least one non-empty root.
+
+    When False the sandbox runs deny-list-only: a prompt-injected context_path
+    can still ship any non-blacklisted file to a third-party LLM. Callers
+    (server startup, healthcheck) use this to surface the missing guardrail.
+    """
+    return bool(_allowed_roots())
+
+
 def _allowed_roots() -> list[Path]:
     raw = os.environ.get(_CONTEXT_ROOTS_ENV, "").strip()
     if not raw:

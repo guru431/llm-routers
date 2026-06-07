@@ -97,12 +97,36 @@ COUNCIL_DEFAULT: list[str] = [
 ]
 
 
+# Named council presets — convenience over hand-listing model ids. Definitions
+# are heuristic (tune against bench/ results) and kept as EXPLICIT lists so a
+# change is a one-line edit that never silently reshuffles a caller's council.
+# No "local" preset: the catalog has no local-runtime members.
+PRESETS: dict[str, list[str]] = {
+    "best": list(COUNCIL_DEFAULT),                    # all strongest members
+    "balanced": ["deepseek-pro", "glm", "gemini"],    # strong + mid mix, fewer calls
+    "cheap": ["glm", "qwen"],                          # lowest-cost OCG pair
+}
+
+
 class UnknownModelError(RuntimeError):
     """Raised when a model_id is not present in CATALOG."""
 
 
 class DisabledModelError(RuntimeError):
     """Raised when a model_id is present but disabled (enabled: False)."""
+
+
+class UnknownPresetError(RuntimeError):
+    """Raised when a preset name is not in PRESETS."""
+
+
+def resolve_preset(name: str) -> list[str]:
+    """Return the model-id list for a named preset (copy). Raises UnknownPresetError."""
+    if name not in PRESETS:
+        raise UnknownPresetError(
+            f"unknown preset: '{name}'. Available: {sorted(PRESETS)}"
+        )
+    return list(PRESETS[name])
 
 
 def resolve_member(id: str) -> dict:
@@ -120,8 +144,16 @@ def resolve_member(id: str) -> dict:
 def resolve_members(ids: list[str] | None) -> list[dict]:
     """Resolve a list of model_ids into cfgs. None → COUNCIL_DEFAULT.
 
-    Preserves input order. Raises on first invalid id.
+    Preserves input order, dropping duplicate ids (a model can appear only once —
+    duplicates would collide on council pseudonyms and skew aggregation).
+    Raises on first invalid id.
     """
     if ids is None:
         ids = COUNCIL_DEFAULT
-    return [resolve_member(i) for i in ids]
+    seen: set[str] = set()
+    unique: list[str] = []
+    for i in ids:
+        if i not in seen:
+            seen.add(i)
+            unique.append(i)
+    return [resolve_member(i) for i in unique]

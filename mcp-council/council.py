@@ -29,7 +29,7 @@ from prompts import (
     build_stage3_user,
 )
 from web_search import WEB_SEARCH_TOOL_SPEC
-from web_search_tool import MAX_TOOL_ITERATIONS, run_with_tool_loop
+from web_search_tool import MAX_TOOL_ITERATIONS, RunSearchCache, run_with_tool_loop
 
 # Hard cap on debate rounds. Pet-project scale; each round adds 2-8 minutes of
 # wall-time so we don't want hidden cost blow-ups.
@@ -62,6 +62,7 @@ async def _run_member_stage1(
     *,
     web_search: bool = False,
     on_progress: ProgressFn | None = None,
+    search_cache: RunSearchCache | None = None,
 ) -> dict:
     """Run one council member through stage 1. Always returns a dict — exceptions
     are captured into status="error" so asyncio.gather sees no raise."""
@@ -92,7 +93,7 @@ async def _run_member_stage1(
             result, tool_log = await run_with_tool_loop(
                 member=member, api_key=api_key, messages=messages,
                 max_tokens=max_tokens, call_fn=call_fn, tools=tools,
-                on_progress=progress,
+                on_progress=progress, search_cache=search_cache,
             )
         else:
             result = await call_fn(
@@ -133,6 +134,7 @@ async def _run_member_stage1(
             "latency_ms": int((time.monotonic() - start) * 1000),
             "tokens_in": result.get("tokens_in"),
             "tokens_out": result.get("tokens_out"),
+            "attempts": result.get("attempts"),
             "tool_calls_log": tool_log,
         }
 
@@ -145,6 +147,7 @@ async def _run_member_stage1(
         "latency_ms": int((time.monotonic() - start) * 1000),
         "tokens_in": result["tokens_in"],
         "tokens_out": result["tokens_out"],
+        "attempts": result.get("attempts"),
         "tool_calls_log": tool_log,
     }
 
@@ -204,6 +207,7 @@ async def _run_member_stage1_round_n(
         "error": None, "answer": result["content"],
         "latency_ms": int((time.monotonic() - start) * 1000),
         "tokens_in": result["tokens_in"], "tokens_out": result["tokens_out"],
+        "attempts": result.get("attempts"),
         "tool_calls_log": [],
     }
 
@@ -316,6 +320,9 @@ async def _run_member_stage2(
             "confidence": None,
             "pseudonyms": pseudonyms,
             "latency_ms": int((time.monotonic() - start) * 1000),
+            "tokens_in": result.get("tokens_in"),
+            "tokens_out": result.get("tokens_out"),
+            "attempts": result.get("attempts"),
         }
 
     # Confidence is optional; clamp to [1, 10] if present, else None.
@@ -354,6 +361,24 @@ async def _run_member_stage2(
             }
         )
 
+    # The raw `rankings` list was non-empty, but normalization may have dropped
+    # every entry (unknown pseudonym letters, non-integer/out-of-range scores).
+    # An all-invalid ranking carries no signal — surface it as a failed ranker
+    # instead of silently degrading the aggregate with an empty contribution.
+    if not clean:
+        return {
+            "ranker_id": ranker["id"],
+            "status": "error",
+            "error": "invalid_json: no valid rankings after normalization",
+            "rankings": [],
+            "confidence": None,
+            "pseudonyms": pseudonyms,
+            "latency_ms": int((time.monotonic() - start) * 1000),
+            "tokens_in": result.get("tokens_in"),
+            "tokens_out": result.get("tokens_out"),
+            "attempts": result.get("attempts"),
+        }
+
     return {
         "ranker_id": ranker["id"],
         "status": "ok",
@@ -362,6 +387,9 @@ async def _run_member_stage2(
         "confidence": confidence,
         "pseudonyms": pseudonyms,
         "latency_ms": int((time.monotonic() - start) * 1000),
+        "tokens_in": result.get("tokens_in"),
+        "tokens_out": result.get("tokens_out"),
+        "attempts": result.get("attempts"),
     }
 
 
@@ -491,6 +519,9 @@ async def _run_stage3_synthesis(
         "synthesis": result["content"],
         "error": None,
         "latency_ms": int((time.monotonic() - start) * 1000),
+        "tokens_in": result.get("tokens_in"),
+        "tokens_out": result.get("tokens_out"),
+        "attempts": result.get("attempts"),
     }
 
 
@@ -526,6 +557,141 @@ def _aggregate(stage2_results: list[dict]) -> list[tuple[str, float, int]]:
         agg.append((mid, weighted_sums[mid] / w, counts[mid]))
     agg.sort(key=lambda x: x[1], reverse=True)
     return agg
+
+
+def _compute_usage(
+    rounds_detail: list[dict],
+    stage3: dict | None,
+    search_cache=None,
+) -> dict:
+    """Aggregate cost/usage signals across every round and stage 3.
+
+    `llm_calls` counts only invocations that actually reached a provider (a
+    member that failed on a missing env var made zero calls and is excluded).
+    `retries` is the number of HTTP retries on the SUCCESS path; calls that
+    exhausted their retries and failed appear in summary.failed_models instead.
+    `web_search_cache_hits` = duplicate queries served from the per-run cache.
+    `estimated_cost_usd` is None until per-model pricing is added to CATALOG.
+    """
+    calls = tin = tout = retries = web = 0
+
+    def _acc(rec: dict) -> None:
+        nonlocal calls, tin, tout, retries, web
+        attempts = rec.get("attempts")
+        if attempts is not None:
+            calls += 1
+            retries += max(0, attempts - 1)
+        tin += rec.get("tokens_in") or 0
+        tout += rec.get("tokens_out") or 0
+        web += len(rec.get("tool_calls_log") or [])
+
+    for rd in rounds_detail:
+        for s in rd["stage1"]:
+            _acc(s)
+        for s in rd["stage2"]:
+            _acc(s)
+    if stage3 is not None:
+        _acc(stage3)
+
+    return {
+        "llm_calls": calls,
+        "tokens_in": tin,
+        "tokens_out": tout,
+        "web_search_calls": web,
+        "web_search_cache_hits": search_cache.hits if search_cache is not None else 0,
+        "retries": retries,
+        "estimated_cost_usd": None,
+    }
+
+
+def _build_summary(
+    stage1: list[dict],
+    stage2: list[dict],
+    aggregate: list[tuple[str, float, int]],
+    stage3: dict | None,
+) -> dict:
+    """Machine-readable verdict for automation (n8n etc.): winner, confidence,
+    failed models, top disagreements, recommended next action."""
+    model_by_id = {s["id"]: s["model"] for s in stage1}
+
+    failed_models: list[dict] = []
+    for s in stage1:
+        if s["status"] != "ok":
+            failed_models.append({"id": s["id"], "model": s["model"],
+                                  "stage": "stage1", "error": s.get("error")})
+    for s in stage2:
+        if s["status"] != "ok":
+            rid = s["ranker_id"]
+            failed_models.append({"id": rid, "model": model_by_id.get(rid, rid),
+                                  "stage": "stage2", "error": s.get("error")})
+
+    # Winner = top of aggregate, else the lone surviving member.
+    winner_id = winner_model = None
+    winner_mean = None
+    if aggregate:
+        winner_id, winner_mean, _ = aggregate[0]
+        winner_model = model_by_id.get(winner_id, winner_id)
+        winner_mean = round(winner_mean, 2)
+    else:
+        survivors = [s for s in stage1 if s["status"] == "ok"]
+        if survivors:
+            winner_id = survivors[0]["id"]
+            winner_model = survivors[0]["model"]
+
+    # Confidence from the margin between the top two aggregate means.
+    if not aggregate:
+        confidence = "low"
+    else:
+        top = aggregate[0][1]
+        margin = top - aggregate[1][1] if len(aggregate) >= 2 else top
+        if margin >= 1.5 and top >= 7:
+            confidence = "high"
+        elif margin >= 0.7:
+            confidence = "medium"
+        else:
+            confidence = "low"
+
+    # Disagreements: per-member score spread across rankers (1-10 scale).
+    scores_by_id: dict[str, list[int]] = {}
+    for s in stage2:
+        if s["status"] != "ok":
+            continue
+        for r in s["rankings"]:
+            scores_by_id.setdefault(r["ranked_id"], []).append(r["score"])
+    top_disagreements: list[dict] = []
+    for mid, scores in scores_by_id.items():
+        if len(scores) < 2:
+            continue
+        spread = max(scores) - min(scores)
+        if spread >= 3:
+            top_disagreements.append({
+                "id": mid, "model": model_by_id.get(mid, mid),
+                "spread": spread, "scores": sorted(scores),
+            })
+    top_disagreements.sort(key=lambda d: d["spread"], reverse=True)
+    top_disagreements = top_disagreements[:3]
+
+    ok_stage1 = sum(1 for s in stage1 if s["status"] == "ok")
+    if failed_models and len(failed_models) >= max(1, len(stage1)) / 2:
+        next_action = "Several models failed — run model_healthcheck and retry."
+    elif confidence == "low" or top_disagreements:
+        next_action = (
+            "Low agreement — consider synthesis=True or another round (rounds=2)."
+        )
+    else:
+        next_action = "Clear winner — adopt the top-ranked answer."
+
+    return {
+        "winner_id": winner_id,
+        "winner_model": winner_model,
+        "winner_mean_score": winner_mean,
+        "confidence": confidence,
+        "survivors": ok_stage1,
+        "failed_models": failed_models,
+        "top_disagreements": top_disagreements,
+        "synthesized": bool(stage3 and stage3.get("status") == "ok"),
+        "recommended_next_action": next_action,
+    }
 
 
 async def _run_stage2_for_round(
@@ -620,13 +786,17 @@ async def run_council(
     notes: list[str] = []
     rounds_detail: list[dict] = []
 
+    # One shared search cache per run — members issue overlapping queries and
+    # otherwise pay Exa per duplicate. Only round-1 stage 1 uses web_search.
+    search_cache = RunSearchCache() if web_search else None
+
     # --- Round 1 ---------------------------------------------------------
     progress("phase", {"phase": "stage1", "members": [m["id"] for m in members]})
 
     async def _stage1_wrap(member: dict) -> dict:
         r = await _run_member_stage1(
             member, question, files_section, max_response_tokens, call_fn,
-            web_search=web_search, on_progress=progress,
+            web_search=web_search, on_progress=progress, search_cache=search_cache,
         )
         progress("stage1_member", {
             "id": r["id"], "model": r["model"], "status": r["status"],
@@ -747,4 +917,6 @@ async def run_council(
         "rounds_detail": rounds_detail,
         "stage3": stage3,
         "notes": notes,
+        "usage": _compute_usage(rounds_detail, stage3, search_cache),
+        "summary": _build_summary(stage1, stage2, aggregate, stage3),
     }

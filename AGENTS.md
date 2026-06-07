@@ -37,4 +37,4 @@
 
 ## Env keys
 
-`DEEPSEEK_KEY`, `OPENCODE_GO_KEY`, `HELICONE_GATEWAY_KEY`, `EXA_API_KEY` — передаются через окружение (для MCP-сервера — `~/.claude.json` → `mcpServers.council.env`). В репозиторий не попадают.
+`DEEPSEEK_KEY`, `OPENCODE_GO_KEY`, `HELICONE_GATEWAY_KEY`, `CODEX_AGENT_TOKEN`, `EXA_API_KEY` — передаются через окружение (для MCP-сервера — `~/.claude.json` → `mcpServers.council.env`). В репозиторий не попадают. `CODEX_AGENT_TOKEN` — bearer к локальному `codex-agent-server` :8766 (член совета `codex`); без него `council_ask` с участником `codex` падает с `CouncilHTTPError`. `MINIMAX_API_KEY` нужен только для `minimax-direct`, который сейчас disabled (billing off).

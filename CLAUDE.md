@@ -16,9 +16,10 @@
 
 - `mcp-council/` — единый MCP-сервер с двумя группами tool'ов:
   - **Council (single-shot deliberation):**
-    - **`council_ask(question, models=None, ...)`** — Karpathy 3-stage council из 7 моделей (или подмножества через `models=[...]`, **минимум 2**). Для архитектурных решений, спорных вопросов, важного code review, debug сложных багов. **НЕ для рутины** (2-8 мин, дорого).
+    - **`council_ask(question, models=None, models_preset=None, ...)`** — Karpathy 3-stage council из 7 моделей (или подмножества через `models=[...]`, **минимум 2**; либо `models_preset="best|balanced|cheap"` вместо ручного списка — взаимоисключимо с `models`). Для архитектурных решений, спорных вопросов, важного code review, debug сложных багов. **НЕ для рутины** (2-8 мин, дорого). Результат содержит machine-readable `summary` (winner/confidence/failed_models/top_disagreements/recommended_next_action) и `usage` (llm_calls/tokens/web_search/retries/cache_hits).
     - **`model_ask(model_id, prompt, context_paths=[], example_paths=[], ...)`** — один прямой вызов конкретной модели из `models.CATALOG`. Для тяжёлой суммаризации логов, шаблонной генерации, переводов. Заменяет старые `deepseek_read/draft` и `minimax_read/draft` (пакеты `mcp-deepseek` и `mcp-minimax` удалены 2026-05-21).
-    - Async-pattern для council: `council_ask_async` + `council_status/result/cancel/list_jobs`.
+    - **`model_healthcheck(models=None)`** — пинг каждой модели CATALOG (или подмножества) тривиальным промптом: ключ/HTTP-статус/latency/empty-response. Возвращает per-model `status` (ok|disabled|no_key|auth|insufficient_balance|rate_limited|timeout|empty_response|network|circuit_open|error) + `circuit_breakers` snapshot + `context_roots_configured`. Использовать ДО council при подозрении на проблему провайдера.
+    - Async-pattern для council: `council_ask_async` + `council_status/result/cancel/list_jobs`. Job-state персистится на диск (`logs/jobs/`, override `COUNCIL_JOBS_DIR`); при рестарте сервера незавершённые задачи помечаются `interrupted` (partial-прогресс через `council_status`).
   - **Dialogue (продолжительные диалоги между моделями с anti-convergence):**
     - **`model_debate(question, participants=None, moderator=None, rounds=5, ...)`** — 2+ моделей с противоположными позициями (модератор автогенерирует), N раундов critique/response. Default participants `["glm","kimi","codex"]`.
     - **`model_panel(question, participants=None, roles=None, diversity_monitor=True, devils_advocate_rotation=True, rounds=5, ...)`** — 4-6 моделей в свободной дискуссии, devil's advocate ротация + diversity monitor (re-prompt согласившимся). Default participants = DEFAULT_PANEL_PARTICIPANTS (7, вкл. codex).
@@ -50,9 +51,9 @@
 
 ## Принципы
 
-- **Stateless** — каждый MCP-вызов независим.
-- **Sandbox** — `sandbox.py` блокирует `.env`, ключи, secrets, settings.json. Лимит 50 файлов / 500 KB суммарно.
-- **Single source of truth** — `models.py::CATALOG` хранит всех моделей, дубликатов `sandbox.py`/`logger.py` больше нет.
+- **Stateless** — каждый MCP-вызов независим. Исключение: process-global circuit breaker (`circuit_breaker.py`) — после `FAILURE_THRESHOLD` подряд infra-ошибок (5xx/timeout/network) хост помечается degraded на `COOLDOWN_SECONDS`, и вызовы к нему short-circuit'ятся (не жгут retry-бюджет всего fan-out). 402/401/400 breaker не открывают.
+- **Sandbox** — `sandbox.py` блокирует `.env`, ключи, secrets, settings.json. Лимит 50 файлов / 500 KB суммарно. Опц. allow-list `COUNCIL_CONTEXT_ROOTS` (если не задан — сервер пишет warning в stderr на старте; виден в `model_healthcheck`).
+- **Single source of truth** — `models.py::CATALOG` хранит всех моделей, дубликатов `sandbox.py`/`logger.py` больше нет. Пресеты совета — `models.py::PRESETS`.
 
 ## Ключи
 
@@ -68,15 +69,27 @@
 
 ## Registration в Claude Code
 
-MCP-сервер регистрируется в `~/.claude.json` под top-level `mcpServers` как `council`. Tool-пути: `mcp__council__council_ask`, `mcp__council__model_ask`, `mcp__council__council_ask_async`, `mcp__council__council_status/result/cancel/list_jobs`.
+MCP-сервер регистрируется в `~/.claude.json` под top-level `mcpServers` как `council`. Tool-пути: `mcp__council__council_ask`, `mcp__council__model_ask`, `mcp__council__model_healthcheck`, `mcp__council__council_ask_async`, `mcp__council__council_status/result/cancel/list_jobs`.
 
 ## Tests
+
+Канонический прогон всех pytest-сьютов — из корня:
+
+```bash
+python run_tests.py              # --quick (дефолт): pytest без live-серверов
+python run_tests.py --full       # + compileall по всем пакетам
+python run_tests.py --integration  # live codex-agent-server/integration_suite.py (нужен сервер :8766 + токен)
+```
+
+Подпроекты — независимые пакеты с одноимёнными модулями (`server.py` ×3, `cache.py`), поэтому один процесс pytest их не соберёт (коллизия `sys.modules`). `run_tests.py` запускает каждый сьют отдельным интерпретатором. Отдельный подпроект:
 
 ```bash
 cd mcp-council
 pip install -e ".[dev]"
 pytest -v
 ```
+
+`codex-agent-server/integration_suite.py` — live-сьют (CLI, не pytest), бьёт по запущенному серверу :8766, в `run_tests.py` не входит.
 
 ## Связанные документы
 

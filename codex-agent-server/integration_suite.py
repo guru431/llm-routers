@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-Test suite for Codex Agent Server.
+Live integration suite for Codex Agent Server.
+
+Not a pytest module — a standalone CLI harness that hits a running server on
+:8766. Named integration_suite.py (not test_*) so pytest does not try to
+collect its zero pytest items during the canonical all-tests run.
 
 Usage:
-    python test_server.py                          # run all tests (localhost:8766)
-    python test_server.py --url http://host:8766/v1/chat/completions
-    python test_server.py --token <bearer>         # or env CODEX_AGENT_TOKEN
-    python test_server.py --cat TextGen            # single category
-    python test_server.py --agentic                # also run slow workspace-write tests
+    python integration_suite.py                          # run all tests (localhost:8766)
+    python integration_suite.py --url http://host:8766/v1/chat/completions
+    python integration_suite.py --token <bearer>         # or env CODEX_AGENT_TOKEN
+    python integration_suite.py --cat TextGen            # single category
+    python integration_suite.py --agentic                # also run slow workspace-write tests
 
 Auth: the server requires a bearer token. Pass --token or set CODEX_AGENT_TOKEN.
 Agentic tests need a writable CODEX_AGENT_WORKDIR on the server and live `codex login`.

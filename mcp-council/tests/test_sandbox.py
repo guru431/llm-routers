@@ -2,7 +2,12 @@
 
 import pytest
 
-from sandbox import SandboxError, resolve_and_validate, _CONTEXT_ROOTS_ENV
+from sandbox import (
+    SandboxError,
+    resolve_and_validate,
+    context_roots_configured,
+    _CONTEXT_ROOTS_ENV,
+)
 
 
 def test_no_roots_env_allows_any_nonblacklisted_file(tmp_path, monkeypatch):
@@ -28,3 +33,12 @@ def test_path_outside_allowed_root_rejected(tmp_path, monkeypatch):
     monkeypatch.setenv(_CONTEXT_ROOTS_ENV, str(root))
     with pytest.raises(SandboxError, match="outside allowed roots"):
         resolve_and_validate([str(outside)])
+
+
+def test_context_roots_configured_reflects_env(tmp_path, monkeypatch):
+    monkeypatch.delenv(_CONTEXT_ROOTS_ENV, raising=False)
+    assert context_roots_configured() is False
+    monkeypatch.setenv(_CONTEXT_ROOTS_ENV, "   ")
+    assert context_roots_configured() is False
+    monkeypatch.setenv(_CONTEXT_ROOTS_ENV, str(tmp_path))
+    assert context_roots_configured() is True

@@ -7,6 +7,8 @@ import pytest
 from council import (
     _aggregate,
     _assign_pseudonyms,
+    _build_summary,
+    _compute_usage,
     _extract_json,
     run_council,
 )
@@ -247,6 +249,103 @@ async def test_run_council_stage2_invalid_json_marked_error():
     # m1's stage1 answer is preserved.
     s1_by_id = {s["id"]: s for s in result["stage1"]}
     assert s1_by_id["m1"]["status"] == "ok"
+
+
+def test_compute_usage_aggregates_calls_tokens_retries():
+    rounds_detail = [{
+        "stage1": [
+            {"attempts": 1, "tokens_in": 100, "tokens_out": 50,
+             "tool_calls_log": [{}, {}]},
+            {"attempts": 2, "tokens_in": 10, "tokens_out": 5, "tool_calls_log": []},
+            # no-key member: never reached provider — excluded from llm_calls.
+            {"attempts": None, "tokens_in": None, "tokens_out": None,
+             "tool_calls_log": []},
+        ],
+        "stage2": [{"attempts": 1, "tokens_in": 20, "tokens_out": 8}],
+        "aggregate": [],
+    }]
+    stage3 = {"attempts": 1, "tokens_in": 200, "tokens_out": 100, "status": "ok"}
+    u = _compute_usage(rounds_detail, stage3)
+    assert u["llm_calls"] == 4
+    assert u["tokens_in"] == 100 + 10 + 20 + 200
+    assert u["tokens_out"] == 50 + 5 + 8 + 100
+    assert u["web_search_calls"] == 2
+    assert u["retries"] == 1
+    assert u["estimated_cost_usd"] is None
+
+
+def test_build_summary_winner_failed_and_disagreement():
+    stage1 = [
+        {"id": "m1", "model": "M1", "status": "ok"},
+        {"id": "m2", "model": "M2", "status": "ok"},
+        {"id": "m3", "model": "M3", "status": "error", "error": "boom"},
+    ]
+    stage2 = [
+        {"ranker_id": "m1", "status": "ok",
+         "rankings": [{"ranked_id": "m2", "score": 9}, {"ranked_id": "m3", "score": 2}]},
+        {"ranker_id": "m2", "status": "ok",
+         "rankings": [{"ranked_id": "m1", "score": 8}, {"ranked_id": "m3", "score": 7}]},
+    ]
+    aggregate = [("m2", 9.0, 1), ("m1", 8.0, 1), ("m3", 4.5, 2)]
+    s = _build_summary(stage1, stage2, aggregate, None)
+    assert s["winner_id"] == "m2"
+    assert s["winner_model"] == "M2"
+    assert any(f["id"] == "m3" and f["stage"] == "stage1" for f in s["failed_models"])
+    # m3 scored 2 and 7 across rankers → spread 5 (≥3) is a disagreement.
+    assert any(d["id"] == "m3" and d["spread"] == 5 for d in s["top_disagreements"])
+    assert s["confidence"] in ("low", "medium", "high")
+
+
+async def test_run_council_returns_usage_and_summary():
+    members = _make_members()
+
+    async def fake_call(**kwargs):
+        user = kwargs["messages"][1]["content"]
+        if "=== ANSWERS TO RANK ===" in user:
+            return {"content": json.dumps(
+                {"rankings": [{"member": "A", "score": 8, "reasoning": ""}]}),
+                "tokens_in": 5, "tokens_out": 3, "attempts": 1}
+        return {"content": "ans", "tokens_in": 7, "tokens_out": 4, "attempts": 1}
+
+    result = await run_council(question="q", members=members, call_fn=fake_call)
+    assert result["usage"]["llm_calls"] > 0
+    assert result["summary"]["winner_id"] is not None
+
+
+async def test_run_council_stage2_all_invalid_entries_marked_error():
+    """Valid JSON with a non-empty rankings list whose entries ALL fail
+    normalization (unknown pseudonym, out-of-range score) must mark the ranker
+    as error — not silently return an empty 'ok' ranking that degrades the
+    aggregate."""
+    members = _make_members()
+
+    async def fake_call(**kwargs):
+        user_msg = kwargs["messages"][1]["content"]
+        if "=== ANSWERS TO RANK ===" in user_msg:
+            if kwargs["model"] == "M1":
+                # 'Z' is not an assigned pseudonym and 99 is out of [1,10];
+                # every entry gets dropped during normalization.
+                return {
+                    "content": json.dumps(
+                        {"rankings": [{"member": "Z", "score": 99, "reasoning": ""}]}
+                    ),
+                    "tokens_in": 1,
+                    "tokens_out": 1,
+                }
+            return {
+                "content": json.dumps(
+                    {"rankings": [{"member": "A", "score": 8, "reasoning": ""}]}
+                ),
+                "tokens_in": 1,
+                "tokens_out": 1,
+            }
+        return {"content": f"ans-{kwargs['model']}", "tokens_in": 1, "tokens_out": 1}
+
+    result = await run_council(question="q", members=members, call_fn=fake_call)
+    s2_by_ranker = {s["ranker_id"]: s for s in result["stage2"]}
+    assert s2_by_ranker["m1"]["status"] == "error"
+    assert "invalid_json" in s2_by_ranker["m1"]["error"]
+    assert s2_by_ranker["m1"]["rankings"] == []
 
 
 async def test_stage2_uses_pseudonyms_no_model_names_in_user_prompt():

@@ -13,8 +13,11 @@ Strip <think>...</think> блоки из ответа (некоторые мод
 
 import asyncio
 import re
+from urllib.parse import urlparse
 
 import httpx
+
+import circuit_breaker
 
 # Read timeout for the upstream LLM. Thinking-style models routed via OCG can
 # spend 2-5 minutes before any bytes are returned (full response held until
@@ -67,6 +70,15 @@ async def call_openai_compat(
     Raises CouncilHTTPError on network/HTTP/parsing failure or after exhausting retries.
     """
     url = base_url.rstrip("/") + "/chat/completions"
+    host = urlparse(base_url).netloc or base_url
+    # Short-circuit if this provider was recently marked down — don't spend the
+    # full retry/timeout budget on a host we already know is failing.
+    cooldown = circuit_breaker.open_for(host)
+    if cooldown:
+        raise CouncilHTTPError(
+            f"circuit_open for {host}: provider marked down, cooling down "
+            f"{int(cooldown)}s"
+        )
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
     payload: dict = {
@@ -100,6 +112,7 @@ async def call_openai_compat(
                 # same backoff as HTTP 5xx for consistency.
                 detail = str(e) or type(e).__name__
                 if attempt >= len(RETRY_BACKOFFS):
+                    circuit_breaker.record_failure(host)
                     raise CouncilHTTPError(
                         f"timeout after {attempt + 1} attempts: {detail}"
                     ) from e
@@ -110,6 +123,7 @@ async def call_openai_compat(
                 # Non-timeout transport error (DNS, TLS, etc.). str(e) is often
                 # empty on these — fall back to the class name so logs aren't blank.
                 detail = str(e) or type(e).__name__
+                circuit_breaker.record_failure(host)
                 raise CouncilHTTPError(f"network error: {detail}") from e
 
             if resp.status_code == 402:
@@ -118,6 +132,7 @@ async def call_openai_compat(
 
             if resp.status_code in RETRY_STATUSES:
                 if attempt >= len(RETRY_BACKOFFS):
+                    circuit_breaker.record_failure(host)
                     raise CouncilHTTPError(
                         f"overload after {attempt + 1} attempts (last status {resp.status_code})"
                     )
@@ -161,6 +176,7 @@ async def call_openai_compat(
                 )
 
             usage = data.get("usage", {}) or {}
+            circuit_breaker.record_success(host)
             return {
                 "content": _strip_think(content) if content else None,
                 "tool_calls": tool_calls,
@@ -168,6 +184,9 @@ async def call_openai_compat(
                 "finish_reason": finish_reason,
                 "tokens_in": usage.get("prompt_tokens"),
                 "tokens_out": usage.get("completion_tokens"),
+                # Number of HTTP attempts spent (1 = succeeded first try). Used by
+                # council usage-accounting to count retries on the success path.
+                "attempts": attempt + 1,
             }
 
     raise CouncilHTTPError(last_error or "unreachable")  # pragma: no cover

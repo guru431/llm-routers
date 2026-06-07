@@ -232,6 +232,20 @@ def test_council_ask_default_models_passes_six_members(monkeypatch):
     fake_dump.unlink(missing_ok=True)
 
 
+def test_resolve_models_arg_preset_and_passthrough():
+    # preset name → its model list
+    assert server._resolve_models_arg(None, "cheap") == ["glm", "qwen"]
+    # explicit models pass through unchanged
+    assert server._resolve_models_arg(["glm", "kimi"], None) == ["glm", "kimi"]
+    # neither → None (default council)
+    assert server._resolve_models_arg(None, None) is None
+
+
+def test_resolve_models_arg_both_set_rejected():
+    with pytest.raises(RuntimeError, match="either models or models_preset"):
+        server._resolve_models_arg(["glm", "kimi"], "best")
+
+
 # -------------------------------------------------------------------------
 # Task 7: model_ask
 # -------------------------------------------------------------------------

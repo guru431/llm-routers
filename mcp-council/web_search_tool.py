@@ -5,6 +5,7 @@ implementation that lived inside council.py."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, Awaitable, Callable
 
@@ -32,10 +33,51 @@ def _noop_progress(event_type: str, payload: dict[str, Any]) -> None:  # noqa: A
     return None
 
 
+class RunSearchCache:
+    """Per-council-run web_search cache keyed by normalized query.
+
+    All council members run stage 1 concurrently and frequently issue the same
+    obvious query, paying Exa per call. This caches by normalized query for the
+    duration of ONE run (created fresh in run_council — never global, so results
+    can't go stale across runs). Stores the in-flight asyncio.Task so concurrent
+    identical queries collapse to a single Exa call rather than racing.
+    """
+
+    def __init__(self, search_fn=None) -> None:
+        # None → resolve the module-level web_search_exa at call time so test
+        # patches of `web_search_tool.web_search_exa` take effect.
+        self._search_fn = search_fn
+        self._tasks: dict[str, asyncio.Task] = {}
+        self._lock = asyncio.Lock()
+        self.hits = 0
+        self.misses = 0
+
+    @staticmethod
+    def _norm(query: str) -> str:
+        return " ".join(query.strip().lower().split())
+
+    async def search(self, query: str) -> dict:
+        key = self._norm(query)
+        async with self._lock:
+            task = self._tasks.get(key)
+            if task is None:
+                self.misses += 1
+                fn = self._search_fn or web_search_exa
+                task = asyncio.ensure_future(fn(query))
+                self._tasks[key] = task
+            else:
+                self.hits += 1
+        # Await outside the lock so a slow Exa call doesn't serialize other
+        # distinct queries. WebSearchError propagates to every awaiter — within
+        # one run a failing query is unlikely to start succeeding.
+        return await task
+
+
 async def execute_tool_call(
     tc: dict,
     on_progress: ProgressFn,
     member_id: str,
+    search_cache: "RunSearchCache | None" = None,
 ) -> tuple[str, dict]:
     """Execute one OpenAI-style tool_call (currently only web_search).
     Returns (tool_message_content, log_entry)."""
@@ -56,7 +98,10 @@ async def execute_tool_call(
             log["error"] = "empty query"
             return (f"# Web search failed\nEmpty query passed to web_search.", log)
         try:
-            result = await web_search_exa(query)
+            result = await (
+                search_cache.search(query) if search_cache is not None
+                else web_search_exa(query)
+            )
         except WebSearchError as e:
             log["error"] = str(e)
             on_progress("tool_call", {
@@ -91,6 +136,7 @@ async def run_with_tool_loop(
     call_fn: CallFn | None = None,
     tools: list[dict] | None = None,
     on_progress: ProgressFn | None = None,
+    search_cache: "RunSearchCache | None" = None,
 ) -> tuple[dict, list[dict]]:
     """Drive the chat loop, executing tool_calls until the model emits content
     or the iteration cap is hit. Returns (final_result_dict, tool_call_log).
@@ -141,7 +187,9 @@ async def run_with_tool_loop(
             assistant_msg["reasoning_content"] = rc
         messages.append(assistant_msg)
         for tc in tool_calls:
-            tool_msg, log_entry = await execute_tool_call(tc, progress, member["id"])
+            tool_msg, log_entry = await execute_tool_call(
+                tc, progress, member["id"], search_cache=search_cache
+            )
             tool_log.append(log_entry)
             messages.append({
                 "role": "tool",

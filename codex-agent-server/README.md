@@ -165,10 +165,12 @@ print(resp.choices[0].message.content)
 
 ## Тесты
 
+Это live-интеграционный сьют (CLI, не pytest) — бьёт по запущенному серверу на :8766:
+
 ```bash
-python test_server.py --token $CODEX_AGENT_TOKEN              # text/tool/system/multi-turn
-python test_server.py --token $CODEX_AGENT_TOKEN --agentic    # + workspace-write (медленно)
-python test_server.py --token $CODEX_AGENT_TOKEN --cat TextGen
+python integration_suite.py --token $CODEX_AGENT_TOKEN              # text/tool/system/multi-turn
+python integration_suite.py --token $CODEX_AGENT_TOKEN --agentic    # + workspace-write (медленно)
+python integration_suite.py --token $CODEX_AGENT_TOKEN --cat TextGen
 ```
 
 Агентные тесты требуют writable `CODEX_AGENT_WORKDIR` на хосте сервера и живой `codex login`.

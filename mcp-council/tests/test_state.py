@@ -12,7 +12,9 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture(autouse=True)
-async def reset_state():
+async def reset_state(tmp_path, monkeypatch):
+    # Isolate on-disk job persistence into a tmp dir so tests never touch logs/.
+    monkeypatch.setenv("COUNCIL_JOBS_DIR", str(tmp_path / "jobs"))
     await state._reset_for_tests()
     yield
     await state._reset_for_tests()
@@ -120,3 +122,42 @@ async def test_list_jobs_newest_first():
     ids = [j.job_id for j in lst]
     assert ids[0] == s2.job_id
     assert ids[1] == s1.job_id
+
+
+# --- persistence / recovery ---------------------------------------------
+
+
+async def test_persist_and_recover_interrupted_job():
+    s = await state.create_job(question_preview="q", synthesis=False, rounds=1)
+    state.mark_phase(s, "stage1")
+    state.update_member_stage1(
+        s, id="glm", model="glm-5.1", status="ok", error=None, latency_ms=1000
+    )
+    # Simulate a server restart: drop in-memory state, keep the on-disk file.
+    state._jobs.clear()
+    loaded = state.load_persisted_jobs()
+    assert loaded == 1
+    recovered = await state.get_job(s.job_id)
+    assert recovered is not None
+    assert recovered.phase == "interrupted"     # non-terminal → interrupted
+    assert "glm" in recovered.stage1            # partial progress preserved
+
+
+async def test_persist_recover_done_job_keeps_phase_and_result():
+    s = await state.create_job(question_preview="q", synthesis=False, rounds=1)
+    s.result_markdown = "# final"
+    state.mark_phase(s, "done")
+    state._jobs.clear()
+    assert state.load_persisted_jobs() == 1
+    recovered = await state.get_job(s.job_id)
+    assert recovered.phase == "done"            # terminal phase preserved
+    assert recovered.result_markdown == "# final"
+
+
+async def test_load_persisted_skips_in_memory_duplicates():
+    s = await state.create_job(question_preview="q", synthesis=False, rounds=1)
+    state.mark_phase(s, "stage1")
+    # File exists AND job is in memory → load must not clobber the live one.
+    loaded = state.load_persisted_jobs()
+    assert loaded == 0
+    assert (await state.get_job(s.job_id)).phase == "stage1"
