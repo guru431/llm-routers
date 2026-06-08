@@ -52,7 +52,7 @@
     {"id": "minimax-m2.5-highspeed-direct","provider": "minimax", "endpoint": "https://api.minimax.io/v1", "model": "MiniMax-M2.5-highspeed", "auth_env": "MINIMAX_API_KEY"},
     {"id": "minimax-m2.1-direct",          "provider": "minimax", "endpoint": "https://api.minimax.io/v1", "model": "MiniMax-M2.1",           "auth_env": "MINIMAX_API_KEY"},
 
-    {"id": "ollama-gemma4-e4b",   "provider": "ollama",     "endpoint": "http://localhost:11434", "model": "gemma4:e4b",          "auth_env": null, "api": "ollama"},
+    {"id": "ollama-gemma4-12b",   "provider": "ollama",     "endpoint": "http://localhost:11434", "model": "gemma4:12b",          "auth_env": null, "api": "ollama"},
     {"id": "ollama-qwen3.5-9b",   "provider": "ollama",     "endpoint": "http://localhost:11434", "model": "qwen3.5:9b",          "auth_env": null, "api": "ollama"},
     {"id": "ollama-gpt-oss-20b",  "provider": "ollama",     "endpoint": "http://localhost:11434", "model": "gpt-oss:20b",         "auth_env": null, "api": "ollama"},
     {"id": "ollama-qwen3-vl-8b",  "provider": "ollama",     "endpoint": "http://localhost:11434", "model": "qwen3-vl:8b-instruct","auth_env": null, "api": "ollama"},
