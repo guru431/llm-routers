@@ -41,7 +41,7 @@
 | `kimi` | kimi-k2.6 | council member (OCG) |
 | `deepseek-pro` | deepseek-v4-pro | council member (DeepSeek direct) |
 | `qwen` | qwen3.6-plus | council member (OCG) |
-| `minimax` | minimax-m2.7 | council member (OCG) |
+| `minimax` | minimax-m3 | council member (OCG) |
 | `gemini` | gemini-3.1-pro-preview | council member (Helicone Gateway) |
 | `codex` | gpt-5.5 | council member (codex-agent-server :8766, read-only) |
 | `deepseek-flash` | deepseek-v4-flash | routine worker (model_ask only) |

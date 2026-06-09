@@ -47,7 +47,7 @@ CATALOG: dict[str, dict] = {
         "env_key": "OPENCODE_GO_KEY",
     },
     "minimax": {
-        "model": "minimax-m2.7",
+        "model": "minimax-m3",
         "base_url": OCG,
         "env_key": "OPENCODE_GO_KEY",
         "min_max_tokens": 30000,

@@ -16,7 +16,7 @@ MCP-сервер: Karpathy 3-stage council из 7 LLM с опционально�
 | kimi | kimi-k2.6 | OpenCode Go | `OPENCODE_GO_KEY` |
 | deepseek | deepseek-v4-pro | DeepSeek direct | `DEEPSEEK_KEY` |
 | qwen | qwen3.6-plus | OpenCode Go | `OPENCODE_GO_KEY` |
-| minimax | minimax-m2.7 | OpenCode Go | `OPENCODE_GO_KEY` |
+| minimax | minimax-m3 | OpenCode Go | `OPENCODE_GO_KEY` |
 | gemini | gemini-3.1-pro-preview | Helicone AI Gateway | `HELICONE_GATEWAY_KEY` |
 | codex | gpt-5.5 | codex-agent-server :8766 (read-only) | `CODEX_AGENT_TOKEN` |
 
