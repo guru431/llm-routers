@@ -31,16 +31,26 @@ class ResponseCache:
     Args:
         max_size: максимум записей в кэше (LRU eviction при превышении).
         ttl_seconds: время жизни записи (после — get возвращает None).
+        max_bytes: максимум суммарного размера значений в байтах (LRU eviction
+            при превышении). Защита от OOM при немногих, но огромных ответах
+            (один ответ может быть в сотни KB; 256 таких записей — десятки MB).
     """
 
-    def __init__(self, max_size: int = 256, ttl_seconds: float = 3600.0):
+    def __init__(self, max_size: int = 256, ttl_seconds: float = 3600.0,
+                 max_bytes: int = 64 * 1024 * 1024):
         if max_size <= 0:
             raise ValueError("max_size must be positive")
         if ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be positive")
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
         self._max_size = max_size
         self._ttl = ttl_seconds
-        self._data: "OrderedDict[str, tuple[float, str]]" = OrderedDict()
+        self._max_bytes = max_bytes
+        # Каждая запись: key -> (timestamp, value, nbytes). Сумму байтов держим
+        # в _total_bytes, чтобы не пересчитывать на каждой эвикции.
+        self._data: "OrderedDict[str, tuple[float, str, int]]" = OrderedDict()
+        self._total_bytes = 0
         self._lock = threading.Lock()
         self._hits = 0
         self._misses = 0
@@ -72,10 +82,11 @@ class ResponseCache:
             if entry is None:
                 self._misses += 1
                 return None
-            timestamp, value = entry
+            timestamp, value, nbytes = entry
             if now - timestamp > self._ttl:
                 # Expired — удаляем
                 del self._data[key]
+                self._total_bytes -= nbytes
                 self._misses += 1
                 return None
             # MRU: переносим в конец
@@ -87,19 +98,28 @@ class ResponseCache:
         """Сохраняет ответ. Перезапись обновляет recency."""
         key = self._make_key(model, system_prompt, prompt)
         now = time.monotonic()
+        nbytes = len(value.encode("utf-8", errors="replace"))
         with self._lock:
-            if key in self._data:
-                # Перезапись — обновляем значение и переносим в MRU
+            old = self._data.get(key)
+            if old is not None:
+                # Перезапись — вычитаем старый размер, переносим в MRU
+                self._total_bytes -= old[2]
                 self._data.move_to_end(key)
-            self._data[key] = (now, value)
-            # LRU eviction
-            while len(self._data) > self._max_size:
-                self._data.popitem(last=False)
+            self._data[key] = (now, value, nbytes)
+            self._total_bytes += nbytes
+            # LRU eviction по числу записей ИЛИ суммарным байтам. Не выселяем
+            # единственную (только что добавленную) запись, даже если она одна
+            # превышает max_bytes — иначе put стал бы no-op.
+            while (len(self._data) > self._max_size
+                   or self._total_bytes > self._max_bytes) and len(self._data) > 1:
+                _, evicted = self._data.popitem(last=False)
+                self._total_bytes -= evicted[2]
 
     def clear(self) -> None:
         """Удаляет все записи, hits/misses не сбрасываются."""
         with self._lock:
             self._data.clear()
+            self._total_bytes = 0
 
     def stats(self) -> dict:
         """Возвращает счётчики для /health endpoint."""
@@ -108,6 +128,8 @@ class ResponseCache:
             return {
                 "size": len(self._data),
                 "max_size": self._max_size,
+                "bytes": self._total_bytes,
+                "max_bytes": self._max_bytes,
                 "ttl_seconds": self._ttl,
                 "hits": self._hits,
                 "misses": self._misses,

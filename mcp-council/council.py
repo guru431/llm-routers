@@ -16,7 +16,7 @@ import string
 import time
 from typing import Any, Awaitable, Callable
 
-from models import COUNCIL_DEFAULT, resolve_members
+from models import CATALOG, COUNCIL_DEFAULT, resolve_members
 from openai_client import CouncilHTTPError, call_openai_compat
 from prompts import (
     STAGE1_ROUND_N_SYSTEM,
@@ -51,6 +51,16 @@ ProgressFn = Callable[[str, dict[str, Any]], None]
 def _noop_progress(event_type: str, payload: dict[str, Any]) -> None:  # noqa: ARG001
     """Default progress sink — silently discards events."""
     return None
+
+
+def _loop_usage(result: dict) -> dict:
+    """Extract web_search tool-loop usage aggregates from a call result.
+
+    run_with_tool_loop attaches loop_* keys summing tokens/calls/attempts across
+    every loop iteration. Non-web calls don't have them — return {} so the
+    record keeps its single-call tokens_in/out/attempts (backward compatible)."""
+    keys = ("loop_calls", "loop_tokens_in", "loop_tokens_out", "loop_attempts")
+    return {k: result[k] for k in keys if k in result}
 
 
 async def _run_member_stage1(
@@ -136,6 +146,7 @@ async def _run_member_stage1(
             "tokens_out": result.get("tokens_out"),
             "attempts": result.get("attempts"),
             "tool_calls_log": tool_log,
+            **_loop_usage(result),
         }
 
     return {
@@ -149,6 +160,7 @@ async def _run_member_stage1(
         "tokens_out": result["tokens_out"],
         "attempts": result.get("attempts"),
         "tool_calls_log": tool_log,
+        **_loop_usage(result),
     }
 
 
@@ -571,19 +583,53 @@ def _compute_usage(
     `retries` is the number of HTTP retries on the SUCCESS path; calls that
     exhausted their retries and failed appear in summary.failed_models instead.
     `web_search_cache_hits` = duplicate queries served from the per-run cache.
-    `estimated_cost_usd` is None until per-model pricing is added to CATALOG.
+    `estimated_cost_usd` = Σ tokens × per-model price (models.CATALOG price_in/
+    price_out, USD per 1M). None only if NO record had a priced model (all
+    members on flat-rate subscriptions with no per-token price).
+
+    For web_search members the per-turn result only carries its last turn's
+    tokens; the loop_* aggregates (summed across every tool-loop iteration) are
+    used instead when present, so multi-turn members aren't undercounted.
     """
     calls = tin = tout = retries = web = 0
+    cost = 0.0
+    any_priced = False
+
+    def _model_id(rec: dict) -> str | None:
+        return rec.get("id") or rec.get("ranker_id") or rec.get("chairman_id")
 
     def _acc(rec: dict) -> None:
-        nonlocal calls, tin, tout, retries, web
-        attempts = rec.get("attempts")
-        if attempts is not None:
-            calls += 1
-            retries += max(0, attempts - 1)
-        tin += rec.get("tokens_in") or 0
-        tout += rec.get("tokens_out") or 0
+        nonlocal calls, tin, tout, retries, web, cost, any_priced
+        # Prefer the tool-loop aggregates for web_search members (calls/tokens/
+        # attempts summed across every iteration); fall back to the single-call
+        # figures for plain (non-web) members.
+        if "loop_calls" in rec:
+            rec_calls = rec.get("loop_calls") or 0
+            rec_in = rec.get("loop_tokens_in") or 0
+            rec_out = rec.get("loop_tokens_out") or 0
+            rec_attempts = rec.get("loop_attempts") or 0
+            calls += rec_calls
+            retries += max(0, rec_attempts - rec_calls)
+        else:
+            rec_in = rec.get("tokens_in") or 0
+            rec_out = rec.get("tokens_out") or 0
+            attempts = rec.get("attempts")
+            if attempts is not None:
+                calls += 1
+                retries += max(0, attempts - 1)
+        tin += rec_in
+        tout += rec_out
         web += len(rec.get("tool_calls_log") or [])
+
+        cfg = CATALOG.get(_model_id(rec) or "")
+        if cfg:
+            pin, pout = cfg.get("price_in"), cfg.get("price_out")
+            if pin is not None:
+                cost += rec_in * pin / 1_000_000
+                any_priced = True
+            if pout is not None:
+                cost += rec_out * pout / 1_000_000
+                any_priced = True
 
     for rd in rounds_detail:
         for s in rd["stage1"]:
@@ -600,7 +646,7 @@ def _compute_usage(
         "web_search_calls": web,
         "web_search_cache_hits": search_cache.hits if search_cache is not None else 0,
         "retries": retries,
-        "estimated_cost_usd": None,
+        "estimated_cost_usd": round(cost, 6) if any_priced else None,
     }
 
 
@@ -750,9 +796,16 @@ async def run_council(
     rounds: int = 1,
     web_search: bool = False,
     on_progress: ProgressFn | None = None,
+    context_in_stage2: bool = True,
 ) -> dict:
     """End-to-end orchestration of stages 1+2 across N rounds, optionally
     stage 3 synthesis at the end.
+
+    `context_in_stage2=False`: drop the (potentially up-to-500KB) context files
+    from stage 2 ranking and stage 3 synthesis prompts — stage 1 still gets the
+    full context, but rankers compare answers off the question + answers alone.
+    With large context_paths this avoids re-sending ~125k tokens × 7 rankers per
+    round. Default True preserves the original behaviour.
 
     `rounds=1` (default): standard Karpathy stage1 → stage2 → optional stage3.
     `rounds=2+`: after each round, surviving members get another stage 1 with
@@ -782,6 +835,9 @@ async def run_council(
     call_fn = call_fn or call_openai_compat
     progress = on_progress or _noop_progress
     members_by_id = {m["id"]: m for m in members}
+    # Stage 2 (ranking) and stage 3 (synthesis) optionally skip the context
+    # files; stage 1 always gets them. See context_in_stage2 in the docstring.
+    stage2_files = files_section if context_in_stage2 else None
 
     notes: list[str] = []
     rounds_detail: list[dict] = []
@@ -818,7 +874,7 @@ async def run_council(
             )
 
     stage2, stage2_notes = await _run_stage2_for_round(
-        ok_stage1, members_by_id, question, files_section,
+        ok_stage1, members_by_id, question, stage2_files,
         max_response_tokens, call_fn, progress,
     )
     notes.extend(stage2_notes)
@@ -869,7 +925,7 @@ async def run_council(
             break
 
         stage2, stage2_notes = await _run_stage2_for_round(
-            ok_stage1, members_by_id, question, files_section,
+            ok_stage1, members_by_id, question, stage2_files,
             max_response_tokens, call_fn, progress,
         )
         notes.extend(stage2_notes)
@@ -892,7 +948,7 @@ async def run_council(
                 stage1=stage1,
                 aggregate=aggregate,
                 stage2=stage2,
-                files_section=files_section,
+                files_section=stage2_files,
                 max_response_tokens=max_response_tokens,
                 call_fn=call_fn,
             )

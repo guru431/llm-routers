@@ -28,8 +28,10 @@ BLOCK_NAME_PREFIXES = (".env.", ".credentials")
 BLOCK_NAME_SUFFIXES = (
     ".pem", ".key", ".p12", ".pfx", ".crt", ".cer",
     ".kdbx", ".keystore", ".jks", ".ppk",
+    # Any *.env (vault.env, prod.env, …), not just the literal ".env" name.
+    ".env",
 )
-BLOCK_DIR_SEGMENTS = ("/.ssh/", "/.aws/", "/.gcp/")
+BLOCK_DIR_SEGMENTS = ("/.ssh/", "/.aws/", "/.gcp/", "/secrets/")
 BLOCK_NAMES_IN_CLAUDE_DIR = frozenset({"settings.json", "settings.local.json"})
 
 
@@ -174,9 +176,16 @@ _BINARY_SNIFF_BYTES = 8192
 def _looks_binary(p: Path) -> bool:
     """Heuristic: file is binary if its first 8KB contain a NUL byte. Same
     rule git uses (`git diff` falls back to "binary patch" on a NUL hit).
-    Cheap, avoids feeding garbage to the LLM."""
+    Cheap, avoids feeding garbage to the LLM.
+
+    Exception: UTF-16 text (PowerShell 5.1's default Out-File encoding) is
+    full of NUL bytes but legitimate text. A leading UTF-16 BOM (FF FE LE /
+    FE FF BE) marks the file as text — `read_text(errors="replace")` decodes
+    it fine, so don't reject it as binary."""
     with p.open("rb") as fh:
         chunk = fh.read(_BINARY_SNIFF_BYTES)
+    if chunk[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return False
     return b"\x00" in chunk
 
 

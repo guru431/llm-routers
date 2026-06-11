@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from dialogue.engine import _run_turn, write_dump
+import asyncio
+
+from dialogue.engine import _run_turn, write_dump, check_round_failures, maybe_dump
 from dialogue.prompts import (
     render_socratic_questioner_prompt,
     render_socratic_respondent_prompt,
@@ -49,6 +51,7 @@ async def run_socratic(
     max_tokens: int,
     web_search: bool,
     files_section: str | None,
+    resume: bool = False,
 ) -> None:
     mark_phase(state, "starting")
     # Carry transport fields so engine helpers can reconstruct calls if needed.
@@ -59,13 +62,15 @@ async def run_socratic(
                 base[k] = cfg[k]
         return base
 
-    state.participants = [
-        _project(questioner_cfg, "questioner"),
-        _project(respondent_cfg, "respondent"),
-    ]
-    state.moderator = (
-        {"id": moderator_cfg["id"], "model": moderator_cfg["model"]} if moderator_cfg else None
-    )
+    # resume=True (dialogue_continue): participants/moderator already on state.
+    if not resume:
+        state.participants = [
+            _project(questioner_cfg, "questioner"),
+            _project(respondent_cfg, "respondent"),
+        ]
+        state.moderator = (
+            {"id": moderator_cfg["id"], "model": moderator_cfg["model"]} if moderator_cfg else None
+        )
 
     start = state.current_round + 1
     for round_n in range(start, rounds + 1):
@@ -112,6 +117,12 @@ async def run_socratic(
             })
 
         state.current_round = round_n
+        # Abort if a participant (questioner/respondent) failed this round — a
+        # dead questioner otherwise has the respondent "answering" [error:...]
+        # for every remaining round. Moderator-note failures don't count.
+        check_round_failures(state, round_n)
+        # Mid-run persistence — snapshot after each completed round.
+        await maybe_dump(state, DUMP_DIR)
 
     # --- final summary (only if moderator present) ---
     if moderator_cfg:
@@ -132,4 +143,4 @@ async def run_socratic(
     from dialogue.render import format_dialogue_markdown
     state.result_markdown = format_dialogue_markdown(state, topic)
     mark_phase(state, "done")
-    state.dump_path = str(write_dump(state, base_dir=DUMP_DIR))
+    state.dump_path = str(await asyncio.to_thread(write_dump, state, base_dir=DUMP_DIR))

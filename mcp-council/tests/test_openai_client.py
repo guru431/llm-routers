@@ -4,6 +4,7 @@ import httpx
 import pytest
 
 import circuit_breaker
+import openai_client
 from openai_client import CouncilHTTPError, _strip_think, call_openai_compat
 
 
@@ -14,6 +15,16 @@ def _reset_breaker():
     circuit_breaker.reset()
     yield
     circuit_breaker.reset()
+
+
+@pytest.fixture(autouse=True)
+def _reset_module_client():
+    # call_openai_compat now reuses a module-level AsyncClient. Tests patch
+    # httpx.AsyncClient per-test via `patch_httpx`; reset the cache so each test
+    # gets its own fake instead of the first test's cached one.
+    openai_client._CLIENT = None
+    yield
+    openai_client._CLIENT = None
 
 
 def _make_response(status_code: int, json_data: dict | None = None, text: str | None = None):
@@ -36,7 +47,7 @@ class _FakeClient:
     async def __aexit__(self, *args):
         return False
 
-    async def post(self, url, headers=None, json=None):
+    async def post(self, url, headers=None, json=None, timeout=None):
         self.calls.append({"url": url, "headers": headers, "json": json})
         if not self._responses:
             raise RuntimeError("no more fake responses")

@@ -387,6 +387,11 @@ def main():
     models = models_data["models"]
     tasks = tasks_data["tasks"]
 
+    # Honour tasks.json `_meta.max_output_tokens` as the per-request token budget.
+    # `_meta` is not a task (the loop below already iterates `tasks` only).
+    global MAX_TOKENS
+    MAX_TOKENS = tasks_data.get("_meta", {}).get("max_output_tokens", MAX_TOKENS)
+
     # Endpoint overrides for self-hosted providers (kept out of the committed
     # models.json, which ships localhost defaults). Set OLLAMA_BASE_URL /
     # CLAUDE_AGENT_BASE_URL in the environment or in secrets/vault.env to point
@@ -400,6 +405,11 @@ def main():
         if ovr:
             m["endpoint"] = ovr
 
+    # Drop skip_reason'd models BEFORE smoke dedup, otherwise smoke can pick a
+    # broken model as the provider representative and the whole provider is skipped.
+    if not args.include_broken and not args.model:
+        models = [m for m in models if not m.get("skip_reason")]
+
     if args.smoke:
         seen = set()
         smoke_models = []
@@ -412,8 +422,6 @@ def main():
         tasks = [t for t in tasks if t["id"] == "T1_ru_edit_short"]
         sys.stderr.write(f"SMOKE: {len(models)} models x {len(tasks)} task\n")
 
-    if not args.include_broken and not args.model:
-        models = [m for m in models if not m.get("skip_reason")]
     if args.providers:
         keep = set(args.providers.split(","))
         models = [m for m in models if m["provider"] in keep]
@@ -430,7 +438,11 @@ def main():
         if args.skip_existing and out_file.exists():
             for line in out_file.read_text(encoding="utf-8", errors="replace").splitlines():
                 try:
-                    existing.add(json.loads(line)["task_id"])
+                    r = json.loads(line)
+                    # Only successful cells count as "existing" — error cells are
+                    # always re-run so --skip-existing backfills failed holes.
+                    if not r.get("error"):
+                        existing.add(r["task_id"])
                 except Exception:
                     pass
         # Open the per-model jsonl once for the whole task loop. Reduces I/O

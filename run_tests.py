@@ -2,10 +2,11 @@
 """Canonical all-tests runner for llm_routers.
 
 Each subproject is an independent package with colliding top-level module names
-(three different `server.py`, a `cache.py`, three `test_server.py`), so they
-CANNOT share one pytest process — `import server` would resolve to whichever
-copy lands in sys.modules first. We run each pytest suite in its own
-interpreter instead, mirroring the standalone invocation that already works.
+(three different `server.py`, a `cache.py`, two `test_server.py` — the codex
+agent-server suite was renamed to integration_suite.py), so they CANNOT share
+one pytest process — `import server` would resolve to whichever copy lands in
+sys.modules first. We run each pytest suite in its own interpreter instead,
+mirroring the standalone invocation that already works.
 
 Profiles:
     --quick        (default) pytest suites only, no live servers
@@ -42,7 +43,10 @@ def run_pytest(extra: list[str]) -> list[str]:
     failed: list[str] = []
     for suite in SUITES:
         print(f"\n=== pytest: {suite} ===", flush=True)
-        if _run([sys.executable, "-m", "pytest", "-q", *extra], ROOT / suite) != 0:
+        rc = _run([sys.executable, "-m", "pytest", "-q", *extra], ROOT / suite)
+        # rc 5 == "no tests collected" (e.g. a -k filter matched only one suite).
+        # Treat it as a skip, not a failure.
+        if rc not in (0, 5):
             failed.append(f"pytest:{suite}")
     return failed
 

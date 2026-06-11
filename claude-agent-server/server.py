@@ -16,6 +16,8 @@ Env:
     CLAUDE_AGENT_CACHE      — '1'/'0' включить response cache (default: '1')
     CLAUDE_AGENT_CACHE_SIZE — макс. записей в кэше (default: 256, LRU eviction)
     CLAUDE_AGENT_CACHE_TTL  — TTL записи в секундах (default: 3600 = 1h)
+    CLAUDE_AGENT_CACHE_BYTES — макс. суммарный размер значений кэша в байтах
+                              (default: 67108864 = 64 MB; LRU eviction)
     CLAUDE_AGENT_MAX_BODY   — макс. размер тела запроса в байтах (default: 10 MB; >лимит → 413)
     CLAUDE_AGENT_MAX_CONCURRENCY — макс. параллельных claude-вызовов (default: 4; сверх → 429)
 
@@ -32,6 +34,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -98,8 +101,13 @@ try:
     _CACHE_TTL = max(1.0, float(os.getenv("CLAUDE_AGENT_CACHE_TTL", "3600")))
 except ValueError:
     _CACHE_TTL = 3600.0
+try:
+    _CACHE_BYTES = max(1024, int(os.getenv("CLAUDE_AGENT_CACHE_BYTES", str(64 * 1024 * 1024))))
+except ValueError:
+    _CACHE_BYTES = 64 * 1024 * 1024
 
-CACHE = ResponseCache(max_size=_CACHE_SIZE, ttl_seconds=_CACHE_TTL) if CACHE_ENABLED else None
+CACHE = ResponseCache(max_size=_CACHE_SIZE, ttl_seconds=_CACHE_TTL,
+                      max_bytes=_CACHE_BYTES) if CACHE_ENABLED else None
 
 # Mandatory bearer auth. Server refuses to start without it; required on every
 # endpoint except /health.
@@ -215,30 +223,62 @@ def run_claude(prompt: str, system_prompt: str | None = None,
     # что это headless-вызов сервера: тяжёлая инъекция wiki-контекста (~162K токенов,
     # ~$3/вызов, упор в лимит Max → "claude exit code 1") должна быть пропущена.
     child_env = {**os.environ, "CLAUDE_AGENT_SERVER": "1"}
-    result = subprocess.run(
-        cmd,
-        input=prompt,
-        capture_output=True,
+    # The bearer token authenticates clients TO this server; the child claude CLI
+    # has no use for it. Strip it from the child env so it isn't leaked into
+    # subprocess inspection / crash dumps / further-spawned tools.
+    child_env.pop("CLAUDE_AGENT_TOKEN", None)
+
+    # Start in its own process group/session so a timeout can kill the WHOLE
+    # tree, not just the launcher. On Windows CLAUDE_BIN is a `claude.CMD` shim
+    # that spawns node.exe; killing only the shim orphans node.exe (it keeps
+    # running and burns the Max quota). CREATE_NEW_PROCESS_GROUP lets taskkill
+    # /T walk the tree; start_new_session does the same via a POSIX process group.
+    popen_kwargs = dict(
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
-        timeout=timeout,
-        creationflags=CREATE_NO_WINDOW,
         env=child_env,
     )
-    if result.returncode != 0:
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+    try:
+        stdout, stderr = proc.communicate(input=prompt, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Kill the whole tree, then reap so we don't leave a zombie/orphan.
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                creationflags=CREATE_NO_WINDOW,
+            )
+        else:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+        proc.communicate()
+        raise
+
+    if proc.returncode != 0:
         raise RuntimeError(
-            result.stderr.strip()
-            or result.stdout.strip()[:800]
-            or f"claude exit code {result.returncode}"
+            (stderr or "").strip()
+            or (stdout or "").strip()[:800]
+            or f"claude exit code {proc.returncode}"
         )
     # Parse JSON output to extract result
     try:
-        data = json.loads(result.stdout.strip())
+        data = json.loads((stdout or "").strip())
         if data.get("is_error"):
             raise RuntimeError(data.get("result", "Unknown error"))
         return data.get("result", "").strip()
     except json.JSONDecodeError:
-        return result.stdout.strip()
+        return (stdout or "").strip()
 
 
 def extract_content(content) -> str:
@@ -268,6 +308,18 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         logger.info("%s %s", self.address_string(), format % args)
 
+    def _authed(self) -> bool:
+        """Side-effect-free auth check (no 401 sent). True if no token is
+        configured, or a valid bearer was presented. Used by /health to decide
+        how much config to disclose."""
+        if not AUTH_TOKEN:
+            return True
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Bearer "):
+            return False
+        presented = header[len("Bearer "):].strip()
+        return hmac.compare_digest(presented.encode("utf-8"), AUTH_TOKEN.encode("utf-8"))
+
     def _check_auth(self) -> bool:
         """Enforce bearer-auth if CLAUDE_AGENT_TOKEN is configured.
         Returns False after sending 401; caller must abort."""
@@ -285,6 +337,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
+            # Liveness probe must work without a token (200 + minimal body).
+            # Config details (model/uptime/security/cache) are only disclosed to
+            # an authenticated caller, so an anonymous probe can't fingerprint
+            # the deployment.
+            if not self._authed():
+                self._send(200, {"status": "ok"})
+                return
             payload = {
                 "status": "ok",
                 "model": MODEL,
@@ -350,6 +409,7 @@ class Handler(BaseHTTPRequestHandler):
             timeout = 300
         timeout = max(10, min(timeout, 600))
         tools = body.get("tools")
+        stream = bool(body.get("stream"))
 
         # Separate system prompt from conversation
         system_parts = []
@@ -442,15 +502,28 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 resp_message["content"] = content
 
+            resp_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+            created = int(time.time())
+            resp_model = model or MODEL
+            finish_reason = "tool_calls" if tool_calls else "stop"
+
+            if stream:
+                # The CLI gives us the full answer at once, so we can't truly
+                # stream. We DO buffer the whole result, then emit it as SSE
+                # chunks so OpenAI-streaming clients (Open WebUI) don't break on
+                # a single JSON blob. Same id/created/model as the non-stream body.
+                self._send_stream(resp_id, created, resp_model, resp_message, finish_reason)
+                return
+
             self._send(200, {
-                "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                "id": resp_id,
                 "object": "chat.completion",
-                "created": int(time.time()),
-                "model": model or MODEL,
+                "created": created,
+                "model": resp_model,
                 "choices": [{
                     "index": 0,
                     "message": resp_message,
-                    "finish_reason": "tool_calls" if tool_calls else "stop",
+                    "finish_reason": finish_reason,
                 }],
                 # Rough estimate (chars/4). Accurate only for ASCII English;
                 # for ru/CJK 1 char ≈ 2-3 tokens, so these undercount badly.
@@ -497,6 +570,46 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_stream(self, resp_id: str, created: int, model: str,
+                     resp_message: dict, finish_reason: str):
+        """Emit the (already-complete) response as OpenAI SSE chunks.
+
+        The claude CLI returns the whole answer at once, so this is pseudo-stream:
+        a role chunk, one content chunk (if any text), an optional tool_calls
+        chunk, the finish chunk, then `[DONE]`. Each line is `data: {json}\\n\\n`,
+        object="chat.completion.chunk", sharing the non-stream id/created/model.
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        def emit(delta: dict, finish=None):
+            chunk = {
+                "id": resp_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            }
+            line = "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
+            self.wfile.write(line.encode("utf-8"))
+
+        # 1) role
+        emit({"role": "assistant"})
+        # 2) content (if any text was produced)
+        content = resp_message.get("content")
+        if content:
+            emit({"content": content})
+        # 3) tool_calls (if present) — surfaced in their own delta
+        tool_calls = resp_message.get("tool_calls")
+        if tool_calls:
+            emit({"tool_calls": tool_calls})
+        # 4) finish + 5) [DONE]
+        emit({}, finish=finish_reason)
+        self.wfile.write(b"data: [DONE]\n\n")
+
 
 class SingleInstanceServer(ThreadingHTTPServer):
     # HTTPServer sets allow_reuse_address=1 (SO_REUSEADDR). On Windows that lets
@@ -529,6 +642,18 @@ def main():
             "bearer auth. Set it via [Environment]::SetEnvironmentVariable(\"CLAUDE_AGENT_TOKEN\", "
             "\"<token>\", \"Machine\") (Windows) or export CLAUDE_AGENT_TOKEN=<token> (POSIX) "
             "and restart."
+        )
+        sys.exit(2)
+
+    # Fail fast on a bad default model. run_claude() whitelists `m` and raises
+    # ValueError on a non-whitelisted model → without this every request that
+    # omits `model` would 500. Better to refuse to start with a clear message.
+    if MODEL not in MODELS:
+        logger.error(
+            "CLAUDE_AGENT_MODEL=%r is not in the supported list %s — server refuses "
+            "to start (every request without an explicit `model` would fail). Set "
+            "CLAUDE_AGENT_MODEL to a supported id and restart.",
+            MODEL, MODELS,
         )
         sys.exit(2)
 

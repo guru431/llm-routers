@@ -1,7 +1,7 @@
 [project]
 name = "mcp-council"
 version = "0.1.0"
-description = "MCP server: Karpathy 3-stage council of 6 LLMs (GLM/Kimi/DeepSeek/Qwen/MiniMax/Gemini). Returns materials for synthesis by main agent."
+description = "MCP server: Karpathy 3-stage council of 7 LLMs (GLM/Kimi/DeepSeek/Qwen/MiniMax/Gemini/Codex). Returns materials for synthesis by main agent."
 requires-python = ">=3.10"
 dependencies = [
     "mcp[cli]>=1.0",

@@ -51,6 +51,20 @@ async def _run_turn(
     try:
         text = await _call_model(cfg, prompt, max_tokens, web_search)
         latency_ms = int((time.monotonic() - start) * 1000)
+        # An empty/whitespace-only completion is a failure, not a turn. Thinking
+        # models that burn the whole max_tokens budget on reasoning routinely
+        # return empty content; counting that as status="ok" would let opponents
+        # "critique" a blank entry round after round and keep the failure
+        # threshold from ever tripping.
+        if not text.strip():
+            return TurnResult(
+                id=cfg["id"],
+                model=cfg["model"],
+                status="error",
+                text="",
+                error="empty_response",
+                latency_ms=latency_ms,
+            )
         return TurnResult(
             id=cfg["id"],
             model=cfg["model"],
@@ -222,11 +236,48 @@ def _count_failures_in_round(state: DialogueState, round_n: int) -> int:
     critique and response, but they're the same participant from a 'is the run
     still viable' perspective.
     """
+    participant_ids = {p["id"] for p in state.participants}
     failed_ids = {
         h["id"] for h in state.history
         if h["round"] == round_n and h.get("status") == "error"
+        and h["id"] in participant_ids
     }
     return len(failed_ids)
+
+
+def compute_failure_threshold(n_participants: int) -> int:
+    """Distinct-participant failure count that aborts a round.
+
+    The floor of 2 only applies once there are >=4 participants. For tiny
+    dialogues (a 1-on-1 debate or socratic pair) a single permanently-failing
+    participant is 50% of the room — aborting only when *both* die would let a
+    debate run all rounds against a dead opponent. So the floor drops to 1 there.
+    """
+    floor = 2 if n_participants >= 4 else 1
+    return max(floor, int((n_participants * FAILURE_THRESHOLD_RATIO) + 0.99))
+
+
+def check_round_failures(state: DialogueState, round_n: int) -> None:
+    """Raise RuntimeError (and mark phase=error) if too many participants failed
+    in round_n. Shared by run_dialogue (debate) and the panel/socratic loops so
+    the abort guard applies to every mode, not just debate."""
+    n_participants = len(state.participants)
+    failures = _count_failures_in_round(state, round_n)
+    if failures >= compute_failure_threshold(n_participants):
+        state.error = (
+            f"failure threshold exceeded in round {round_n}: "
+            f"{failures}/{n_participants} participants failed"
+        )
+        mark_phase(state, "error")
+        raise RuntimeError(state.error)
+
+
+async def maybe_dump(state: DialogueState, dump_dir: "Path | None") -> None:
+    """Persist a mid-run snapshot off the event loop. No-op when dump_dir is
+    None. write_dump does blocking file IO (+ short sleeps on Windows lock
+    contention), so it must not run inline on the loop."""
+    if dump_dir is not None:
+        await asyncio.to_thread(write_dump, state, base_dir=dump_dir)
 
 
 PerRoundHook = Callable[[DialogueState, int], Awaitable[None]]
@@ -243,6 +294,7 @@ async def run_dialogue(
     do_critique: bool,
     per_round_hook: PerRoundHook | None,
     start_round: int = 1,
+    dump_dir: "Path | None" = None,
 ) -> None:
     """Run rounds [start_round .. state.total_rounds] inclusive.
 
@@ -258,9 +310,6 @@ async def run_dialogue(
     start_round > 1 supports dialogue_continue: caller bumps total_rounds and
     calls run_dialogue again with start_round=state.current_round+1.
     """
-    n_participants = len(state.participants)
-    threshold = max(2, int((n_participants * FAILURE_THRESHOLD_RATIO) + 0.99))
-
     for round_n in range(start_round, state.total_rounds + 1):
         await run_round(
             state=state,
@@ -274,17 +323,15 @@ async def run_dialogue(
             do_critique=do_critique,
         )
 
-        failures = _count_failures_in_round(state, round_n)
-        if failures >= threshold:
-            state.error = (
-                f"failure threshold exceeded in round {round_n}: "
-                f"{failures}/{n_participants} participants failed"
-            )
-            mark_phase(state, "error")
-            raise RuntimeError(state.error)
+        check_round_failures(state, round_n)
 
         if per_round_hook is not None:
             await per_round_hook(state, round_n)
+
+        # Mid-run persistence: snapshot after each completed round so a server
+        # restart surfaces the session as 'interrupted' with partial history
+        # instead of losing 5-50 minutes of paid work silently.
+        await maybe_dump(state, dump_dir)
 
 
 def write_dump(state: DialogueState, *, base_dir: Path) -> Path:
@@ -298,6 +345,8 @@ def write_dump(state: DialogueState, *, base_dir: Path) -> Path:
         "session_id": state.session_id,
         "mode": state.mode,
         "question_preview": state.question_preview,
+        # Full fields needed to resume an interrupted session via dialogue_continue.
+        "question": state.question,
         "total_rounds": state.total_rounds,
         "current_round": state.current_round,
         "phase": state.phase,
@@ -310,6 +359,14 @@ def write_dump(state: DialogueState, *, base_dir: Path) -> Path:
         "started_at": state.started_at,
         "finished_at": state.finished_at,
         "error": state.error,
+        "result_markdown": state.result_markdown,
+        "dump_path": state.dump_path,
+        "web_search": state.web_search,
+        "max_tokens": state.max_tokens,
+        "context_paths": state.context_paths,
+        "diversity_monitor": state.diversity_monitor,
+        "diversity_threshold": state.diversity_threshold,
+        "devils_advocate_rotation": state.devils_advocate_rotation,
     }
     tmp = dump_path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

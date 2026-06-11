@@ -68,6 +68,28 @@ python server.py --host 0.0.0.0     # открыть на LAN (токен обя
 
 `tools` всегда форсят `read-only`: клиентские OpenAI-функции несовместимы с агентным режимом, где Codex дёргает собственные инструменты.
 
+### Токены: read-only vs workspace-write
+
+Два **раздельных** токена с разными правами:
+
+| Токен | Что открывает | Обязателен |
+|---|---|---|
+| `CODEX_AGENT_TOKEN` | read-only (чат, tools-эмуляция) | да — без него сервер не стартует (exit 2) |
+| `CODEX_AGENT_AGENT_TOKEN` | дополнительно workspace-write (запись файлов / shell) | нет — если не задан, workspace-write недоступен (403) |
+
+workspace-write-запрос должен предъявить bearer, совпадающий **и** с валидным read-токеном (проходит общий `Authorization`-чек), **и** с `CODEX_AGENT_AGENT_TOKEN` (timing-safe сравнение). Смысл разделения: утечка read-only копии токена (она размазана по конфигам council/CCR/code-review) **не** даёт агентного доступа на запись. Для этого значения токенов должны **отличаться**.
+
+Если `CODEX_AGENT_AGENT_TOKEN` не задан — любой workspace-write-запрос (`*-agent` модель или `sandbox: "workspace-write"`) получает `403 workspace-write requires CODEX_AGENT_AGENT_TOKEN`, а read-only продолжает работать по старому токену (backward-compatible).
+
+### Область доступа по режимам
+
+| Режим | Запись | Чтение хоста |
+|---|---|---|
+| read-only | нет | **полная** (codex read-only = `full host read access`) |
+| workspace-write | только внутри `writable_roots=[workdir]` (enforce'ит codex) | полная |
+
+`CODEX_AGENT_READ_ROOT` (default = `CODEX_AGENT_WORKDIR_ROOT`) задаёт **cwd** для read-only codex (`-C`). Это **не** песочница чтения — codex в read-only имеет полный read-доступ к хосту независимо от cwd; `-C` лишь фиксирует, куда резолвятся относительные пути (скромный defense-in-depth). Если `CODEX_AGENT_READ_ROOT` не задан — codex стартует в cwd сервера, и на старте пишется warning «read-only codex has full host read access». Сервер слушает на LAN только при явном `--host 0.0.0.0` — учитывайте это.
+
 ## Endpoints
 
 ### `POST /v1/chat/completions` — OpenAI-compatible
@@ -104,9 +126,10 @@ curl http://localhost:8766/health
 ## Агентный режим (workspace-write)
 
 ```bash
-# Codex создаст/изменит файлы в CODEX_AGENT_WORKDIR
+# Codex создаст/изменит файлы в CODEX_AGENT_WORKDIR.
+# Bearer ДОЛЖЕН быть равен CODEX_AGENT_AGENT_TOKEN (не read-only токену).
 curl -X POST http://localhost:8766/v1/chat/completions \
-  -H "Authorization: Bearer $CODEX_AGENT_TOKEN" \
+  -H "Authorization: Bearer $CODEX_AGENT_AGENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-5.5-agent",
@@ -115,7 +138,7 @@ curl -X POST http://localhost:8766/v1/chat/completions \
   }'
 ```
 
-`workdir` обязан лежать внутри `CODEX_AGENT_WORKDIR_ROOT` (дефолт = `CODEX_AGENT_WORKDIR`), иначе `400`. Если `workdir` не передан — берётся `CODEX_AGENT_WORKDIR`.
+workspace-write требует заданного `CODEX_AGENT_AGENT_TOKEN` (иначе `403`) — см. [Токены](#токены-read-only-vs-workspace-write). `workdir` обязан лежать внутри `CODEX_AGENT_WORKDIR_ROOT` (дефолт = `CODEX_AGENT_WORKDIR`), иначе `400`. Путь с cmd-метасимволами (`& | ^ < > ( ) " %`) отвергается `400` (BatBadBut: codex резолвится в `.cmd`-шим). Если `workdir` не передан — берётся `CODEX_AGENT_WORKDIR`.
 
 ## Конфигурация (env)
 
@@ -126,9 +149,11 @@ curl -X POST http://localhost:8766/v1/chat/completions \
 | `CODEX_AGENT_DEFAULT_SANDBOX` | `read-only` | дефолт режима |
 | `CODEX_AGENT_PORT` | `8766` | порт |
 | `CODEX_AGENT_HOST` | `127.0.0.1` | bind-адрес |
-| `CODEX_AGENT_TOKEN` | _(обязателен)_ | bearer-токен; без него exit 2 |
+| `CODEX_AGENT_TOKEN` | _(обязателен)_ | bearer-токен read-only; без него exit 2 |
+| `CODEX_AGENT_AGENT_TOKEN` | _(не задан)_ | отдельный bearer для workspace-write; если не задан — агентный режим `403` |
 | `CODEX_AGENT_WORKDIR` | _(для агентного)_ | корень работы агента |
 | `CODEX_AGENT_WORKDIR_ROOT` | = `WORKDIR` | разрешённый корень для override |
+| `CODEX_AGENT_READ_ROOT` | = `WORKDIR_ROOT` | cwd для read-only codex (не песочница чтения); не задан → warning |
 | `CODEX_AGENT_REASONING` | `medium` | `model_reasoning_effort` |
 | `CODEX_AGENT_MAX_BODY` | `10485760` (10 MB) | макс. размер тела запроса; больше → `413` |
 | `CODEX_AGENT_MAX_CONCURRENCY` | `4` | макс. параллельных codex-вызовов; сверх → `429` |
@@ -159,7 +184,10 @@ print(resp.choices[0].message.content)
 
 - Bind по умолчанию `127.0.0.1`. Для LAN (`--host 0.0.0.0`) — bearer-токен обязателен (и так требуется).
 - `CODEX_AGENT_TOKEN` **обязателен** — без него сервер не стартует (exit 2). Все endpoint кроме `/health` требуют `Authorization: Bearer`.
-- **Агентный режим = HTTP-запрос может писать файлы и запускать shell.** Защита: обязательный токен, containment-проверка `workdir` внутри `CODEX_AGENT_WORKDIR_ROOT`, безопасный дефолт `read-only`.
+- **`/health` без токена отдаёт только `{"status":"ok"}`.** Конфиг (model/default_sandbox/uptime/security) — лишь при валидном read-токене, чтобы endpoint не фингерпринтил сервер.
+- **Раздельные токены для read-only и workspace-write.** read-only — `CODEX_AGENT_TOKEN`; workspace-write дополнительно требует `CODEX_AGENT_AGENT_TOKEN`. Утечка read-only токена не даёт агентного write/exec. Если agent-токен не задан — workspace-write `403`.
+- **Агентный режим = HTTP-запрос может писать файлы и запускать shell.** Защита: отдельный agent-токен, containment-проверка `workdir` внутри `CODEX_AGENT_WORKDIR_ROOT`, отказ от cmd-метасимволов в пути (`& | ^ < > ( ) " %`), безопасный дефолт `read-only`.
+- **read-only codex имеет полный read-доступ к хосту** (`full host read access`). `CODEX_AGENT_READ_ROOT` пиннит лишь cwd — не песочницу чтения. Не задан → warning на старте.
 - **Реальный write-containment делегирован codex**, а не `-C`/realpath-проверке (та лишь выбирает cwd и отсекает запросы вне корня). На каждый агентный вызов сервер пиннит `-c sandbox_workspace_write.writable_roots=[<workdir>]`, чтобы границу записи enforce'ил сам `codex --sandbox workspace-write`, а не дефолтное поведение cwd.
 - Глобальные MCP-серверы Codex отключаются на каждом вызове (`-c mcp_servers={}`), чтобы сервис не триггерил сторонние интеграции.
 

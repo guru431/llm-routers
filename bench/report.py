@@ -24,6 +24,27 @@ RESULTS = ROOT / "results"
 JUDGE_FILE = RESULTS / "_judge.jsonl"
 OUT = ROOT.parent / "LLM_MODELS_BENCH_2026-05-15.md"
 
+# Markers wrapping the hand-written TL;DR. On re-run, if OUT already exists we
+# splice the existing block between these markers back in, so manual edits survive.
+TLDR_BEGIN = "<!-- manual-tldr -->"
+TLDR_END = "<!-- /manual-tldr -->"
+
+
+def _extract_manual_tldr(path: Path) -> list[str] | None:
+    """Return the lines between the TL;DR markers (inclusive) from an existing
+    report, or None if the file/markers are absent."""
+    if not path.exists():
+        return None
+    old = path.read_text(encoding="utf-8").splitlines()
+    try:
+        i = old.index(TLDR_BEGIN)
+        j = old.index(TLDR_END)
+    except ValueError:
+        return None
+    if j < i:
+        return None
+    return old[i:j + 1]
+
 
 def fmt_s(v):
     if v is None:
@@ -155,6 +176,16 @@ def main():
             "total_p90": statistics.quantiles(totals, n=10)[8] if len(totals) >= 5 else None,
             "quality_avg": statistics.mean(scores) if scores else None,
             "quality_n": len(scores),
+            # Coverage-penalized quality: a model that answered 2/8 tasks at Q5
+            # should NOT outrank a stable 8/8 model at Q4.6. Used for ranking;
+            # quality_avg is still shown verbatim (with a '*' when partial).
+            "quality_eff": (
+                statistics.mean(scores) * len(scores) / len(task_ids)
+                if scores and task_ids else None
+            ),
+            # claude-opus-4-8 is also the judge — its own family's scores are
+            # self-assessed and prone to self-preference bias. Flagged with '†'.
+            "self_judged": m["provider"] == "claude_agent",
             "errors": errors,
         })
 
@@ -167,29 +198,45 @@ def main():
     lines.append(f"**Задач:** {len(tasks)} (RU-edit, YT-summary EN/RU, JSON-extract, RU→EN translate, classify, bash one-liner, Python function)")
     lines.append(f"**Judge:** claude-opus-4-8 (через agent server, температура 0)")
     lines.append("")
+    lines.append(
+        "> ⚠️ **Self-judge bias:** judge — claude-opus-4-8, и модели семейства "
+        "`claude_agent` судят сами себя (помечены `†`). Их Q завышены из-за "
+        "self-preference; сравнивать их с другими провайдерами с осторожностью. "
+        "`*` у Q = оценка по неполному покрытию задач (quality_n < задач) — "
+        "ранжирование использует покрытие-взвешенный Q, не сырой средний."
+    )
+    lines.append("")
 
     # === TL;DR ===
     active_with_q = [r for r in rows if not r.get("skip") and r.get("quality_avg") is not None]
     by_quality = sorted(active_with_q, key=lambda r: -r["quality_avg"])
     by_ttft = sorted(active_with_q, key=lambda r: r["ttft_p50"] if r["ttft_p50"] is not None else 9999)
 
+    # === Manual TL;DR ===
+    # Hand-written block, preserved across re-runs via the marker pair below
+    # (see read-old-file logic at the end of main()). The default text is a
+    # SNAPSHOT from 2026-05-15 — numbers may lag the auto-generated tables below.
+    lines.append(TLDR_BEGIN)
     lines.append("## TL;DR")
+    lines.append("")
+    lines.append("_Снимок 2026-05-15 — таблицы ниже могут быть свежее этого ручного блока._")
     lines.append("")
     lines.append("**Победители по use-case:**")
     lines.append("")
     lines.append("- **Голос/чат (минимум TTFT при разумном качестве):** `groq-llama-3.3-70b` (TTFT 1.0s, Total 1.3s, Q4.12), `or-qwen3-235b` (1.5s/3.1s/Q4.62), `or-qwen3-vl-30b` (1.7s/2.6s/Q4.50)")
     lines.append("- **Максимальное качество (Q=5.0):** `claude-opus-4-7`, `ollama-gpt-oss-20b`, `ocg-glm-5/5.1`, `ocg-kimi-k2.5/k2.6`, `ocg-qwen3.5-plus`/`3.6-plus` — но все медленные (TTFT 7-40s)")
-    lines.append("- **Voice_to_Clipboard (текущая прод-цель):** `or-qwen3-235b` лучший общий выбор (TTFT 1.5s/Total 3.1s/Q4.62). Внутри OpenCode Go подписки — `ocg-mimo-v2.5-pro` (3.6s/4.1s/Q4.75) или текущий `ocg-mimo-v2.5` (3.2s/4.0s/Q4.25)")
+    lines.append("- **Локальный desktop-проект (текущая прод-цель):** `or-qwen3-235b` лучший общий выбор (TTFT 1.5s/Total 3.1s/Q4.62). Внутри OpenCode Go подписки — `ocg-mimo-v2.5-pro` (3.6s/4.1s/Q4.75) или текущий `ocg-mimo-v2.5` (3.2s/4.0s/Q4.25)")
     lines.append("- **Ночные cron-скрипты (качество > скорость):** `claude-opus-4-7` через agent server (бесплатно по Max-подписке, Q5.0) или продолжать `ocg-minimax-m2.7` (Q4.5)")
     lines.append("")
     lines.append("**Главные сюрпризы:**")
     lines.append("")
     lines.append("- **Groq Llama-3.3-70B** — самый быстрый ответ в бенче (TTFT 1.0s, Total 1.3s) и стабильно Q4+. Free-tier 60 RPM ограничение")
-    lines.append("- **OpenCode Go mimo-серия (v2-pro/v2.5-pro/v2.5)** — лучший trade-off в OpenCode Go подписке: TTFT 3.2-3.6s, Q4.25-4.75. Превосходит текущий выбор по Voice_to_Clipboard")
+    lines.append("- **OpenCode Go mimo-серия (v2-pro/v2.5-pro/v2.5)** — лучший trade-off в OpenCode Go подписке: TTFT 3.2-3.6s, Q4.25-4.75. Превосходит текущий выбор для локального desktop-проекта")
     lines.append("- **Reasoning-модели (kimi-k2.6, deepseek-v4-flash, glm-5/5.1, ollama qwen3.5:9b)** тратят 30-90% бюджета токенов на thinking → высокая latency, иногда пустой `content` если max_tokens исчерпан")
     lines.append("- **MiniMax direct через OpenAI-compat endpoint не возвращает SSE-стрим** — все 4 модели имеют TTFT=Total. Реальный TTFT неизвестен (нужен их native endpoint)")
     lines.append("- **OpenRouter блокирует** все Google + Anthropic модели с 403 \"violation of provider ToS\" — нужно включить privacy/data opt-in на их dashboard")
     lines.append("- **Hy3-preview и Kimi-k2.5/k2.6 нестабильны** на длинных input/output — 1-3/8 пустых ответов даже при HTTP 200")
+    lines.append(TLDR_END)
     lines.append("")
     lines.append("## Методика")
     lines.append("")
@@ -212,12 +259,18 @@ def main():
     lines.append("|--------|----------|----------|----------|------------|-----------|-----------|---|-----|")
 
     active = [r for r in rows if not r.get("skip")]
+    # Rank by coverage-penalized quality so a model with 2/8 answers can't top
+    # the table on two lucky high scores; tie-break by TTFT.
     active.sort(key=lambda r: (
-        -(r["quality_avg"] or -1),
+        -(r["quality_eff"] if r["quality_eff"] is not None else -1),
         r["ttft_p50"] if r["ttft_p50"] is not None else 9999,
     ))
     for r in active:
         q = f"{r['quality_avg']:.2f}" if r["quality_avg"] is not None else "—"
+        if r["quality_avg"] is not None and r["quality_n"] < r["n"]:
+            q += "*"  # partial coverage
+        if r.get("self_judged"):
+            q += "†"  # self-judged family
         ok_str = f"{r['ok']}/{r['n']}"
         if r.get("empty_text"):
             ok_str += f" (+{r['empty_text']} empty)"
@@ -292,7 +345,10 @@ def main():
     lines.append("")
     if active:
         by_ttft = sorted([r for r in active if r["ttft_p50"] is not None], key=lambda r: r["ttft_p50"])[:5]
-        by_quality = sorted([r for r in active if r["quality_avg"] is not None], key=lambda r: -r["quality_avg"])[:5]
+        by_quality = sorted(
+            [r for r in active if r["quality_eff"] is not None],
+            key=lambda r: -r["quality_eff"],
+        )[:5]
         balanced = sorted(
             [r for r in active if r["quality_avg"] is not None and r["ttft_p50"] is not None],
             key=lambda r: (r["ttft_p50"] / max(0.5, r["quality_avg"])),
@@ -302,9 +358,13 @@ def main():
             q = f"{r['quality_avg']:.2f}" if r["quality_avg"] is not None else "—"
             lines.append(f"- `{r['id']}` — TTFT p50 {r['ttft_p50']:.2f}s, quality {q}")
         lines.append("")
-        lines.append("**Топ-5 по качеству:**")
+        lines.append("**Топ-5 по качеству (покрытие-взвешенному):**")
         for r in by_quality:
-            lines.append(f"- `{r['id']}` — quality {r['quality_avg']:.2f}, TTFT p50 {fmt_s(r['ttft_p50'])}s")
+            mark = ("*" if r["quality_n"] < r["n"] else "") + ("†" if r.get("self_judged") else "")
+            lines.append(
+                f"- `{r['id']}` — quality {r['quality_avg']:.2f}{mark} "
+                f"(eff {r['quality_eff']:.2f}), TTFT p50 {fmt_s(r['ttft_p50'])}s"
+            )
         lines.append("")
         lines.append("**Топ-5 по balance (TTFT/quality):**")
         for r in balanced:
@@ -319,6 +379,17 @@ def main():
         for r in err_rows:
             lines.append(f"- `{r['id']}` ({len(r['errors'])} fail): {'; '.join(r['errors'][:3])}")
         lines.append("")
+
+    # Preserve a hand-edited TL;DR from a previous run: replace the freshly
+    # generated default block with the existing one between the markers.
+    preserved = _extract_manual_tldr(OUT)
+    if preserved is not None:
+        try:
+            i = lines.index(TLDR_BEGIN)
+            j = lines.index(TLDR_END)
+            lines[i:j + 1] = preserved
+        except ValueError:
+            pass
 
     OUT.write_text("\n".join(lines), encoding="utf-8")
     print(f"Report written: {OUT} ({len(lines)} lines, {OUT.stat().st_size} bytes)")

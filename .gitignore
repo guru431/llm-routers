@@ -23,6 +23,10 @@ secrets/
 # Internal design docs (kept local, not published)
 docs/
 
+# Local working notes — may reference internal paths/projects; never publish
+FINDINGS.md
+IDEAS.md
+
 # local-only secret denylist for pre-commit hook (never commit)
 .sanitize-patterns
 

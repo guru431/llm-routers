@@ -35,11 +35,14 @@ def log_call(
     total_latency_ms: int,
     status: str,
     log_dump: str | None,
+    tool: str = "council_ask",
 ) -> None:
     """Append one JSONL summary record to logs/council_YYYY-MM-DD.log.
 
     status = "ok" | "error: <message>".
     log_dump = relative path to the full dump (or None on hard failure before any dump).
+    tool = which MCP tool produced this record ("council_ask" default; callers
+        pass "model_ask" etc. so log analysis can split by tool).
     """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / f"council_{datetime.now().strftime('%Y-%m-%d')}.log"
@@ -47,7 +50,7 @@ def log_call(
     record = {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "call_id": call_id,
-        "tool": "council_ask",
+        "tool": tool,
         "members_total": members_total,
         "members_ok_stage1": members_ok_stage1,
         "members_ok_stage2": members_ok_stage2,

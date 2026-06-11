@@ -9,7 +9,7 @@ HTTP-endpoint. Один API, два мира потребителей:
 Endpoints:
     POST /v1/chat/completions  — OpenAI-compatible (messages + tools + sandbox/workdir)
     GET  /v1/models            — список моделей (base + `-agent` варианты)
-    GET  /health               — healthcheck (security mode, default sandbox)
+    GET  /health               — healthcheck (liveness only; config fields require read-token)
 
 Режим sandbox разрешается по приоритету (первое сработавшее побеждает):
     1. есть `tools` в запросе          → read-only (клиентские tools несовместимы с агентным)
@@ -23,9 +23,11 @@ Env:
     CODEX_AGENT_DEFAULT_SANDBOX— дефолт режима (default: read-only)
     CODEX_AGENT_PORT           — порт (default: 8766)
     CODEX_AGENT_HOST           — bind (default: 127.0.0.1)
-    CODEX_AGENT_TOKEN          — bearer-токен (ОБЯЗАТЕЛЕН — без него сервер не стартует)
+    CODEX_AGENT_TOKEN          — bearer-токен для read-only (ОБЯЗАТЕЛЕН — без него сервер не стартует)
+    CODEX_AGENT_AGENT_TOKEN    — ОТДЕЛЬНЫЙ bearer-токен для workspace-write (если не задан — workspace-write недоступен, 403)
     CODEX_AGENT_WORKDIR        — корень работы агента (обязателен для workspace-write)
     CODEX_AGENT_WORKDIR_ROOT   — разрешённый корень для per-request override (default = WORKDIR)
+    CODEX_AGENT_READ_ROOT      — рабочая директория для read-only codex (default = WORKDIR_ROOT; если не задан — codex видит весь хост)
     CODEX_AGENT_REASONING      — model_reasoning_effort (default: medium)
     CODEX_AGENT_MAX_BODY       — макс. размер тела запроса в байтах (default: 10 MB; >лимит → 413)
     CODEX_AGENT_MAX_CONCURRENCY— макс. параллельных codex-вызовов (default: 4; сверх → 429)
@@ -41,6 +43,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -109,9 +112,26 @@ REASONING = os.getenv("CODEX_AGENT_REASONING", "medium") or None
 WORKDIR = os.getenv("CODEX_AGENT_WORKDIR") or None
 WORKDIR_ROOT = os.getenv("CODEX_AGENT_WORKDIR_ROOT") or WORKDIR
 
-# Mandatory bearer auth. Server refuses to start without it; required on every
-# endpoint except /health.
+# Working root for read-only codex. read-only sandbox still grants the model
+# full host *read* access (codex read-only == full host read access), so `-C`
+# is NOT a read boundary — it only pins the cwd (relative paths resolve here,
+# modest defense-in-depth). Default to WORKDIR_ROOT; when unset, codex sees the
+# whole host (a startup warning is logged).
+READ_ROOT = os.getenv("CODEX_AGENT_READ_ROOT") or WORKDIR_ROOT
+
+# Mandatory bearer auth for read-only. Server refuses to start without it;
+# required on every /v1/* endpoint.
 AUTH_TOKEN = os.getenv("CODEX_AGENT_TOKEN") or None
+
+# Separate bearer for workspace-write (agentic) requests. A leaked read-only
+# token must NOT grant file-write/exec. When unset, workspace-write is refused
+# with 403 while read-only keeps working with AUTH_TOKEN (backward-compatible).
+AGENT_AUTH_TOKEN = os.getenv("CODEX_AGENT_AGENT_TOKEN") or None
+
+# cmd.exe metacharacters: codex resolves to a `.cmd` shim on Windows, so a
+# workdir path containing these would be reinterpreted by cmd.exe (BatBadBut)
+# even though it passed realpath containment. Reject such workdirs early.
+_CMD_METACHARS = set('&|^<>()"%')
 
 # Reject oversized request bodies before reading them into memory (DoS guard).
 try:
@@ -146,7 +166,10 @@ def resolve_model(requested: str | None) -> tuple[str, str | None]:
     name = requested or DEFAULT_MODEL
     suffix_mode = None
     base = name
-    if name.endswith(AGENT_SUFFIX):
+    # Only treat `-agent` as the workspace-write suffix when stripping it leaves
+    # a known base model. Otherwise a base model whose own name happens to end
+    # in `-agent` would be mangled (and fail the whitelist) — keep the full name.
+    if name.endswith(AGENT_SUFFIX) and name[: -len(AGENT_SUFFIX)] in BASE_MODELS:
         base = name[: -len(AGENT_SUFFIX)]
         suffix_mode = "workspace-write"
     if base not in BASE_MODELS:
@@ -206,6 +229,14 @@ def resolve_workdir(req_workdir: str | None) -> str:
         raise BadRequest(f"workdir outside allowed root: {real!r} not under {root!r}")
     if not os.path.isdir(real):
         raise BadRequest(f"workdir is not a directory: {real!r}")
+    # BatBadBut: codex resolves to a `.cmd` shim, so a workdir path that contains
+    # cmd.exe metacharacters would be reinterpreted by the shell even though it
+    # passed realpath containment (a client can mkdir such a dir inside the root).
+    if _CMD_METACHARS & set(real):
+        raise BadRequest(
+            f"workdir contains shell metacharacters: {real!r} "
+            f"(disallowed: {''.join(sorted(_CMD_METACHARS))})"
+        )
     return real
 
 
@@ -285,6 +316,35 @@ def parse_tool_calls(text: str) -> tuple[list[dict], str]:
 # Codex CLI runner
 # ============================================================
 
+def _kill_process_tree(proc: "subprocess.Popen") -> None:
+    """Terminate a codex subprocess and its descendants (the `.cmd` shim spawns
+    a detached `node`). On Windows: `taskkill /T /F`; on POSIX: kill the session
+    process group. Best-effort — never raises."""
+    if proc.poll() is not None:
+        return
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                creationflags=CREATE_NO_WINDOW,
+                timeout=15,
+            )
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
 def run_codex(prompt: str, *, model_base: str, sandbox: str,
               workdir: str | None = None, reasoning: str | None = None,
               timeout: int = 300) -> str:
@@ -314,22 +374,51 @@ def run_codex(prompt: str, *, model_base: str, sandbox: str,
         # choice of cwd — is the security boundary. json.dumps escapes Windows
         # backslashes into valid JSON, which codex parses for the `-c` value.
         cmd += ["-c", f"sandbox_workspace_write.writable_roots={json.dumps([workdir])}"]
+    elif sandbox == "read-only" and READ_ROOT:
+        # read-only codex has full host *read* access (full host read access),
+        # so this `-C` does NOT sandbox reads — it only pins the cwd so relative
+        # paths resolve inside READ_ROOT (modest defense-in-depth). When READ_ROOT
+        # is unset, codex runs in the server's cwd with whole-host read access
+        # (a startup warning is logged in main()).
+        cmd += ["-C", READ_ROOT]
 
     fd, outfile = tempfile.mkstemp(suffix=".txt", prefix="codex-out-")
     os.close(fd)
     cmd += ["-o", outfile]
+
+    # New process group / session so a timeout can kill the whole tree. On
+    # Windows codex spawns a `node` child under the `.cmd` shim; killing only
+    # the shim PID (what subprocess.run did) orphaned that node. CREATE_NEW_PROCESS_GROUP
+    # lets taskkill /T reach the tree; start_new_session on POSIX enables killpg.
+    popen_kwargs = {}
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
+
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            input=prompt,
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
-            timeout=timeout,
-            creationflags=CREATE_NO_WINDOW,
+            **popen_kwargs,
         )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or f"codex exit code {result.returncode}")
+        try:
+            _, stderr = proc.communicate(input=prompt, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Kill the whole tree, not just the shim, then reap so no orphaned
+            # node lingers holding the subscription / outfile open.
+            _kill_process_tree(proc)
+            try:
+                proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            raise
+        if proc.returncode != 0:
+            raise RuntimeError((stderr or "").strip() or f"codex exit code {proc.returncode}")
         with open(outfile, encoding="utf-8") as f:
             return f.read().strip()
     finally:
@@ -345,6 +434,10 @@ def run_codex(prompt: str, *, model_base: str, sandbox: str,
                 break
             except OSError:
                 time.sleep(0.05)
+        else:
+            # Don't swallow a real leak silently — surface the path so the temp
+            # file can be reaped out-of-band.
+            logger.warning("could not delete codex temp output file (leaked): %s", outfile)
 
 
 def extract_content(content) -> str:
@@ -388,8 +481,44 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _has_valid_read_token(self) -> bool:
+        """Non-sending bearer check against the read token. Used by /health to
+        decide whether to expose config, without emitting a 401."""
+        if not AUTH_TOKEN:
+            return False
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Bearer "):
+            return False
+        presented = header[len("Bearer "):].strip()
+        return hmac.compare_digest(presented.encode("utf-8"), AUTH_TOKEN.encode("utf-8"))
+
+    def _check_agent_auth(self) -> bool:
+        """Enforce the workspace-write bearer. The presented token (already a
+        valid read-only token) must ALSO match CODEX_AGENT_AGENT_TOKEN. If that
+        env is unset, workspace-write is disabled entirely. Sends 403 + returns
+        False on failure; caller aborts."""
+        if not AGENT_AUTH_TOKEN:
+            self._send(403, {"error": {
+                "message": "workspace-write requires CODEX_AGENT_AGENT_TOKEN (not configured on this server)",
+                "type": "auth_error"}})
+            return False
+        header = self.headers.get("Authorization", "")
+        presented = header[len("Bearer "):].strip() if header.startswith("Bearer ") else ""
+        if not hmac.compare_digest(presented.encode("utf-8"), AGENT_AUTH_TOKEN.encode("utf-8")):
+            self._send(403, {"error": {
+                "message": "invalid workspace-write token (CODEX_AGENT_AGENT_TOKEN required for agentic mode)",
+                "type": "auth_error"}})
+            return False
+        return True
+
     def do_GET(self):
         if self.path == "/health":
+            # Unauthenticated callers (LAN liveness probes) get only liveness.
+            # Config details (model/sandbox/uptime/security) require a valid
+            # read-token so the endpoint can't fingerprint the server.
+            if not self._has_valid_read_token():
+                self._send(200, {"status": "ok"})
+                return
             self._send(200, {
                 "status": "ok",
                 "model": DEFAULT_MODEL,
@@ -452,6 +581,13 @@ class Handler(BaseHTTPRequestHandler):
                 if sandbox == "workspace-write" else None
         except BadRequest as exc:
             self._send(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
+            return
+
+        # workspace-write requires the *separate* agent token: a leaked read-only
+        # token must not grant file-write/exec. Checked here (not in _check_auth)
+        # because the mode is only known after model/sandbox resolution. read-only
+        # already passed _check_auth against AUTH_TOKEN.
+        if sandbox == "workspace-write" and not self._check_agent_auth():
             return
 
         # Separate system prompt from conversation
@@ -629,7 +765,18 @@ def main():
         logger.info("Workdir root: %s (allowed: %s)", WORKDIR, WORKDIR_ROOT)
     else:
         logger.info("Workdir: not set (workspace-write requests need `workdir` in body)")
-    logger.info("Auth: bearer token required on /v1/* (token len=%d)", len(AUTH_TOKEN))
+    if READ_ROOT:
+        logger.info("Read root (read-only cwd): %s", READ_ROOT)
+    else:
+        logger.warning(
+            "CODEX_AGENT_READ_ROOT not set: read-only codex runs with full host "
+            "read access (full host read access). Set CODEX_AGENT_READ_ROOT to pin its cwd."
+        )
+    logger.info("Auth: bearer token required on /v1/* (read-token len=%d)", len(AUTH_TOKEN))
+    if AGENT_AUTH_TOKEN:
+        logger.info("workspace-write: enabled (separate agent token, len=%d)", len(AGENT_AUTH_TOKEN))
+    else:
+        logger.info("workspace-write: DISABLED (set CODEX_AGENT_AGENT_TOKEN to enable agentic mode)")
     logger.info("Endpoints: POST /v1/chat/completions, GET /v1/models, GET /health")
     try:
         server.serve_forever()

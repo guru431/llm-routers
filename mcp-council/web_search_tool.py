@@ -149,6 +149,12 @@ async def run_with_tool_loop(
         tools = [WEB_SEARCH_TOOL_SPEC]
     tool_log: list[dict] = []
     last_result: dict | None = None
+    # Accumulate usage across ALL loop iterations — each call_fn turn spends
+    # tokens/attempts, but only the final result dict carries its own (last)
+    # turn's numbers. Without this, usage-accounting undercounts a multi-turn
+    # web_search member to just its closing call. Surfaced under loop_* keys so
+    # council._compute_usage sums them instead of the single last-turn figures.
+    loop_calls = loop_tin = loop_tout = loop_attempts = 0
     total_turns = MAX_TOOL_ITERATIONS + 1
     for turn in range(total_turns):
         # Last turn: forbid new tool calls so the model writes a final answer
@@ -168,8 +174,18 @@ async def run_with_tool_loop(
             tool_choice="none" if force_no_tools else None,
         )
         last_result = result
+        loop_calls += 1
+        loop_tin += result.get("tokens_in") or 0
+        loop_tout += result.get("tokens_out") or 0
+        loop_attempts += result.get("attempts") or 1
         tool_calls = result.get("tool_calls")
         if not tool_calls:
+            result.update({
+                "loop_calls": loop_calls,
+                "loop_tokens_in": loop_tin,
+                "loop_tokens_out": loop_tout,
+                "loop_attempts": loop_attempts,
+            })
             return result, tool_log
 
         # Record the assistant turn that produced these tool_calls, then
@@ -199,4 +215,11 @@ async def run_with_tool_loop(
             })
     # Hit the cap. Return whatever the model said last, even if it's another
     # tool_calls request — caller will see no content and mark error.
+    if last_result is not None:
+        last_result.update({
+            "loop_calls": loop_calls,
+            "loop_tokens_in": loop_tin,
+            "loop_tokens_out": loop_tout,
+            "loop_attempts": loop_attempts,
+        })
     return last_result, tool_log  # type: ignore[return-value]

@@ -124,6 +124,10 @@ def load_judged() -> set[tuple[str, str]]:
             continue
         try:
             d = json.loads(line)
+            # Records with score=None failed to parse — don't mark them judged,
+            # so a re-run can re-score just those pairs without a full --rescore.
+            if d.get("score") is None:
+                continue
             seen.add((d["model_id"], d["task_id"]))
         except Exception:
             pass
@@ -160,9 +164,20 @@ def main():
                 continue
             pairs.append((model_id, tid, r["text"]))
 
+    # Dedup by (model_id, task_id), last-wins: results.jsonl can hold multiple
+    # records for the same cell (re-runs/retries); judging each would double-bill.
+    deduped: dict[tuple[str, str], tuple[str, str, str]] = {}
+    for p in pairs:
+        deduped[(p[0], p[1])] = p
+    pairs = list(deduped.values())
+
     sys.stderr.write(f"Pairs to judge: {len(pairs)}\n")
+    # --rescore truncates the whole file. Write to a sibling .tmp and atomically
+    # replace on success so a crash mid-run leaves the old scores intact.
+    # Append mode (no rescore) writes straight to the file as before.
+    target = JUDGE_FILE.with_suffix(JUDGE_FILE.suffix + ".tmp") if args.rescore else JUDGE_FILE
     mode = "w" if args.rescore else "a"
-    with JUDGE_FILE.open(mode, encoding="utf-8") as out:
+    with target.open(mode, encoding="utf-8") as out:
         for i, (mid, tid, text) in enumerate(pairs, 1):
             task = tasks_by_id.get(tid)
             if not task:
@@ -178,6 +193,8 @@ def main():
             }
             out.write(json.dumps(rec, ensure_ascii=False) + "\n")
             out.flush()
+    if args.rescore:
+        os.replace(target, JUDGE_FILE)
 
 
 if __name__ == "__main__":

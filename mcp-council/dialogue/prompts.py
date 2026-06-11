@@ -11,12 +11,32 @@ from __future__ import annotations
 
 HISTORY_TRUNCATE_ROUNDS = 10
 
+# Within the kept round-window, only the most recent rounds are sent verbatim;
+# in older rounds each entry's text is capped. Without this, a 7-participant
+# panel at round 10 carries ~140 entries of up to max_tokens (4096) each —
+# hundreds of thousands of tokens in every per-round prompt, growing quadratically.
+RECENT_FULL_ROUNDS = 2
+OLD_ROUND_ENTRY_CHAR_CAP = 1000
 
-def format_history_section(history: list[dict]) -> str:
+
+def _cap_text(text: str, cap: int | None) -> str:
+    if cap is None or len(text) <= cap:
+        return text
+    return text[:cap].rstrip() + f"… [truncated {len(text) - cap} chars]"
+
+
+def format_history_section(
+    history: list[dict],
+    *,
+    recent_full_rounds: int = RECENT_FULL_ROUNDS,
+    old_entry_char_cap: int | None = OLD_ROUND_ENTRY_CHAR_CAP,
+) -> str:
     """Group history entries by round and render as readable text.
 
-    Only the last HISTORY_TRUNCATE_ROUNDS rounds are included. Within a round,
-    critiques come before responses (chronological).
+    Only the last HISTORY_TRUNCATE_ROUNDS rounds are included. Within that
+    window, the last `recent_full_rounds` rounds are verbatim; older rounds
+    have each entry capped to `old_entry_char_cap` chars (None = no cap).
+    Within a round, critiques come before responses (chronological).
     """
     if not history:
         return ""
@@ -25,6 +45,10 @@ def format_history_section(history: list[dict]) -> str:
         keep = set(rounds_seen[-HISTORY_TRUNCATE_ROUNDS:])
         history = [h for h in history if h["round"] in keep]
         rounds_seen = sorted(keep)
+
+    full_rounds = (
+        set(rounds_seen[-recent_full_rounds:]) if recent_full_rounds else set(rounds_seen)
+    )
 
     phase_order = {"critique": 0, "response": 1, "question": 0, "answer": 1}
     lines: list[str] = []
@@ -48,7 +72,8 @@ def format_history_section(history: list[dict]) -> str:
                 phase_marker = " (reprompt)"
             elif h["phase"] == "moderator_note":
                 phase_marker = " (moderator note)"
-            lines.append(f"  [{h['id']}]{phase_marker}: {h['text']}")
+            text = h["text"] if rn in full_rounds else _cap_text(h["text"], old_entry_char_cap)
+            lines.append(f"  [{h['id']}]{phase_marker}: {text}")
     return "\n".join(lines)
 
 
@@ -156,17 +181,31 @@ def render_position_split_prompt(*, question: str, n: int) -> str:
 
 
 def render_summary_prompt(*, topic: str, history: list[dict], mode: str) -> str:
-    """Ask the moderator to write a final summary of the dialogue."""
-    hist_text = format_history_section(history)
+    """Ask the moderator to write a final summary of the dialogue.
+
+    Summarizing needs the full text of each kept round (no per-entry cap), but
+    the round-window cap still applies — so for runs longer than
+    HISTORY_TRUNCATE_ROUNDS the transcript is the most-recent rounds, not all of
+    them. The header says so rather than mislabelling a partial view as 'full'.
+    """
+    hist_text = format_history_section(
+        history, recent_full_rounds=HISTORY_TRUNCATE_ROUNDS, old_entry_char_cap=None
+    )
+    total_rounds = len({h["round"] for h in history})
+    window_note = (
+        f" (most recent {HISTORY_TRUNCATE_ROUNDS} of {total_rounds} rounds)"
+        if total_rounds > HISTORY_TRUNCATE_ROUNDS else ""
+    )
     return (
-        f"You are the moderator for a {mode} dialogue. Below is the full transcript. "
+        f"You are the moderator for a {mode} dialogue. Below is the transcript"
+        f"{window_note}. "
         "Write a final summary in 3-6 short paragraphs covering:\n"
         "1. The strongest 1-2 points each participant made.\n"
         "2. Areas where participants converged (if any).\n"
         "3. Areas that remain unresolved or in genuine disagreement.\n"
         "4. What a reader should take away.\n\n"
         f"=== TOPIC ===\n{topic}\n\n"
-        f"=== FULL TRANSCRIPT ===\n{hist_text}\n"
+        f"=== TRANSCRIPT{window_note} ===\n{hist_text}\n"
     )
 
 

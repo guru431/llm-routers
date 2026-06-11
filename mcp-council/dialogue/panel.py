@@ -14,7 +14,12 @@ import json
 import re
 from pathlib import Path
 
-from dialogue.engine import _run_turn, _run_phase, run_round, write_dump
+import asyncio
+
+from dialogue.engine import (
+    _run_turn, _run_phase, run_round, write_dump,
+    check_round_failures, maybe_dump,
+)
 from dialogue.prompts import (
     render_diversity_monitor_prompt,
     render_summary_prompt,
@@ -155,14 +160,20 @@ async def run_panel(
     diversity_monitor: bool,
     diversity_threshold: int,
     devils_advocate_rotation: bool,
+    resume: bool = False,
 ) -> None:
-    """Orchestrate a panel session."""
+    """Orchestrate a panel session.
+
+    resume=True (dialogue_continue): participants/moderator already live on
+    state — skip seeding and pick up from state.current_round + 1.
+    """
     mark_phase(state, "starting")
-    state.participants = [
-        _cfg_to_participant(c, role=(roles[i] if roles else None))
-        for i, c in enumerate(participant_cfgs)
-    ]
-    state.moderator = {"id": monitor_cfg["id"], "model": monitor_cfg["model"]}
+    if not resume:
+        state.participants = [
+            _cfg_to_participant(c, role=(roles[i] if roles else None))
+            for i, c in enumerate(participant_cfgs)
+        ]
+        state.moderator = {"id": monitor_cfg["id"], "model": monitor_cfg["model"]}
 
     def role_descriptor(p: dict) -> str:
         if p.get("role"):
@@ -193,6 +204,10 @@ async def run_panel(
             do_critique=True,
         )
 
+        # Same abort guard debate gets via run_dialogue: a dead provider must
+        # not drag a 7-model panel through all rounds emitting [error:...].
+        check_round_failures(state, round_n)
+
         if devils_advocate_rotation:
             da_id = devils_advocate_for_round(state.participants, round_n)
             state.devils_advocates.append(da_id)
@@ -218,6 +233,9 @@ async def run_panel(
                 files_section=files_section,
             )
 
+        # Mid-run persistence — snapshot after each completed round.
+        await maybe_dump(state, DUMP_DIR)
+
     mark_phase(state, "summarizing")
     summary_prompt = render_summary_prompt(topic=question, history=state.history, mode="panel")
     summary_result = await _run_turn(
@@ -238,4 +256,4 @@ async def run_panel(
     from dialogue.render import format_dialogue_markdown
     state.result_markdown = format_dialogue_markdown(state, question)
     mark_phase(state, "done")
-    state.dump_path = str(write_dump(state, base_dir=DUMP_DIR))
+    state.dump_path = str(await asyncio.to_thread(write_dump, state, base_dir=DUMP_DIR))

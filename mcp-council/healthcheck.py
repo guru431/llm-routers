@@ -19,8 +19,9 @@ from openai_client import CouncilHTTPError, call_openai_compat
 _PING_MESSAGES = [{"role": "user", "content": "Reply with the single word: pong"}]
 
 # Per-check ceiling. Healthcheck should be fast; a real model that needs minutes
-# is itself a signal worth surfacing as a timeout.
-DEFAULT_TIMEOUT = 25.0
+# is itself a signal worth surfacing as a timeout. Probes run with max_attempts=1
+# (no retry) so a single slow model can't stretch the check to minutes.
+DEFAULT_TIMEOUT = 12.0
 
 
 def _classify_error(msg: str) -> str:
@@ -32,7 +33,16 @@ def _classify_error(msg: str) -> str:
         return "insufficient_balance"
     if "401" in m or "403" in m or " auth" in m:
         return "auth"
-    if "429" in m or "overload" in m or "rate" in m:
+    # Exhausted 5xx surface as "overload after N attempts (last status 5xx)" —
+    # that's a server/network outage, not throttling. Classify by the real
+    # status so a 503 outage isn't mislabeled rate_limited. Only genuine
+    # throttling (429/529/the word "rate") maps to rate_limited.
+    if "last status 5" in m:
+        return "network"
+    if "429" in m or "529" in m or "rate" in m:
+        return "rate_limited"
+    if "overload" in m:
+        # "overload" without a 5xx status (e.g. last status 429/529) is throttling.
         return "rate_limited"
     if "timeout" in m:
         return "timeout"
@@ -74,6 +84,11 @@ async def _check_one(mid: str, cfg: dict, call_fn, timeout: float) -> dict:
             max_tokens=max(64, cfg.get("min_max_tokens", 0)),
             extra_payload=cfg.get("extra"),
             timeout=timeout,
+            # One attempt, no breaker side-effects: a probe must not burn the
+            # retry budget (up to 3×25s+backoff) nor trip the breaker that the
+            # real council path relies on.
+            max_attempts=1,
+            record_breaker=False,
         )
     except CouncilHTTPError as e:
         return {**base, "enabled": True, "key_present": True, "ok": False,

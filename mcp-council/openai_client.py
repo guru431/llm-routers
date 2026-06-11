@@ -4,7 +4,8 @@ Supports OCG (OpenCode Go), DeepSeek direct, Helicone Gateway — все они 
 один и тот же /v1/chat/completions схему. Различия (thinking/reasoning_effort,
 min max_tokens) задаются через `extra` и `min_max_tokens` в config.COUNCIL.
 
-Retry: 2 раза на HTTP 429/529 с backoff [60s, 120s].
+Retry: до 2 повторов на HTTP 429/500/502/503/529 и на timeout, backoff
+[15s, 45s] между попытками (RETRY_BACKOFFS).
 402 (insufficient balance) — без retry, сразу ошибка.
 
 Strip <think>...</think> блоки из ответа (некоторые модели — Kimi, GLM —
@@ -38,6 +39,21 @@ class CouncilHTTPError(Exception):
     """Любая ошибка вызова OpenAI-compatible endpoint."""
 
 
+# Module-level client, lazily created on first use. Reused across every call so
+# the TCP+TLS connection pool survives between requests — council fan-out has
+# 4/6 default members on the same OCG host, so they share connections instead of
+# re-handshaking per attempt. Must be created inside a running event loop (httpx
+# binds to the loop), hence lazy init rather than a module-import-time singleton.
+_CLIENT: "httpx.AsyncClient | None" = None
+
+
+def _get_client() -> "httpx.AsyncClient":
+    global _CLIENT
+    if _CLIENT is None:
+        _CLIENT = httpx.AsyncClient()
+    return _CLIENT
+
+
 def _strip_think(text: str) -> str:
     return re.sub(r"<think>[\s\S]*?</think>\s*", "", text).strip()
 
@@ -55,8 +71,16 @@ async def call_openai_compat(
     tools: list[dict] | None = None,
     tool_choice: str | dict | None = None,
     timeout: float = DEFAULT_TIMEOUT,
+    max_attempts: int | None = None,
+    record_breaker: bool = True,
 ) -> dict:
     """Один POST к {base_url}/chat/completions с retry на 429/500/502/503/529.
+
+    `max_attempts`: cap on total HTTP attempts (1 = no retries). None = full
+    RETRY_BACKOFFS budget (default council behavior).
+    `record_breaker`: when False, infra failures do NOT feed the circuit
+    breaker (healthcheck uses this so a probe can't trip the breaker for the
+    real council path).
 
     Returns::
         {
@@ -98,95 +122,107 @@ async def call_openai_compat(
             payload["tool_choice"] = tool_choice
 
     last_error: str | None = None
-    # One AsyncClient across retries — saves TCP+TLS handshake per attempt and,
+    # Reused module-level AsyncClient — saves TCP+TLS handshake per attempt and,
     # for council runs, lets multiple members reuse the same connection pool to
     # the same host (OCG serves 4/6 council members in the default catalog).
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        for attempt in range(len(RETRY_BACKOFFS) + 1):
-            try:
-                resp = await client.post(url, headers=headers, json=payload)
-            except httpx.TimeoutException as e:
-                # ReadTimeout / ConnectTimeout / PoolTimeout. Thinking-mode models
-                # can hold the connection for minutes and a transient blip from the
-                # provider shouldn't kill an otherwise viable request. Apply the
-                # same backoff as HTTP 5xx for consistency.
-                detail = str(e) or type(e).__name__
-                if attempt >= len(RETRY_BACKOFFS):
-                    circuit_breaker.record_failure(host)
-                    raise CouncilHTTPError(
-                        f"timeout after {attempt + 1} attempts: {detail}"
-                    ) from e
-                await asyncio.sleep(RETRY_BACKOFFS[attempt])
-                last_error = f"timeout {detail} (retry)"
-                continue
-            except httpx.HTTPError as e:
-                # Non-timeout transport error (DNS, TLS, etc.). str(e) is often
-                # empty on these — fall back to the class name so logs aren't blank.
-                detail = str(e) or type(e).__name__
-                circuit_breaker.record_failure(host)
-                raise CouncilHTTPError(f"network error: {detail}") from e
+    # timeout is per-request so different callers (council vs healthcheck) can
+    # set their own ceiling on the shared client.
+    client = _get_client()
+    # Retry budget: full RETRY_BACKOFFS by default; max_attempts caps it (1 = no
+    # retries) so healthcheck can probe without burning the full backoff budget.
+    max_retries = len(RETRY_BACKOFFS)
+    if max_attempts is not None:
+        max_retries = min(max_retries, max(0, max_attempts - 1))
 
-            if resp.status_code == 402:
-                body = resp.text[:200] if resp.text else ""
-                raise CouncilHTTPError(f"http 402 insufficient_balance: {body}")
+    def _record_failure() -> None:
+        if record_breaker:
+            circuit_breaker.record_failure(host)
 
-            if resp.status_code in RETRY_STATUSES:
-                if attempt >= len(RETRY_BACKOFFS):
-                    circuit_breaker.record_failure(host)
-                    raise CouncilHTTPError(
-                        f"overload after {attempt + 1} attempts (last status {resp.status_code})"
-                    )
-                await asyncio.sleep(RETRY_BACKOFFS[attempt])
-                last_error = f"http {resp.status_code} (retry)"
-                continue
-
-            if resp.status_code != 200:
-                body = resp.text[:200] if resp.text else ""
-                raise CouncilHTTPError(f"http {resp.status_code}: {body}")
-
-            try:
-                data = resp.json()
-            except ValueError as e:
-                raise CouncilHTTPError(f"invalid JSON in response: {e}") from e
-
-            try:
-                choice = data["choices"][0]
-                msg = choice["message"]
-            except (KeyError, IndexError, TypeError) as e:
-                raise CouncilHTTPError(f"invalid response structure: {e}") from e
-
-            content = msg.get("content")
-            tool_calls = msg.get("tool_calls")
-            # DeepSeek thinking-mode returns a separate `reasoning_content` alongside
-            # tool_calls. The DeepSeek API STRICTLY REQUIRES it to be echoed back in
-            # the next assistant message — otherwise the follow-up call rejects with
-            # http 400: "The `reasoning_content` in the thinking mode must be passed
-            # back to the API." We surface it here so the caller can put it back
-            # into the conversation. Other providers leave the field absent and the
-            # caller passing it back is harmless (extra key is ignored).
-            reasoning_content = msg.get("reasoning_content")
-            finish_reason = choice.get("finish_reason")
-
-            # Accept the response when either (a) we got actual content, or (b) the
-            # model decided to call tools. Only fail when both are missing — that's
-            # a degenerate response (often max_tokens spent on hidden reasoning).
-            if not content and not tool_calls:
+    for attempt in range(max_retries + 1):
+        try:
+            resp = await client.post(url, headers=headers, json=payload, timeout=timeout)
+        except httpx.TimeoutException as e:
+            # ReadTimeout / ConnectTimeout / PoolTimeout. Thinking-mode models
+            # can hold the connection for minutes and a transient blip from the
+            # provider shouldn't kill an otherwise viable request. Apply the
+            # same backoff as HTTP 5xx for consistency.
+            detail = str(e) or type(e).__name__
+            if attempt >= max_retries:
+                _record_failure()
                 raise CouncilHTTPError(
-                    f"empty content (finish_reason={finish_reason})"
-                )
+                    f"timeout after {attempt + 1} attempts: {detail}"
+                ) from e
+            await asyncio.sleep(RETRY_BACKOFFS[attempt])
+            last_error = f"timeout {detail} (retry)"
+            continue
+        except httpx.HTTPError as e:
+            # Non-timeout transport error (DNS, TLS, etc.). str(e) is often
+            # empty on these — fall back to the class name so logs aren't blank.
+            detail = str(e) or type(e).__name__
+            _record_failure()
+            raise CouncilHTTPError(f"network error: {detail}") from e
 
-            usage = data.get("usage", {}) or {}
-            circuit_breaker.record_success(host)
-            return {
-                "content": _strip_think(content) if content else None,
-                "tool_calls": tool_calls,
-                "reasoning_content": reasoning_content,
-                "finish_reason": finish_reason,
-                "tokens_in": usage.get("prompt_tokens"),
-                "tokens_out": usage.get("completion_tokens"),
-                # Number of HTTP attempts spent (1 = succeeded first try). Used by
-                # council usage-accounting to count retries on the success path.
-                "attempts": attempt + 1,
-            }
+        if resp.status_code == 402:
+            body = resp.text[:200] if resp.text else ""
+            raise CouncilHTTPError(f"http 402 insufficient_balance: {body}")
+
+        if resp.status_code in RETRY_STATUSES:
+            if attempt >= max_retries:
+                _record_failure()
+                raise CouncilHTTPError(
+                    f"overload after {attempt + 1} attempts (last status {resp.status_code})"
+                )
+            await asyncio.sleep(RETRY_BACKOFFS[attempt])
+            last_error = f"http {resp.status_code} (retry)"
+            continue
+
+        if resp.status_code != 200:
+            body = resp.text[:200] if resp.text else ""
+            raise CouncilHTTPError(f"http {resp.status_code}: {body}")
+
+        try:
+            data = resp.json()
+        except ValueError as e:
+            raise CouncilHTTPError(f"invalid JSON in response: {e}") from e
+
+        try:
+            choice = data["choices"][0]
+            msg = choice["message"]
+        except (KeyError, IndexError, TypeError) as e:
+            raise CouncilHTTPError(f"invalid response structure: {e}") from e
+
+        content = msg.get("content")
+        tool_calls = msg.get("tool_calls")
+        # DeepSeek thinking-mode returns a separate `reasoning_content` alongside
+        # tool_calls. The DeepSeek API STRICTLY REQUIRES it to be echoed back in
+        # the next assistant message — otherwise the follow-up call rejects with
+        # http 400: "The `reasoning_content` in the thinking mode must be passed
+        # back to the API." We surface it here so the caller can put it back
+        # into the conversation. Other providers leave the field absent and the
+        # caller passing it back is harmless (extra key is ignored).
+        reasoning_content = msg.get("reasoning_content")
+        finish_reason = choice.get("finish_reason")
+
+        # Accept the response when either (a) we got actual content, or (b) the
+        # model decided to call tools. Only fail when both are missing — that's
+        # a degenerate response (often max_tokens spent on hidden reasoning).
+        if not content and not tool_calls:
+            raise CouncilHTTPError(
+                f"empty content (finish_reason={finish_reason})"
+            )
+
+        usage = data.get("usage", {}) or {}
+        circuit_breaker.record_success(host)
+        return {
+            "content": _strip_think(content) if content else None,
+            "tool_calls": tool_calls,
+            "reasoning_content": reasoning_content,
+            "finish_reason": finish_reason,
+            "tokens_in": usage.get("prompt_tokens"),
+            "tokens_out": usage.get("completion_tokens"),
+            # Number of HTTP attempts spent (1 = succeeded first try). Used by
+            # council usage-accounting to count retries on the success path.
+            "attempts": attempt + 1,
+        }
 
     raise CouncilHTTPError(last_error or "unreachable")  # pragma: no cover

@@ -4,17 +4,22 @@ Separate from `state.py` (which manages council Karpathy jobs) because the
 dialogue model has different shape: phases are round-keyed (round_N_critique,
 round_N_response, round_N_diversity, etc.), not stage-keyed.
 
-Lifetime is per-process; restart loses active sessions (matches council's
-state.py). Hard cap MAX_ACTIVE_SESSIONS prevents memory leak; stale done/error/
-cancelled sessions are pruned opportunistically when create_session is called.
+Mid-run snapshots are persisted to logs/dialogues/<session_id>.json after every
+round (see engine.write_dump); load_persisted_dialogues() restores them at
+startup, marking still-running sessions as 'interrupted' (mirrors council's
+state.py, which persists per-job). Hard cap MAX_ACTIVE_SESSIONS prevents memory
+leak; stale terminal sessions are pruned opportunistically on create_session.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal
 
 MAX_ACTIVE_SESSIONS = 20
@@ -22,7 +27,15 @@ MAX_ACTIVE_SESSIONS = 20
 INACTIVE_TIMEOUT_SECONDS = 2 * 3600
 
 ACTIVE_PHASES = {"starting"}
-TERMINAL_PHASES = {"done", "error", "cancelled"}
+TERMINAL_PHASES = {"done", "error", "cancelled", "interrupted"}
+
+# Where engine.write_dump persists session snapshots. Override with
+# COUNCIL_DIALOGUES_DIR (read at call time so tests can isolate it).
+_DEFAULT_DUMP_DIR = Path(__file__).parent.parent / "logs" / "dialogues"
+
+
+def _dump_dir() -> Path:
+    return Path(os.environ.get("COUNCIL_DIALOGUES_DIR") or _DEFAULT_DUMP_DIR)
 
 
 @dataclass
@@ -86,6 +99,76 @@ def _gc_locked(now: float) -> None:
     ]
     for sid in stale:
         del _sessions[sid]
+
+
+def _state_from_dump(data: dict) -> DialogueState:
+    """Rebuild a DialogueState from a persisted snapshot. A non-terminal
+    persisted phase becomes 'interrupted' (the run died with the previous
+    process)."""
+    s = DialogueState(
+        session_id=data["session_id"],
+        mode=data.get("mode", "panel"),  # type: ignore[arg-type]
+        question_preview=data.get("question_preview", ""),
+        total_rounds=data.get("total_rounds") or 1,
+        created_at=data.get("created_at") or time.time(),
+        question=data.get("question") or data.get("question_preview", ""),
+    )
+    s.current_round = data.get("current_round") or 0
+    s.participants = data.get("participants") or []
+    s.moderator = data.get("moderator")
+    s.history = data.get("history") or []
+    s.diversity_scores = data.get("diversity_scores") or []
+    s.devils_advocates = data.get("devils_advocates") or []
+    s.started_at = data.get("started_at")
+    s.finished_at = data.get("finished_at")
+    s.error = data.get("error")
+    s.result_markdown = data.get("result_markdown")
+    s.dump_path = data.get("dump_path")
+    s.web_search = bool(data.get("web_search"))
+    s.max_tokens = data.get("max_tokens") or 4096
+    s.context_paths = data.get("context_paths") or []
+    s.diversity_monitor = bool(data.get("diversity_monitor", True))
+    s.diversity_threshold = data.get("diversity_threshold") or 7
+    s.devils_advocate_rotation = bool(data.get("devils_advocate_rotation", True))
+    phase = data.get("phase") or "starting"
+    now = time.time()
+    if phase not in TERMINAL_PHASES:
+        s.phase = "interrupted"
+        s.error = s.error or "server restarted mid-run (partial history available)"
+        s.finished_at = s.finished_at or now
+    else:
+        s.phase = phase
+    s.last_activity = s.finished_at or s.started_at or s.created_at
+    return s
+
+
+def load_persisted_dialogues() -> int:
+    """Load persisted session snapshots into memory at startup, marking
+    non-terminal sessions as 'interrupted'. Returns the number loaded.
+    Synchronous — intended to run once before the event loop serves."""
+    d = _dump_dir()
+    if not d.exists():
+        return 0
+    now = time.time()
+    loaded = 0
+    for f in d.glob("*.json"):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        # Drop snapshots past the inactive timeout so a restart doesn't resurrect
+        # ancient sessions; matches the in-memory GC horizon.
+        if now - (data.get("created_at") or 0) > INACTIVE_TIMEOUT_SECONDS:
+            continue
+        sid = data.get("session_id")
+        if not sid or sid in _sessions:
+            continue
+        try:
+            _sessions[sid] = _state_from_dump(data)
+        except (KeyError, TypeError):
+            continue
+        loaded += 1
+    return loaded
 
 
 async def create_session(

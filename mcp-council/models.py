@@ -10,6 +10,13 @@ Kimi needs reasoning_effort "none") to avoid truncated/garbage output.
 
 Env key names (`env_key`) are read from the process environment; see the
 project README for how keys are provided to the MCP server.
+
+Pricing (`price_in`/`price_out`, USD per 1M tokens) drives council
+usage.estimated_cost_usd. Only models with a published per-token PAYG price get
+real numbers — flat-rate subscription models (OCG $10/mo: glm/kimi/qwen/minimax;
+ChatGPT-flat: codex/gpt-5.5; Helicone gemini 3.1-pro-preview has no listed price)
+are None and contribute 0 to the cost estimate. DeepSeek PAYG list prices as of
+2026-05.
 """
 
 from __future__ import annotations
@@ -27,6 +34,9 @@ CATALOG: dict[str, dict] = {
         "base_url": OCG,
         "env_key": "OPENCODE_GO_KEY",
         "extra": {"thinking": {"type": "disabled"}},
+        # OCG flat-rate subscription — no published per-token price.
+        "price_in": None,
+        "price_out": None,
     },
     "kimi": {
         "model": "kimi-k2.6",
@@ -34,29 +44,41 @@ CATALOG: dict[str, dict] = {
         "env_key": "OPENCODE_GO_KEY",
         "extra": {"reasoning_effort": "none"},
         "min_max_tokens": 30000,
+        "price_in": None,
+        "price_out": None,
     },
     "deepseek-pro": {
         # via OCG-прокси с 2026-06-07 (DeepSeek direct PAYG исчерпан, вряд ли вернётся)
         "model": "deepseek-v4-pro",
         "base_url": OCG,
         "env_key": "OPENCODE_GO_KEY",
+        # DeepSeek PAYG list price (50% off promo): $0.435/1M in, $0.87/1M out.
+        "price_in": 0.435,
+        "price_out": 0.87,
     },
     "qwen": {
         "model": "qwen3.6-plus",
         "base_url": OCG,
         "env_key": "OPENCODE_GO_KEY",
+        "price_in": None,
+        "price_out": None,
     },
     "minimax": {
         "model": "minimax-m3",
         "base_url": OCG,
         "env_key": "OPENCODE_GO_KEY",
         "min_max_tokens": 30000,
+        "price_in": None,
+        "price_out": None,
     },
     "gemini": {
         "model": "gemini-3.1-pro-preview",
         "base_url": HEL,
         "env_key": "HELICONE_GATEWAY_KEY",
         "min_max_tokens": 30000,
+        # No published price for 3.1-pro-preview via Helicone Gateway.
+        "price_in": None,
+        "price_out": None,
     },
     "codex": {
         # codex-agent-server (local OpenAI-compatible wrapper over `codex exec`,
@@ -68,6 +90,9 @@ CATALOG: dict[str, dict] = {
         "base_url": "http://127.0.0.1:8766/v1",
         "env_key": "CODEX_AGENT_TOKEN",
         "extra": {"sandbox": "read-only"},
+        # ChatGPT/Codex flat subscription — no per-token price.
+        "price_in": None,
+        "price_out": None,
     },
 
     # --- Routine workers (model_ask only) ---
@@ -76,12 +101,17 @@ CATALOG: dict[str, dict] = {
         "model": "deepseek-v4-flash",
         "base_url": OCG,
         "env_key": "OPENCODE_GO_KEY",
+        # DeepSeek PAYG list price: $0.14/1M in, $0.28/1M out.
+        "price_in": 0.14,
+        "price_out": 0.28,
     },
     "minimax-direct": {
         "model": "abab7-chat-preview",
         "base_url": MM,
         "env_key": "MINIMAX_API_KEY",
         "enabled": False,
+        "price_in": None,
+        "price_out": None,
     },
 }
 

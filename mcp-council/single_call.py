@@ -23,7 +23,8 @@ async def run_single(
     """One LLM call. Returns the model's text answer (or '' if empty).
 
     Raises:
-        RuntimeError if the env var for this cfg's api key is not set.
+        RuntimeError if the env var for this cfg's api key is not set, or (web_search
+            path) if the tool-loop exhausts its iterations without a final answer.
         CouncilHTTPError on network / HTTP / parsing failure.
     """
     api_key = os.environ.get(cfg["env_key"])
@@ -41,7 +42,16 @@ async def run_single(
             max_tokens=effective_max,
             tools=[WEB_SEARCH_TOOL_SPEC],
         )
-        return result.get("content") or ""
+        content = result.get("content")
+        if not content:
+            # Loop exhausted its iteration cap with no final answer (the model
+            # kept calling tools). Same contract as the council path: surface a
+            # hard error instead of silently returning "".
+            raise RuntimeError(
+                "no final content after tool iterations "
+                f"(finish_reason={result.get('finish_reason')})"
+            )
+        return content
 
     result = await call_openai_compat(
         base_url=cfg["base_url"],

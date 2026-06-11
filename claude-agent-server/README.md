@@ -26,7 +26,7 @@ cd claude-agent-server
 python server.py
 ```
 
-Сервер запустится на `0.0.0.0:8765`. Проверка:
+Сервер запустится на `127.0.0.1:8765` (только loopback). Проверка:
 
 ```bash
 curl http://localhost:8765/health
@@ -36,7 +36,7 @@ curl http://localhost:8765/health
 
 ```bash
 python server.py --port 9000              # другой порт
-python server.py --host 127.0.0.1         # bind только на localhost
+python server.py --host 0.0.0.0           # открыть на LAN (по умолчанию loopback)
 ```
 
 ### Автозапуск на Windows (Task Scheduler)
@@ -85,6 +85,7 @@ curl -X POST http://localhost:8765/v1/chat/completions \
 - `model` (optional) — `claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` (см. `/v1/models`)
 - `tools` (optional) — массив определений функций в OpenAI-формате; вызовы парсятся из `<tool_call>` блоков ответа
 - `timeout` (optional) — таймаут в секундах (default 300)
+- `stream` (optional) — если `true`, ответ отдаётся как OpenAI SSE (`text/event-stream`, чанки `chat.completion.chunk` + `data: [DONE]`). Псевдо-стрим: CLI возвращает ответ целиком, сервер режет его на чанки для совместимости (Open WebUI)
 
 ### `GET /v1/models`
 
@@ -98,7 +99,8 @@ curl http://localhost:8765/v1/models
 
 ```bash
 curl http://localhost:8765/health
-# {"status": "ok", "model": "claude-opus-4-8", "uptime": 3600, "security": "authenticated", "cache": {...}}
+# без токена: {"status": "ok"}
+# с токеном:  {"status": "ok", "model": "claude-opus-4-8", "uptime": 3600, "security": "authenticated", "cache": {...}}
 ```
 
 ## Конфигурация
@@ -113,6 +115,7 @@ curl http://localhost:8765/health
 | `CLAUDE_AGENT_CACHE` | `1` | Включить response cache (`0`/`false` — выключить) |
 | `CLAUDE_AGENT_CACHE_SIZE` | `256` | Макс. записей в кэше (LRU eviction) |
 | `CLAUDE_AGENT_CACHE_TTL` | `3600` | TTL записи в секундах |
+| `CLAUDE_AGENT_CACHE_BYTES` | `67108864` (64 MB) | Макс. суммарный размер значений кэша; больше → LRU eviction |
 | `CLAUDE_AGENT_MAX_BODY` | `10485760` (10 MB) | Макс. размер тела запроса; больше → `413` |
 | `CLAUDE_AGENT_MAX_CONCURRENCY` | `4` | Макс. параллельных claude-вызовов; сверх → `429` |
 
@@ -181,14 +184,14 @@ client.chat.completions.create(
 
 ## Безопасность
 
-Биндится по умолчанию на `0.0.0.0` — доступен всем в сети. Bearer-токен через `CLAUDE_AGENT_TOKEN` **обязателен** — без него сервер не стартует (exit 2):
+Биндится по умолчанию на `127.0.0.1` (только loopback). Для доступа из LAN задать `--host 0.0.0.0` (или `CLAUDE_AGENT_HOST=0.0.0.0`, или через install_task). Bearer-токен через `CLAUDE_AGENT_TOKEN` **обязателен** — без него сервер не стартует (exit 2):
 
 ```bash
 export CLAUDE_AGENT_TOKEN='cas-<random hex>'
 python server.py
 ```
 
-Все endpoints кроме `/health` требуют `Authorization: Bearer <token>` — иначе 401. `/health` всегда отдаёт `security: "authenticated"`.
+Все endpoints кроме `/health` требуют `Authorization: Bearer <token>` — иначе 401. `/health` работает без токена (liveness-проба) и отдаёт только `{"status": "ok"}`; полные поля (`model`, `uptime`, `security`, `cache`) — лишь при валидном bearer.
 
 Клиент с токеном:
 

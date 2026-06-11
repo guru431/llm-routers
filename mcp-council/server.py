@@ -20,6 +20,7 @@ from mcp.server.fastmcp import FastMCP
 from models import COUNCIL_DEFAULT, resolve_member, resolve_members, resolve_preset
 from council import _aggregate as _aggregate_helper  # noqa: F401 — re-exported for tests
 from council import run_council
+from council import MAX_ROUNDS as COUNCIL_MAX_ROUNDS
 from single_call import run_single
 from logger import _new_call_id, log_call, write_full_dump
 from sandbox import SandboxError, read_files_with_limit, resolve_and_validate
@@ -222,6 +223,7 @@ async def _do_council_ask_async(
     rounds: int = 1,
     web_search: bool = False,
     models: list[str] | None = None,
+    context_in_stage2: bool = True,
 ) -> str:
     """Validate paths, read files, run council, log, return markdown brief.
 
@@ -262,6 +264,7 @@ async def _do_council_ask_async(
             rounds=rounds,
             web_search=web_search,
             members=members,
+            context_in_stage2=context_in_stage2,
         )
     except SandboxError as e:
         latency_ms = int((time.monotonic() - start) * 1000)
@@ -355,13 +358,14 @@ async def council_ask(
     web_search: bool = False,
     models: list[str] | None = None,
     models_preset: str | None = None,
+    context_in_stage2: bool = True,
 ) -> str:
     """Спросить council по методу Karpathy: independent answers → anonymized
     peer-ranking → optional stage 3 synthesis. Synthesis off by default —
     пусть Claude в сессии делает финальный синтез с полным контекстом.
 
-    По умолчанию совет = 6 моделей (GLM, Kimi, DeepSeek-Pro, Qwen, MiniMax,
-    Gemini). Через `models=[...]` можно вызвать подмножество — минимум 2
+    По умолчанию совет = 7 моделей (GLM, Kimi, DeepSeek-Pro, Qwen, MiniMax,
+    Gemini, Codex). Через `models=[...]` можно вызвать подмножество — минимум 2
     модели. Для одной модели используй `model_ask`.
 
     Используй когда: архитектурное решение, спорный технический вопрос, важный
@@ -389,7 +393,7 @@ async def council_ask(
     models = _resolve_models_arg(models, models_preset)
     return await _do_council_ask_async(
         question, context_paths or [], max_response_tokens, synthesis, rounds,
-        web_search, models,
+        web_search, models, context_in_stage2,
     )
 
 
@@ -460,6 +464,7 @@ async def _run_job(
     rounds: int,
     web_search: bool,
     members: list[dict],
+    context_in_stage2: bool = True,
 ) -> None:
     """Background entry point — runs the council and stores the result on state."""
     start = time.monotonic()
@@ -487,6 +492,7 @@ async def _run_job(
                 web_search=web_search,
                 members=members,
                 on_progress=on_progress,
+                context_in_stage2=context_in_stage2,
             )
         except asyncio.CancelledError:
             # cancel_job intentionally leaves phase alone now (it used to set
@@ -552,6 +558,29 @@ async def _run_job(
             prompt_size_bytes=prompt_size, total_latency_ms=latency_ms,
             status="ok", log_dump=log_dump_rel,
         )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        # Catch-all so an unexpected error never leaves the job stuck in a
+        # non-terminal phase forever, holding one of the MAX_ACTIVE_JOBS slots.
+        # Reachable via e.g. a context file deleted between validation and read
+        # (FileNotFoundError), or write_full_dump hitting OSError after the
+        # council already succeeded. CancelledError is re-raised above so cancel
+        # semantics (handled inside the inner try) are preserved.
+        if state.phase not in job_state.TERMINAL_PHASES:
+            state.error = state.error or f"{type(e).__name__}: {e}"
+            job_state.mark_phase(state, "error")
+            try:
+                on_progress("result_ready", {"status": "error", "error": state.error})
+            except Exception:
+                pass
+            latency_ms = int((time.monotonic() - start) * 1000)
+            log_call(
+                call_id=call_id, members_total=len(members),
+                members_ok_stage1=0, members_ok_stage2=0,
+                prompt_size_bytes=prompt_size, total_latency_ms=latency_ms,
+                status=f"error: {type(e).__name__} — {e}", log_dump=None,
+            )
     finally:
         # Always close the event log so the tail -F consumer sees EOF cleanly.
         event_log.close_writer(state.job_id)
@@ -567,6 +596,7 @@ async def council_ask_async(
     web_search: bool = False,
     models: list[str] | None = None,
     models_preset: str | None = None,
+    context_in_stage2: bool = True,
 ) -> dict:
     """Start a council deliberation in the background and return a job_id
     immediately (within ~50ms). Poll progress with `council_status(job_id)`
@@ -580,7 +610,7 @@ async def council_ask_async(
     where surviving members rewrite their answers after seeing peer critique.
     Each extra round adds 2-8 minutes of wall-time.
 
-    `models` — list[str] | None. Subset of CATALOG ids (≥2). None → default 6.
+    `models` — list[str] | None. Subset of CATALOG ids (≥2). None → default 7.
     `models_preset` — str | None. "best" | "balanced" | "cheap" instead of a
         hand-listed `models` (mutually exclusive with it).
     """
@@ -591,6 +621,12 @@ async def council_ask_async(
             "council_ask_async requires at least 2 distinct models; "
             "use model_ask for single-model"
         )
+    # Validate rounds BEFORE create_job. run_council raises ValueError on a bad
+    # rounds value; if that fired inside the background task it would leave the
+    # job stuck non-terminal (the catch-all now also guards this, but failing
+    # fast here gives the caller a clean error instead of a dead job_id).
+    if not (1 <= rounds <= COUNCIL_MAX_ROUNDS):
+        raise RuntimeError(f"rounds must be in [1, {COUNCIL_MAX_ROUNDS}], got {rounds}")
     members = resolve_members(models)
 
     state = await job_state.create_job(
@@ -601,7 +637,7 @@ async def council_ask_async(
     task = asyncio.create_task(
         _run_job(
             state, question, context_paths or [], max_response_tokens,
-            synthesis, rounds, web_search, members,
+            synthesis, rounds, web_search, members, context_in_stage2,
         )
     )
     job_state.attach_task(state, task)
@@ -778,14 +814,21 @@ async def model_ask(
         cfg = resolve_member(model_id)
         max_tokens = _clamp_tokens(max_response_tokens)
 
-        ctx_files: list[tuple[Path, str]] = []
-        ex_files: list[tuple[Path, str]] = []
-        if context_paths:
-            validated = resolve_and_validate(context_paths)
-            ctx_files = read_files_with_limit(validated)
-        if example_paths:
-            validated = resolve_and_validate(example_paths)
-            ex_files = read_files_with_limit(validated)
+        # Enforce the 50-file / 500 KB sandbox limit across context + example
+        # COMBINED, not per-list (reading each list independently doubled the
+        # documented budget). resolve_and_validate caps count per call, so add
+        # an explicit combined count check, then read both lists through one
+        # byte-budgeted pass and split the result back by count.
+        validated_ctx = resolve_and_validate(context_paths) if context_paths else []
+        validated_ex = resolve_and_validate(example_paths) if example_paths else []
+        if len(validated_ctx) + len(validated_ex) > sandbox.MAX_FILE_COUNT:
+            raise SandboxError(
+                f"file count limit exceeded: "
+                f"{len(validated_ctx) + len(validated_ex)} > {sandbox.MAX_FILE_COUNT}"
+            )
+        all_files = read_files_with_limit(validated_ctx + validated_ex)
+        ctx_files = all_files[: len(validated_ctx)]
+        ex_files = all_files[len(validated_ctx):]
 
         files_section = _build_files_sections(ctx_files, ex_files)
         full_prompt_parts: list[str] = []
@@ -807,7 +850,7 @@ async def model_ask(
             call_id=call_id, members_total=1,
             members_ok_stage1=0, members_ok_stage2=0,
             prompt_size_bytes=prompt_size, total_latency_ms=latency_ms,
-            status=f"error: sandbox — {e}", log_dump=None,
+            status=f"error: sandbox — {e}", log_dump=None, tool="model_ask",
         )
         raise RuntimeError(f"sandbox: {e}") from e
     except RuntimeError as e:
@@ -816,7 +859,7 @@ async def model_ask(
             call_id=call_id, members_total=1,
             members_ok_stage1=0, members_ok_stage2=0,
             prompt_size_bytes=prompt_size, total_latency_ms=latency_ms,
-            status=f"error: {e}", log_dump=None,
+            status=f"error: {e}", log_dump=None, tool="model_ask",
         )
         raise
 
@@ -825,7 +868,7 @@ async def model_ask(
         call_id=call_id, members_total=1,
         members_ok_stage1=1, members_ok_stage2=0,
         prompt_size_bytes=prompt_size, total_latency_ms=latency_ms,
-        status="ok", log_dump=None,
+        status="ok", log_dump=None, tool="model_ask",
     )
     return answer
 
@@ -839,7 +882,7 @@ from dialogue.debate import run_debate
 from dialogue.panel import run_panel
 from dialogue.socratic import run_socratic
 from dialogue.render import format_dialogue_markdown
-from dialogue.engine import write_dump, _run_turn
+from dialogue.engine import write_dump
 
 DIALOGUE_DUMP_DIR = Path(__file__).parent / "logs" / "dialogues"
 DIALOGUE_ROUNDS_MAX = 20
@@ -875,6 +918,28 @@ async def _build_files_section_or_none(context_paths: list[str] | None) -> str |
     return _build_files_section(files) or None
 
 
+async def _dialogue_runner_guard(state, runner_coro_factory) -> None:
+    """Run a dialogue runner, owning the terminal-phase transitions. Shared by
+    the 3 starter tools and dialogue_continue so cancel/error handling and the
+    error-path dump live in exactly one place (they used to be copy-pasted)."""
+    try:
+        await runner_coro_factory(state)
+    except asyncio.CancelledError:
+        # cancel_session no longer flips phase eagerly — we own the transition
+        # here so a near-done task isn't overwritten.
+        dialogue_state.mark_phase(state, "cancelled")
+        raise
+    except Exception as e:
+        state.error = f"{type(e).__name__}: {e}"
+        dialogue_state.mark_phase(state, "error")
+        try:
+            state.dump_path = str(
+                await asyncio.to_thread(write_dump, state, base_dir=DIALOGUE_DUMP_DIR)
+            )
+        except Exception:
+            pass
+
+
 async def _start_dialogue_session(
     *,
     mode: str,
@@ -896,23 +961,7 @@ async def _start_dialogue_session(
     state.participants = participants
     state.moderator = moderator
 
-    async def _runner_with_error_capture():
-        try:
-            await runner_coro_factory(state)
-        except asyncio.CancelledError:
-            # cancel_session no longer flips phase eagerly — we own the
-            # transition here so a near-done task isn't overwritten.
-            dialogue_state.mark_phase(state, "cancelled")
-            raise
-        except Exception as e:
-            state.error = f"{type(e).__name__}: {e}"
-            dialogue_state.mark_phase(state, "error")
-            try:
-                state.dump_path = str(write_dump(state, base_dir=DIALOGUE_DUMP_DIR))
-            except Exception:
-                pass
-
-    task = asyncio.create_task(_runner_with_error_capture())
+    task = asyncio.create_task(_dialogue_runner_guard(state, runner_coro_factory))
     dialogue_state.attach_task(state, task)
 
     return {
@@ -958,6 +1007,8 @@ async def model_debate(
     """
     rounds = _validate_rounds(rounds)
     ids = participants or DEFAULT_DEBATE_PARTICIPANTS
+    if len(set(ids)) != len(ids):
+        raise RuntimeError(f"model_debate participants must be distinct, got duplicates: {ids}")
     if len(set(ids)) < DEFAULT_DEBATE_MIN_PARTICIPANTS:
         raise RuntimeError(
             f"model_debate requires at least {DEFAULT_DEBATE_MIN_PARTICIPANTS} distinct participants, got {ids}"
@@ -1013,6 +1064,8 @@ async def model_panel(
     """
     rounds = _validate_rounds(rounds)
     ids = participants or DEFAULT_PANEL_PARTICIPANTS
+    if len(set(ids)) != len(ids):
+        raise RuntimeError(f"model_panel participants must be distinct, got duplicates: {ids}")
     if len(set(ids)) < DEFAULT_PANEL_MIN_PARTICIPANTS:
         raise RuntimeError(
             f"model_panel requires at least {DEFAULT_PANEL_MIN_PARTICIPANTS} distinct participants, got {ids}"
@@ -1175,23 +1228,27 @@ async def dialogue_continue(
     directive: str,
     rounds: int = 3,
 ) -> dict:
-    """Продолжить done-сессию ещё N раундов с user-directive.
+    """Продолжить завершённую или прерванную сессию ещё N раундов с user-directive.
 
     Directive вшивается в историю как entry с phase='directive' от модератора,
-    участники видят её в DIALOGUE HISTORY следующего раунда.
+    участники видят её в DIALOGUE HISTORY следующего раунда. Под капотом
+    переиспользуются те же оркестраторы (run_debate/run_panel/run_socratic) с
+    resume=True — отдельной копии round-loop'ов больше нет.
 
     Errors:
       - unknown session_id
-      - session not in phase='done' (must finish initial run first)
+      - session not in phase 'done'/'interrupted' (finish/cancel the run first)
       - total_rounds + rounds > DIALOGUE_ROUNDS_MAX
     """
     state = await dialogue_state.get_session(session_id)
     if state is None:
         raise RuntimeError(f"unknown session_id: {session_id}")
-    if state.phase != "done":
+    # 'interrupted' = a run that died on a server restart; its full history and
+    # params were persisted, so it can be resumed just like a finished one.
+    if state.phase not in ("done", "interrupted"):
         raise RuntimeError(
-            f"dialogue_continue requires phase='done', got '{state.phase}' "
-            "(cancel/wait the current run first)"
+            f"dialogue_continue requires phase 'done' or 'interrupted', got "
+            f"'{state.phase}' (cancel/wait the current run first)"
         )
     new_total = state.total_rounds + rounds
     if new_total > DIALOGUE_ROUNDS_MAX:
@@ -1201,6 +1258,16 @@ async def dialogue_continue(
     if rounds < 1:
         raise RuntimeError(f"rounds must be >= 1, got {rounds}")
 
+    # Pre-flight resolves that can raise (a model removed from CATALOG, a context
+    # file deleted/blocked) run BEFORE any state mutation, so a failure can't
+    # leave a half-mutated zombie session stuck non-terminal forever.
+    part_cfgs = [_resolve_engine_cfg(p["id"]) for p in state.participants]
+    mod_cfg = _resolve_engine_cfg(state.moderator["id"]) if state.moderator else None
+    files_section = await _build_files_section_or_none(state.context_paths or None)
+    web_search = state.web_search
+    max_tokens = state.max_tokens
+
+    # All pre-flight passed — now mutate.
     mod_id = (state.moderator or {}).get("id", "moderator")
     state.history.append({
         "round": state.current_round,
@@ -1210,130 +1277,42 @@ async def dialogue_continue(
         "latency_ms": 0,
         "status": "ok",
     })
-
     state.total_rounds = new_total
     state.error = None
+    # Reset so dialogue_status' elapsed_ms tracks the continuation, not a value
+    # frozen at the first run's duration.
+    state.finished_at = None
     dialogue_state.mark_phase(state, "starting")
-
-    part_cfgs = [_resolve_engine_cfg(p["id"]) for p in state.participants]
-    mod_cfg = _resolve_engine_cfg(state.moderator["id"]) if state.moderator else None
-
-    # Reuse the parameters the session was originally created with so that
-    # continue doesn't silently degrade web_search / max_tokens / context.
-    web_search = state.web_search
-    max_tokens = state.max_tokens
-    files_section = await _build_files_section_or_none(state.context_paths or None)
 
     if state.mode == "debate":
         async def runner(s):
-            from dialogue.engine import run_dialogue
-            from dialogue.prompts import render_summary_prompt
-            role_descriptors = {
-                p["id"]: f"You are participant {p['id']}. Defend this position: \"{p['position']}\""
-                for p in s.participants
-            }
-            await run_dialogue(
-                state=s, topic=s.question, role_descriptors=role_descriptors,
-                max_tokens=max_tokens, web_search=web_search, files_section=files_section,
-                do_critique=True, per_round_hook=None,
-                start_round=s.current_round + 1,
+            await run_debate(
+                state=s, question=s.question, participant_cfgs=part_cfgs,
+                moderator_cfg=mod_cfg, rounds=s.total_rounds, max_tokens=max_tokens,
+                web_search=web_search, files_section=files_section, resume=True,
             )
-            dialogue_state.mark_phase(s, "summarizing")
-            prompt = render_summary_prompt(topic=s.question, history=s.history, mode="debate")
-            r = await _run_turn(cfg=mod_cfg, prompt=prompt, max_tokens=max_tokens, web_search=False)
-            s.history.append({
-                "round": s.total_rounds, "phase": "summary", "id": mod_cfg["id"],
-                "text": r.text if r.status == "ok" else f"[summary failed: {r.error}]",
-                "latency_ms": r.latency_ms, "status": r.status,
-            })
-            s.result_markdown = format_dialogue_markdown(s, s.question)
-            s.dump_path = str(write_dump(s, base_dir=DIALOGUE_DUMP_DIR))
-            dialogue_state.mark_phase(s, "done")
-
     elif state.mode == "panel":
         async def runner(s):
-            from dialogue.panel import (
-                devils_advocate_for_round, run_diversity_check, _maybe_reprompt,
-                DEVILS_ADVOCATE_RULE,
+            await run_panel(
+                state=s, question=s.question, participant_cfgs=part_cfgs,
+                monitor_cfg=mod_cfg, rounds=s.total_rounds, max_tokens=max_tokens,
+                web_search=web_search, files_section=files_section, roles=None,
+                diversity_monitor=s.diversity_monitor,
+                diversity_threshold=s.diversity_threshold,
+                devils_advocate_rotation=s.devils_advocate_rotation, resume=True,
             )
-            from dialogue.engine import run_round
-            from dialogue.prompts import render_summary_prompt
-            role_descriptors = {
-                p["id"]: (
-                    f"You are participant {p['id']} playing the role: {p['role']}. Stay in character."
-                    if p.get("role") else
-                    f"You are participant {p['id']} in a multi-model panel discussion."
-                )
-                for p in s.participants
-            }
-            start = s.current_round + 1
-            for round_n in range(start, s.total_rounds + 1):
-                rules = None
-                if s.devils_advocate_rotation:
-                    da_id = devils_advocate_for_round(s.participants, round_n)
-                    rules = {da_id: DEVILS_ADVOCATE_RULE}
-                await run_round(
-                    state=s, round_n=round_n, topic=s.question,
-                    role_descriptors=role_descriptors, max_tokens=max_tokens,
-                    web_search=web_search, anti_agreement_rules=rules,
-                    files_section=files_section, do_critique=True,
-                )
-                if s.devils_advocate_rotation:
-                    s.devils_advocates.append(da_id)
-                if s.diversity_monitor:
-                    responses_this_round = {
-                        h["id"]: h["text"] for h in s.history
-                        if h["round"] == round_n and h["phase"] == "response" and h.get("status") == "ok"
-                    }
-                    score, agreers = await run_diversity_check(monitor_cfg=mod_cfg, responses=responses_this_round)
-                    s.diversity_scores.append(score)
-                    await _maybe_reprompt(
-                        state=s, round_n=round_n, participant_cfgs=part_cfgs,
-                        score=score, agreers=agreers, threshold=s.diversity_threshold,
-                        topic=s.question,
-                        max_tokens=max_tokens, files_section=files_section,
-                    )
-            dialogue_state.mark_phase(s, "summarizing")
-            prompt = render_summary_prompt(topic=s.question, history=s.history, mode="panel")
-            r = await _run_turn(cfg=mod_cfg, prompt=prompt, max_tokens=max_tokens, web_search=False)
-            s.history.append({
-                "round": s.total_rounds, "phase": "summary", "id": mod_cfg["id"],
-                "text": r.text if r.status == "ok" else f"[summary failed: {r.error}]",
-                "latency_ms": r.latency_ms, "status": r.status,
-            })
-            s.result_markdown = format_dialogue_markdown(s, s.question)
-            s.dump_path = str(write_dump(s, base_dir=DIALOGUE_DUMP_DIR))
-            dialogue_state.mark_phase(s, "done")
-
     elif state.mode == "socratic":
         async def runner(s):
-            from dialogue.socratic import run_socratic
-            q_cfg = part_cfgs[0]
-            r_cfg = part_cfgs[1]
             await run_socratic(
-                state=s, topic=s.question, questioner_cfg=q_cfg,
-                respondent_cfg=r_cfg, moderator_cfg=mod_cfg,
+                state=s, topic=s.question, questioner_cfg=part_cfgs[0],
+                respondent_cfg=part_cfgs[1], moderator_cfg=mod_cfg,
                 rounds=s.total_rounds, max_tokens=max_tokens, web_search=web_search,
-                files_section=files_section,
+                files_section=files_section, resume=True,
             )
     else:
         raise RuntimeError(f"unknown mode {state.mode!r}")
 
-    async def _runner_with_error_capture():
-        try:
-            await runner(state)
-        except asyncio.CancelledError:
-            dialogue_state.mark_phase(state, "cancelled")
-            raise
-        except Exception as e:
-            state.error = f"{type(e).__name__}: {e}"
-            dialogue_state.mark_phase(state, "error")
-            try:
-                state.dump_path = str(write_dump(state, base_dir=DIALOGUE_DUMP_DIR))
-            except Exception:
-                pass
-
-    task = asyncio.create_task(_runner_with_error_capture())
+    task = asyncio.create_task(_dialogue_runner_guard(state, runner))
     dialogue_state.attach_task(state, task)
     return {
         "session_id": state.session_id,
@@ -1358,13 +1337,27 @@ def _warn_if_context_roots_unset() -> None:
         )
 
 
-if __name__ == "__main__":
+def _run_startup_recovery() -> None:
+    """Warn about an unset context-roots allow-list and reload persisted job /
+    dialogue snapshots, marking still-running ones 'interrupted'."""
     _warn_if_context_roots_unset()
-    _recovered = job_state.load_persisted_jobs()
-    if _recovered:
+    n_jobs = job_state.load_persisted_jobs()
+    n_dlg = dialogue_state.load_persisted_dialogues()
+    if n_jobs or n_dlg:
         print(
-            f"[mcp-council] recovered {_recovered} persisted job(s); "
-            "non-terminal ones marked 'interrupted' (partial result via council_result).",
+            f"[mcp-council] recovered {n_jobs} persisted job(s) and "
+            f"{n_dlg} dialogue session(s); non-terminal ones marked 'interrupted' "
+            "(partial result via council_result / dialogue_result).",
             file=sys.stderr,
         )
+
+
+# Run recovery for every launch path (`python server.py`, `fastmcp run server.py`,
+# `mcp dev server.py`) — not just __main__, which a non-direct launcher never
+# triggers. Skipped under pytest so importing the module for tests has no disk
+# side effects on the real logs/ directories.
+if "pytest" not in sys.modules:
+    _run_startup_recovery()
+
+if __name__ == "__main__":
     mcp.run()

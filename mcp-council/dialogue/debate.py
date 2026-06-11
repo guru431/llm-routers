@@ -15,6 +15,8 @@ import json
 import re
 from pathlib import Path
 
+import asyncio
+
 from dialogue.engine import _run_turn, run_dialogue, write_dump
 from dialogue.prompts import (
     render_position_split_prompt,
@@ -88,20 +90,27 @@ async def run_debate(
     max_tokens: int,
     web_search: bool,
     files_section: str | None,
+    resume: bool = False,
 ) -> None:
-    """Orchestrate a full debate session and mark phase=done at the end."""
-    mark_phase(state, "starting")
-    positions = await generate_positions(
-        moderator_cfg=moderator_cfg,
-        question=question,
-        n=len(participant_cfgs),
-    )
+    """Orchestrate a full debate session and mark phase=done at the end.
 
-    state.participants = [
-        {**cfg_to_participant(c), "position": p}
-        for c, p in zip(participant_cfgs, positions)
-    ]
-    state.moderator = {"id": moderator_cfg["id"], "model": moderator_cfg["model"]}
+    resume=True (dialogue_continue): participants and their moderator-assigned
+    positions already live on state — skip the position-split LLM call and
+    participant seeding, and pick up from state.current_round + 1.
+    """
+    mark_phase(state, "starting")
+    if not resume:
+        positions = await generate_positions(
+            moderator_cfg=moderator_cfg,
+            question=question,
+            n=len(participant_cfgs),
+        )
+
+        state.participants = [
+            {**cfg_to_participant(c), "position": p}
+            for c, p in zip(participant_cfgs, positions)
+        ]
+        state.moderator = {"id": moderator_cfg["id"], "model": moderator_cfg["model"]}
 
     role_descriptors = {
         p["id"]: (
@@ -120,6 +129,7 @@ async def run_debate(
         do_critique=True,
         per_round_hook=None,
         start_round=state.current_round + 1,
+        dump_dir=DUMP_DIR,
     )
 
     mark_phase(state, "summarizing")
@@ -148,4 +158,4 @@ async def run_debate(
     # phase (otherwise dumps freeze at "summarizing" and post-mortem inspection
     # makes it look like the run never finished).
     mark_phase(state, "done")
-    state.dump_path = str(write_dump(state, base_dir=DUMP_DIR))
+    state.dump_path = str(await asyncio.to_thread(write_dump, state, base_dir=DUMP_DIR))
