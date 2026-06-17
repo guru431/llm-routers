@@ -9,7 +9,7 @@
  * How per-project model selection works:
  *   In each project's .claude/settings.local.json set:
  *     "env": {
- *       "ANTHROPIC_MODEL": "minimax-m3"   // or glm-5.1, qwen3.6-plus, etc.
+ *       "ANTHROPIC_MODEL": "minimax-m3"   // or glm-5.2, qwen3.6-plus, etc.
  *     }
  *   Claude Code extension reads this and puts the model in the request body.
  *   Our router sees it and routes to opencode provider with that exact model id.
@@ -24,8 +24,8 @@
 // SOURCE OF TRUTH: config.example.json's Providers[opencode].models. This list is
 // a hand-maintained copy of it — keep both in sync when models change (no build step).
 const OPENCODE_MODELS_FALLBACK = new Set([
-  'glm-5.1', 'glm-5',
-  'kimi-k2.5', 'kimi-k2.6',
+  'glm-5.2', 'glm-5',
+  'kimi-k2.5', 'kimi-k2.7-code',
   'mimo-v2-pro', 'mimo-v2-omni', 'mimo-v2.5-pro', 'mimo-v2.5',
   'minimax-m3', 'minimax-m2.5',
   'qwen3.6-plus', 'qwen3.5-plus', 'qwen3.7-plus',

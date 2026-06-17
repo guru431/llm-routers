@@ -7,8 +7,10 @@
   "models": [
     {"id": "ocg-minimax-m2.7",    "provider": "opencode_go", "endpoint": "https://opencode.ai/zen/go/v1", "model": "minimax-m2.7",     "auth_env": "OPENCODE_GO_KEY"},
     {"id": "ocg-minimax-m2.5",    "provider": "opencode_go", "endpoint": "https://opencode.ai/zen/go/v1", "model": "minimax-m2.5",     "auth_env": "OPENCODE_GO_KEY"},
+    {"id": "ocg-kimi-k2.7-code",  "provider": "opencode_go", "endpoint": "https://opencode.ai/zen/go/v1", "model": "kimi-k2.7-code",   "auth_env": "OPENCODE_GO_KEY"},
     {"id": "ocg-kimi-k2.6",       "provider": "opencode_go", "endpoint": "https://opencode.ai/zen/go/v1", "model": "kimi-k2.6",        "auth_env": "OPENCODE_GO_KEY"},
     {"id": "ocg-kimi-k2.5",       "provider": "opencode_go", "endpoint": "https://opencode.ai/zen/go/v1", "model": "kimi-k2.5",        "auth_env": "OPENCODE_GO_KEY"},
+    {"id": "ocg-glm-5.2",         "provider": "opencode_go", "endpoint": "https://opencode.ai/zen/go/v1", "model": "glm-5.2",          "auth_env": "OPENCODE_GO_KEY"},
     {"id": "ocg-glm-5.1",         "provider": "opencode_go", "endpoint": "https://opencode.ai/zen/go/v1", "model": "glm-5.1",          "auth_env": "OPENCODE_GO_KEY"},
     {"id": "ocg-glm-5",           "provider": "opencode_go", "endpoint": "https://opencode.ai/zen/go/v1", "model": "glm-5",            "auth_env": "OPENCODE_GO_KEY"},
     {"id": "ocg-deepseek-v4-pro", "provider": "opencode_go", "endpoint": "https://opencode.ai/zen/go/v1", "model": "deepseek-v4-pro",  "auth_env": "OPENCODE_GO_KEY"},

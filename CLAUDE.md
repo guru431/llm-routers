@@ -37,8 +37,8 @@
 
 | id | model | назначение |
 |---|---|---|
-| `glm` | glm-5.1 | council member (OCG) |
-| `kimi` | kimi-k2.6 | council member (OCG) |
+| `glm` | glm-5.2 | council member (OCG) |
+| `kimi` | kimi-k2.7-code | council member (OCG) |
 | `deepseek-pro` | deepseek-v4-pro | council member (OCG) |
 | `qwen` | qwen3.6-plus | council member (OCG) |
 | `minimax` | minimax-m3 | council member (OCG) |

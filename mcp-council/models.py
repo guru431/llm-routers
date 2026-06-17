@@ -6,7 +6,7 @@ mcp-deepseek/mcp-minimax.
 
 Quirks (`extra`, `min_max_tokens`) per model are documented inline below —
 they encode provider-specific requirements (e.g. GLM needs thinking disabled,
-Kimi needs reasoning_effort "none") to avoid truncated/garbage output.
+Kimi k2.7-code needs reasoning_effort "minimal") to avoid truncated/garbage output.
 
 Env key names (`env_key`) are read from the process environment; see the
 project README for how keys are provided to the MCP server.
@@ -30,7 +30,7 @@ MM = "https://api.minimaxi.chat/v1"
 CATALOG: dict[str, dict] = {
     # --- Council members (default participants of council_ask) ---
     "glm": {
-        "model": "glm-5.1",
+        "model": "glm-5.2",
         "base_url": OCG,
         "env_key": "OPENCODE_GO_KEY",
         "extra": {"thinking": {"type": "disabled"}},
@@ -39,10 +39,12 @@ CATALOG: dict[str, dict] = {
         "price_out": None,
     },
     "kimi": {
-        "model": "kimi-k2.6",
+        "model": "kimi-k2.7-code",
         "base_url": OCG,
         "env_key": "OPENCODE_GO_KEY",
-        "extra": {"reasoning_effort": "none"},
+        # k2.7-code не поддерживает reasoning_effort="none" (HTTP 400, в отличие
+        # от k2.6) — допустимы minimal|low|medium. minimal — ближайшее к none.
+        "extra": {"reasoning_effort": "minimal"},
         "min_max_tokens": 30000,
         "price_in": None,
         "price_out": None,

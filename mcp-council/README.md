@@ -12,8 +12,8 @@ MCP-сервер: Karpathy 3-stage council из 7 LLM с опционально�
 
 | id | model | provider | env_key |
 |---|---|---|---|
-| glm | glm-5.1 | OpenCode Go | `OPENCODE_GO_KEY` |
-| kimi | kimi-k2.6 | OpenCode Go | `OPENCODE_GO_KEY` |
+| glm | glm-5.2 | OpenCode Go | `OPENCODE_GO_KEY` |
+| kimi | kimi-k2.7-code | OpenCode Go | `OPENCODE_GO_KEY` |
 | deepseek-pro | deepseek-v4-pro | OpenCode Go | `OPENCODE_GO_KEY` |
 | qwen | qwen3.6-plus | OpenCode Go | `OPENCODE_GO_KEY` |
 | minimax | minimax-m3 | OpenCode Go | `OPENCODE_GO_KEY` |
