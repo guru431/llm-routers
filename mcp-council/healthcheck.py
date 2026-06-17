@@ -74,6 +74,11 @@ async def _check_one(mid: str, cfg: dict, call_fn, timeout: float) -> dict:
                 "status": "no_key", "latency_ms": None,
                 "error": f"env var {cfg['env_key']} not set"}
 
+    # A local agent-server member (e.g. codex spawning `codex exec` as a
+    # subprocess) cold-starts a reasoning model on a real POST and would almost
+    # always ReadTimeout under the 12s default — its per-model override lifts
+    # the ceiling so a healthy server isn't reported as status="timeout".
+    effective_timeout = cfg.get("healthcheck_timeout", timeout)
     start = time.monotonic()
     try:
         result = await call_fn(
@@ -83,7 +88,7 @@ async def _check_one(mid: str, cfg: dict, call_fn, timeout: float) -> dict:
             messages=_PING_MESSAGES,
             max_tokens=max(64, cfg.get("min_max_tokens", 0)),
             extra_payload=cfg.get("extra"),
-            timeout=timeout,
+            timeout=effective_timeout,
             # One attempt, no breaker side-effects: a probe must not burn the
             # retry budget (up to 3×25s+backoff) nor trip the breaker that the
             # real council path relies on.

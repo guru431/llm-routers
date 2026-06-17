@@ -154,6 +154,43 @@ async def test_run_panel_diversity_monitor_triggers_reprompt(fake_call, tmp_path
     assert state.diversity_scores == [8]
 
 
+async def test_run_panel_reprompt_only_failure_triggers_abort(fake_call, tmp_path, monkeypatch):
+    """A participant that fails ONLY on the heavy reprompt call must still trip
+    the failure-threshold abort. The pre-reprompt failure check cannot see that
+    error, so run_panel re-checks after the reprompt."""
+    monkeypatch.setattr("dialogue.panel.DUMP_DIR", tmp_path)
+    # 2 participants, 1 round. Both respond OK → monitor flags both → reprompt:
+    # a succeeds, b raises. 1/2 distinct failures == threshold(2)=1 → abort.
+    fake_call(
+        ["A1", "B1"]
+        + [json.dumps({"score": 8, "agreers": ["a", "b"], "reasoning": "saying same"})]
+        + ["A1-distinct", RuntimeError("reprompt boom")]
+    )
+
+    state = await dialogue_state.create_session(
+        mode="panel", question_preview="q", total_rounds=1,
+    )
+
+    with pytest.raises(RuntimeError):
+        await run_panel(
+            state=state,
+            question="q",
+            participant_cfgs=[_cfg("a"), _cfg("b")],
+            monitor_cfg=_cfg("deepseek-flash"),
+            rounds=1,
+            max_tokens=100,
+            web_search=False,
+            files_section=None,
+            roles=None,
+            diversity_monitor=True,
+            diversity_threshold=7,
+            devils_advocate_rotation=False,
+        )
+
+    assert state.phase == "error"
+    assert "failure threshold exceeded in round 1" in (state.error or "")
+
+
 async def test_run_panel_diversity_monitor_no_trigger_below_threshold(fake_call, tmp_path, monkeypatch):
     monkeypatch.setattr("dialogue.panel.DUMP_DIR", tmp_path)
     fake_call(

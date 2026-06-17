@@ -52,6 +52,9 @@ logging.basicConfig(
 logger = logging.getLogger("claude-agent-server")
 
 
+# NOTE: _load_dotenv, build_tools_system_prompt, parse_tool_calls and
+# extract_content are kept byte-identical with codex-agent-server/server.py
+# (no shared module on purpose) — apply any fix to both copies.
 def _load_dotenv() -> None:
     """Load KEY=VALUE pairs from a .env file next to this script into the
     environment, without overwriting variables already set. Lets the server
@@ -251,18 +254,27 @@ def run_claude(prompt: str, system_prompt: str | None = None,
         stdout, stderr = proc.communicate(input=prompt, timeout=timeout)
     except subprocess.TimeoutExpired:
         # Kill the whole tree, then reap so we don't leave a zombie/orphan.
+        # Bound both the kill and the reap so a hung taskkill/communicate can't
+        # pin the _CLAUDE_SEM slot forever (concurrency leak → eventual 429s).
         if sys.platform == "win32":
-            subprocess.run(
-                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                capture_output=True,
-                creationflags=CREATE_NO_WINDOW,
-            )
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    capture_output=True,
+                    creationflags=CREATE_NO_WINDOW,
+                    timeout=15,
+                )
+            except subprocess.TimeoutExpired:
+                proc.kill()
         else:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 proc.kill()
-        proc.communicate()
+        try:
+            proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
         raise
 
     if proc.returncode != 0:
@@ -431,6 +443,23 @@ class Handler(BaseHTTPRequestHandler):
                     header += f" id={tool_call_id}"
                 header += f"]: {content}"
                 conversation.append(("tool", header))
+            elif role == "assistant" and msg.get("tool_calls"):
+                # A pure tool-call assistant turn has empty content but carries
+                # tool_calls. Render them (with their id) into the text so the
+                # id referenced by the following tool result actually appears in
+                # the prompt — otherwise multi-turn tool loops become incoherent
+                # (result id points at a call absent from the conversation).
+                call_lines = []
+                for tc in msg["tool_calls"]:
+                    fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                    call_lines.append(
+                        f"[Called tool {fn.get('name', '')} id={tc.get('id', '')} "
+                        f"with {fn.get('arguments', '')}]"
+                    )
+                merged = "\n".join(call_lines)
+                if content:
+                    merged = content + "\n" + merged
+                conversation.append((role, merged))
             else:
                 conversation.append((role, content))
 
@@ -596,19 +625,27 @@ class Handler(BaseHTTPRequestHandler):
             line = "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
             self.wfile.write(line.encode("utf-8"))
 
-        # 1) role
-        emit({"role": "assistant"})
-        # 2) content (if any text was produced)
-        content = resp_message.get("content")
-        if content:
-            emit({"content": content})
-        # 3) tool_calls (if present) — surfaced in their own delta
-        tool_calls = resp_message.get("tool_calls")
-        if tool_calls:
-            emit({"tool_calls": tool_calls})
-        # 4) finish + 5) [DONE]
-        emit({}, finish=finish_reason)
-        self.wfile.write(b"data: [DONE]\n\n")
+        # Once the 200 + headers are sent, the response has begun. A mid-stream
+        # client disconnect makes wfile.write raise ConnectionError/BrokenPipe;
+        # swallow it here and return rather than let it bubble to _handle_chat's
+        # `except Exception`, which would log a false "claude error" and try to
+        # write a second 500 status to the already-dead socket.
+        try:
+            # 1) role
+            emit({"role": "assistant"})
+            # 2) content (if any text was produced)
+            content = resp_message.get("content")
+            if content:
+                emit({"content": content})
+            # 3) tool_calls (if present) — surfaced in their own delta
+            tool_calls = resp_message.get("tool_calls")
+            if tool_calls:
+                emit({"tool_calls": tool_calls})
+            # 4) finish + 5) [DONE]
+            emit({}, finish=finish_reason)
+            self.wfile.write(b"data: [DONE]\n\n")
+        except (ConnectionError, BrokenPipeError):
+            return
 
 
 class SingleInstanceServer(ThreadingHTTPServer):

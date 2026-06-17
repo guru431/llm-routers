@@ -85,7 +85,7 @@ def heuristic(task_id: str, text: str) -> str:
             return "✓ single line"
         return f"✗ {len(lines)} lines"
     if task_id in ("T2_yt_summary_en", "T3_yt_summary_ru"):
-        bullets = re.findall(r"^\s*[-•*]|\d+[\.)]", text, flags=re.MULTILINE)
+        bullets = re.findall(r"^\s*(?:[-•*]|\d+[.)])\s", text, flags=re.MULTILINE)
         n = len(bullets)
         return f"{n} bullets" + (" ✓" if n == 5 else " ✗")
     return ""
@@ -93,8 +93,13 @@ def heuristic(task_id: str, text: str) -> str:
 
 def main():
     models = json.loads(MODELS_JSON.read_text(encoding="utf-8"))["models"]
-    tasks = json.loads(TASKS_JSON.read_text(encoding="utf-8"))["tasks"]
+    tasks_data = json.loads(TASKS_JSON.read_text(encoding="utf-8"))
+    tasks = tasks_data["tasks"]
     task_ids = [t["id"] for t in tasks]
+    # Methodology section reports the per-request budget; derive it from
+    # _meta.max_output_tokens (the runner's source of truth), not a hardcode.
+    # Ollama uses num_predict = MAX_TOKENS * 2 in run.py.
+    max_output_tokens = tasks_data.get("_meta", {}).get("max_output_tokens", 2048)
 
     # Load all results: results[(model_id, task_id)] = record
     results: dict[tuple[str, str], dict] = {}
@@ -245,7 +250,7 @@ def main():
     lines.append("- **Total** — wall-clock полного ответа")
     lines.append("- **Quality (0-5)** — LLM-as-judge по рубрикам категории (rubric на каждую категорию см. `bench/judge.py::RUBRIC`)")
     lines.append("- **OK** — задач с непустым финальным `text` (reasoning-only ответы считаются empty)")
-    lines.append("- Параметры запросов: `temperature=0.2`, `max_tokens=2048` (Ollama: `num_predict=4096`)")
+    lines.append(f"- Параметры запросов: `temperature=0.2`, `max_tokens={max_output_tokens}` (Ollama: `num_predict={max_output_tokens * 2}`)")
     lines.append("- Запуск последовательный (не параллельный — чтобы не искажать TTFT rate-limit'ами)")
     lines.append("- Источники: `bench/run.py` (раннер), `bench/judge.py` (judge), `bench/results/*.jsonl` (сырые данные)")
     lines.append("")

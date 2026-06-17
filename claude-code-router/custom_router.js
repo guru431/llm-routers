@@ -21,6 +21,8 @@
 // Fallback list of OpenCode Go models if config isn't passed to the router.
 // Normally we derive the set from config.Providers[opencode].models (below) so
 // the two stay in sync; this hardcode is only the safety net.
+// SOURCE OF TRUTH: config.example.json's Providers[opencode].models. This list is
+// a hand-maintained copy of it — keep both in sync when models change (no build step).
 const OPENCODE_MODELS_FALLBACK = new Set([
   'glm-5.1', 'glm-5',
   'kimi-k2.5', 'kimi-k2.6',
@@ -40,8 +42,9 @@ module.exports = async function router(req, config) {
 
   // Single source of truth: the opencode provider's model list from config.json.
   // Falls back to the hardcoded set if config isn't available in this signature.
+  const configModels = config?.Providers?.find((p) => p.name === 'opencode')?.models;
   const opencodeModels = new Set(
-    config?.Providers?.find((p) => p.name === 'opencode')?.models ?? OPENCODE_MODELS_FALLBACK
+    configModels?.length ? configModels : OPENCODE_MODELS_FALLBACK
   );
 
   // Per-project override: model id matches an OpenCode Go model → route through opencode

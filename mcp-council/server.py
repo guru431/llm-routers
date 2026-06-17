@@ -73,6 +73,7 @@ def format_markdown(question: str, result: dict) -> str:
     aggregate = result["aggregate"]
     stage3 = result.get("stage3")
     notes = result["notes"]
+    rounds_detail = result.get("rounds_detail") or []
 
     # Build a global pseudonym mapping for display: stable letter per member_id,
     # in stage1 order (so reading is consistent). Stage 2 rankers used their own
@@ -107,6 +108,27 @@ def format_markdown(question: str, result: dict) -> str:
                 "_(Synthesis attempt failed; fall back to stage 1 / stage 2 materials below.)_"
             )
             lines.append("")
+
+    # Multi-round progression: the stage1/stage2/aggregate blocks below show only
+    # the FINAL round, so for rounds>=2 the early critique rounds would be visible
+    # nowhere. Render a compact per-round digest (who answered + aggregate order)
+    # before the detailed final-round materials.
+    if len(rounds_detail) > 1:
+        lines.append("## Round-by-round progression (compact)")
+        lines.append("")
+        for ri, rd in enumerate(rounds_detail, 1):
+            rd_stage1 = rd["stage1"]
+            model_by_id = {s["id"]: s["model"] for s in rd_stage1}
+            revised = [s["model"] for s in rd_stage1 if s["status"] == "ok"]
+            revised_str = ", ".join(revised) if revised else "(none)"
+            lines.append(f"- Round {ri}: answered — {revised_str}")
+            order = [
+                f"{model_by_id.get(mid, mid)} {mean:.2f}"
+                for mid, mean, _n in rd["aggregate"]
+            ]
+            if order:
+                lines.append(f"  - aggregate order: {'; '.join(order)}")
+        lines.append("")
 
     lines.append("## Stage 1: Independent answers")
     lines.append("")
@@ -244,6 +266,12 @@ async def _do_council_ask_async(
             "council_ask requires at least 2 distinct models; "
             "use model_ask for single-model"
         )
+    # Validate rounds with the same RuntimeError the async tool raises. Without
+    # this a bad rounds reaches run_council as a ValueError, which is not caught
+    # by the except (SandboxError, RuntimeError) below (no audit log, worse error
+    # than council_ask_async).
+    if not (1 <= rounds <= COUNCIL_MAX_ROUNDS):
+        raise RuntimeError(f"rounds must be in [1, {COUNCIL_MAX_ROUNDS}], got {rounds}")
     members = resolve_members(models)
 
     try:
@@ -303,6 +331,7 @@ async def _do_council_ask_async(
         "stage1": result["stage1"],
         "stage2": result["stage2"],
         "aggregate": result["aggregate"],
+        "rounds_detail": result.get("rounds_detail"),
         "stage3": result.get("stage3"),
         "notes": result["notes"],
         "usage": result.get("usage"),
@@ -334,6 +363,7 @@ def _do_council_ask(
     rounds: int = 1,
     web_search: bool = False,
     models: list[str] | None = None,
+    context_in_stage2: bool = True,
 ) -> str:
     """Sync wrapper around `_do_council_ask_async` for tests and CLI use.
 
@@ -343,7 +373,7 @@ def _do_council_ask(
     return asyncio.run(
         _do_council_ask_async(
             question, context_paths, max_response_tokens, synthesis, rounds,
-            web_search, models,
+            web_search, models, context_in_stage2,
         )
     )
 
@@ -531,7 +561,8 @@ async def _run_job(
         dump = {
             "call_id": call_id, "question": question, "context_paths": list(context_paths),
             "stage1": result["stage1"], "stage2": result["stage2"],
-            "aggregate": result["aggregate"], "stage3": result.get("stage3"),
+            "aggregate": result["aggregate"], "rounds_detail": result.get("rounds_detail"),
+            "stage3": result.get("stage3"),
             "notes": result["notes"],
             "usage": result.get("usage"), "summary": result.get("summary"),
         }
@@ -1267,7 +1298,18 @@ async def dialogue_continue(
     web_search = state.web_search
     max_tokens = state.max_tokens
 
+    # create_session is the only gate for MAX_ACTIVE_SESSIONS; reactivating a
+    # terminal session here would bypass it. Re-check the cap (same RuntimeError)
+    # before any mutation so a failure can't leave a half-mutated session.
+    await dialogue_state.reserve_active_slot()
+
     # All pre-flight passed — now mutate.
+    # Strip terminal artifacts before resuming: a phase=='summary' entry has no
+    # branch in format_history_section, so it would render as a plain participant
+    # reply in the next round's history and leak the verdict to every model,
+    # biasing the continuation toward the stated conclusion (breaks
+    # anti-convergence). The renderer recreates the summary from summary_entries.
+    state.history = [h for h in state.history if h["phase"] != "summary"]
     mod_id = (state.moderator or {}).get("id", "moderator")
     state.history.append({
         "round": state.current_round,

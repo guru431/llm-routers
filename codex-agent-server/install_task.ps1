@@ -121,7 +121,7 @@ $cred = Get-Credential -Credential $user
 Register-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName `
     -Action $action -Trigger $trigger -Settings $settings `
     -User $user -Password $cred.GetNetworkCredential().Password `
-    -RunLevel Highest -Force | Out-Null
+    -Force | Out-Null
 $cred = $null
 [System.GC]::Collect()
 

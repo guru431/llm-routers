@@ -72,6 +72,24 @@ def test_unknown_id_raises():
         _run(healthcheck_models(["nope"], call_fn=fake))
 
 
+def test_per_model_healthcheck_timeout_overrides_default(monkeypatch):
+    # codex (local agent-server) carries healthcheck_timeout in CATALOG; glm does
+    # not. The catalog override must win over the passed default for codex while
+    # glm still uses the default.
+    monkeypatch.setenv(CATALOG["codex"]["env_key"], "k")
+    monkeypatch.setenv(CATALOG["glm"]["env_key"], "k")
+    assert "healthcheck_timeout" not in CATALOG["glm"]
+    seen: dict[str, float] = {}
+
+    async def fake(**kwargs):
+        seen[kwargs["model"]] = kwargs["timeout"]
+        return {"content": "pong", "tokens_out": 1}
+
+    _run(healthcheck_models(["codex", "glm"], call_fn=fake, timeout=12.0))
+    assert seen[CATALOG["codex"]["model"]] == CATALOG["codex"]["healthcheck_timeout"]
+    assert seen[CATALOG["glm"]["model"]] == 12.0
+
+
 # --- helper ---
 import asyncio
 

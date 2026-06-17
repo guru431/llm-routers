@@ -40,13 +40,19 @@ def _run(cmd: list[str], cwd: Path) -> int:
 
 
 def run_pytest(extra: list[str]) -> list[str]:
+    # rc 5 == "no tests collected". Tolerate it only when a -k/-m filter is in
+    # effect (extra args present) — then a suite legitimately matching nothing is
+    # a skip. For an UNFILTERED run, rc 5 means the suite lost all its tests
+    # (file deleted/renamed) and MUST fail loudly instead of reporting success.
+    filtered = bool(extra)
+    ok_codes = (0, 5) if filtered else (0,)
     failed: list[str] = []
     for suite in SUITES:
         print(f"\n=== pytest: {suite} ===", flush=True)
         rc = _run([sys.executable, "-m", "pytest", "-q", *extra], ROOT / suite)
-        # rc 5 == "no tests collected" (e.g. a -k filter matched only one suite).
-        # Treat it as a skip, not a failure.
-        if rc not in (0, 5):
+        if rc == 5 and not filtered:
+            print(f"!!! {suite}: no tests collected (rc 5) on an unfiltered run", flush=True)
+        if rc not in ok_codes:
             failed.append(f"pytest:{suite}")
     return failed
 

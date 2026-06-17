@@ -212,7 +212,8 @@ async def call_openai_compat(
             )
 
         usage = data.get("usage", {}) or {}
-        circuit_breaker.record_success(host)
+        if record_breaker:
+            circuit_breaker.record_success(host)
         return {
             "content": _strip_think(content) if content else None,
             "tool_calls": tool_calls,

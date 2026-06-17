@@ -25,11 +25,10 @@ import httpx
 
 EXA_API_URL = "https://api.exa.ai/search"
 EXA_TIMEOUT_SECONDS = 30.0
-# Per-call budget: stops a runaway loop from costing too much. Exa charges
-# ~$0.005-0.01 per request at the volume we use; this is a guardrail, not a
-# strict accountancy.
-DEFAULT_NUM_RESULTS = 5
-MAX_NUM_RESULTS = 10
+# Fixed result count per search. The tool spec exposes only `query`, so callers
+# never tune this; keeping it constant avoids a runaway loop costing too much
+# (Exa charges ~$0.005-0.01 per request at the volume we use).
+NUM_RESULTS = 5
 
 
 class WebSearchError(Exception):
@@ -40,7 +39,6 @@ class WebSearchError(Exception):
 
 async def web_search_exa(
     query: str,
-    num_results: int = DEFAULT_NUM_RESULTS,
     *,
     api_key: str | None = None,
     timeout: float = EXA_TIMEOUT_SECONDS,
@@ -66,14 +64,13 @@ async def web_search_exa(
     if not query or not query.strip():
         raise WebSearchError("empty query")
 
-    num_results = max(1, min(num_results, MAX_NUM_RESULTS))
     key = api_key or os.environ.get("EXA_API_KEY")
     if not key:
         raise WebSearchError("EXA_API_KEY not set")
 
     payload = {
         "query": query.strip(),
-        "numResults": num_results,
+        "numResults": NUM_RESULTS,
         "contents": {
             # ~800 chars of text is enough to anchor the LLM without bloating
             # the context window.

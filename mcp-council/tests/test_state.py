@@ -161,3 +161,47 @@ async def test_load_persisted_skips_in_memory_duplicates():
     loaded = state.load_persisted_jobs()
     assert loaded == 0
     assert (await state.get_job(s.job_id)).phase == "stage1"
+
+
+def _read_persisted(job_id: str) -> dict:
+    import json
+    return json.loads((state._persist_dir() / f"{job_id}.json").read_text(encoding="utf-8"))
+
+
+async def test_member_persists_coalesced_within_interval():
+    # Rapid member updates within the min-interval write disk at most once; a
+    # later forced flush (phase transition) still captures the latest progress.
+    s = await state.create_job(question_preview="q", synthesis=False, rounds=1)
+    state.mark_phase(s, "stage1")  # forced flush; does not arm member throttle
+    # First member write goes through (no prior member persist).
+    state.update_member_stage1(
+        s, id="glm", model="glm-5.1", status="ok", error=None, latency_ms=1000
+    )
+    on_disk_ids = {m["id"] for m in _read_persisted(s.job_id)["stage1"]}
+    assert on_disk_ids == {"glm"}
+    # Second member arrives immediately → coalesced (skipped), file unchanged.
+    state.update_member_stage1(
+        s, id="kimi", model="kimi-k2.6", status="ok", error=None, latency_ms=1200
+    )
+    on_disk_ids = {m["id"] for m in _read_persisted(s.job_id)["stage1"]}
+    assert on_disk_ids == {"glm"}
+    # A phase transition forces a flush → coalesced-away member now on disk.
+    state.mark_phase(s, "stage2")
+    disk = _read_persisted(s.job_id)
+    assert disk["phase"] == "stage2"
+    assert {m["id"] for m in disk["stage1"]} == {"glm", "kimi"}
+
+
+async def test_terminal_state_always_flushed():
+    # The final (terminal) state must always be persisted, never coalesced away.
+    s = await state.create_job(question_preview="q", synthesis=False, rounds=1)
+    state.mark_phase(s, "stage1")
+    state.update_member_stage1(
+        s, id="glm", model="glm-5.1", status="ok", error=None, latency_ms=1000
+    )
+    # Immediately mark done (within the member interval) — forced flush wins.
+    s.result_markdown = "# final"
+    state.mark_phase(s, "done")
+    disk = _read_persisted(s.job_id)
+    assert disk["phase"] == "done"
+    assert disk["result_markdown"] == "# final"

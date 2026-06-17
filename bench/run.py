@@ -419,7 +419,10 @@ def main():
             seen.add(m["provider"])
             smoke_models.append(m)
         models = smoke_models
-        tasks = [t for t in tasks if t["id"] == "T1_ru_edit_short"]
+        # Use the requested task under smoke; otherwise the general --task filter
+        # below would intersect with a hardcoded T1 and yield zero cells.
+        smoke_task_id = args.task or "T1_ru_edit_short"
+        tasks = [t for t in tasks if t["id"] == smoke_task_id]
         sys.stderr.write(f"SMOKE: {len(models)} models x {len(tasks)} task\n")
 
     if args.providers:

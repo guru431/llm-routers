@@ -77,7 +77,7 @@ python server.py --host 0.0.0.0     # открыть на LAN (токен обя
 | `CODEX_AGENT_TOKEN` | read-only (чат, tools-эмуляция) | да — без него сервер не стартует (exit 2) |
 | `CODEX_AGENT_AGENT_TOKEN` | дополнительно workspace-write (запись файлов / shell) | нет — если не задан, workspace-write недоступен (403) |
 
-workspace-write-запрос должен предъявить bearer, совпадающий **и** с валидным read-токеном (проходит общий `Authorization`-чек), **и** с `CODEX_AGENT_AGENT_TOKEN` (timing-safe сравнение). Смысл разделения: утечка read-only копии токена (она размазана по конфигам council/CCR/code-review) **не** даёт агентного доступа на запись. Для этого значения токенов должны **отличаться**.
+Транспортный `Authorization`-чек пропускает **любой** из двух токенов (read-only **или** agent, timing-safe), поэтому read-token открывает только read-only, а agent-token — и read-only, и workspace-write. workspace-write-запрос должен предъявить bearer, совпадающий с `CODEX_AGENT_AGENT_TOKEN` (это единственный write-гейт). Смысл разделения: утечка read-only копии токена (она размазана по конфигам council/CCR/code-review) **не** даёт агентного доступа на запись. Для этого значения токенов должны **отличаться**.
 
 Если `CODEX_AGENT_AGENT_TOKEN` не задан — любой workspace-write-запрос (`*-agent` модель или `sandbox: "workspace-write"`) получает `403 workspace-write requires CODEX_AGENT_AGENT_TOKEN`, а read-only продолжает работать по старому токену (backward-compatible).
 

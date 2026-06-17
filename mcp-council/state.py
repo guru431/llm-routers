@@ -39,18 +39,38 @@ TERMINAL_PHASES = frozenset({"done", "error", "cancelled", "interrupted"})
 
 # Best-effort on-disk persistence so an MCP-server restart can surface jobs that
 # were mid-flight ("interrupted, partial result available") instead of silently
-# losing them. One JSON snapshot per job; written on every state change. Override
-# the location with COUNCIL_JOBS_DIR (read at call time so tests can isolate it).
+# losing them. One JSON snapshot per job; written on every phase transition and
+# (coalesced) on member progress. Override the location with COUNCIL_JOBS_DIR
+# (read at call time so tests can isolate it).
 _DEFAULT_PERSIST_DIR = Path(__file__).parent / "logs" / "jobs"
+
+# Per-member progress fires ~50 times per 7-member 3-round run; on a network jobs
+# disk every tmp+replace is a real round-trip. A recovery snapshot only needs to
+# be approximately current, so member persists are coalesced to at most one write
+# per this interval. Phase transitions and terminal/cancel persists always flush
+# (force=True) so the final state is never lost — and since a write always dumps
+# the full current snapshot, the next forced flush captures any coalesced-away
+# member progress. _last_member_persist_at tracks only coalesced (member) writes
+# per job_id, so a mandatory phase flush doesn't suppress the next member update;
+# entries are dropped when the job is GC'd / its file is unlinked.
+_MEMBER_PERSIST_MIN_INTERVAL = 2.0
+_last_member_persist_at: dict[str, float] = {}
 
 
 def _persist_dir() -> Path:
     return Path(os.environ.get("COUNCIL_JOBS_DIR") or _DEFAULT_PERSIST_DIR)
 
 
-def _persist(state: "JobState") -> None:
+def _persist(state: "JobState", *, force: bool = True) -> None:
     """Write a job's current snapshot to disk. Best-effort — never raises into
-    a running council."""
+    a running council. With force=False the member write is coalesced: skipped if
+    the last member persist for this job was less than _MEMBER_PERSIST_MIN_INTERVAL
+    ago (the latest progress is then picked up by the next forced flush)."""
+    if not force:
+        now = time.time()
+        last = _last_member_persist_at.get(state.job_id)
+        if last is not None and now - last < _MEMBER_PERSIST_MIN_INTERVAL:
+            return
     try:
         d = _persist_dir()
         d.mkdir(parents=True, exist_ok=True)
@@ -59,11 +79,14 @@ def _persist(state: "JobState") -> None:
         tmp = d / f"{state.job_id}.json.tmp"
         tmp.write_text(json.dumps(payload), encoding="utf-8")
         tmp.replace(d / f"{state.job_id}.json")
+        if not force:
+            _last_member_persist_at[state.job_id] = time.time()
     except OSError:
         pass
 
 
 def _unlink_persisted(job_id: str) -> None:
+    _last_member_persist_at.pop(job_id, None)
     try:
         (_persist_dir() / f"{job_id}.json").unlink(missing_ok=True)
     except OSError:
@@ -298,21 +321,21 @@ def update_member_stage1(state: JobState, *, id: str, model: str, status: str, e
     state.stage1[id] = MemberProgress(
         id=id, model=model, status=status, error=error, latency_ms=latency_ms
     )
-    _persist(state)
+    _persist(state, force=False)
 
 
 def update_member_stage2(state: JobState, *, id: str, model: str, status: str, error: str | None, latency_ms: int | None) -> None:
     state.stage2[id] = MemberProgress(
         id=id, model=model, status=status, error=error, latency_ms=latency_ms
     )
-    _persist(state)
+    _persist(state, force=False)
 
 
 def update_stage3(state: JobState, *, id: str, model: str, status: str, error: str | None, latency_ms: int | None) -> None:
     state.stage3 = MemberProgress(
         id=id, model=model, status=status, error=error, latency_ms=latency_ms
     )
-    _persist(state)
+    _persist(state, force=False)
 
 
 def snapshot(state: JobState) -> dict:
@@ -371,6 +394,7 @@ async def _reset_for_tests() -> None:
             if j._task is not None and not j._task.done():
                 j._task.cancel()
         _jobs.clear()
+    _last_member_persist_at.clear()
     try:
         for f in _persist_dir().glob("*.json*"):
             f.unlink(missing_ok=True)

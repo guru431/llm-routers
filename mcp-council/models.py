@@ -90,6 +90,11 @@ CATALOG: dict[str, dict] = {
         "base_url": "http://127.0.0.1:8766/v1",
         "env_key": "CODEX_AGENT_TOKEN",
         "extra": {"sandbox": "read-only"},
+        # `codex exec gpt-5.5` is a reasoning model spawned as a subprocess
+        # (cold start) — a real POST, not a light /health GET. The default 12s
+        # probe almost always ReadTimeouts on a healthy server, so give this
+        # local agent-server member a longer healthcheck ceiling.
+        "healthcheck_timeout": 75.0,
         # ChatGPT/Codex flat subscription — no per-token price.
         "price_in": None,
         "price_out": None,

@@ -111,6 +111,24 @@ async def test_success_clears_breaker_failures(patch_httpx):
     assert circuit_breaker.snapshot().get(host) is None  # streak reset on success
 
 
+async def test_success_with_record_breaker_false_keeps_streak(patch_httpx):
+    # healthcheck passes record_breaker=False so a probe can't touch the breaker.
+    # A successful probe must NOT reset an accumulated fail-streak either.
+    host = "probed.example.com"
+    for _ in range(circuit_breaker.FAILURE_THRESHOLD - 1):
+        circuit_breaker.record_failure(host)
+    patch_httpx["client"] = _FakeClient([_ok_response()])
+    await call_openai_compat(
+        base_url=f"https://{host}/v1",
+        api_key="sk-test",
+        model="m",
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=100,
+        record_breaker=False,
+    )
+    assert circuit_breaker.snapshot()[host]["fails"] == circuit_breaker.FAILURE_THRESHOLD - 1
+
+
 async def test_call_returns_content_and_usage(patch_httpx):
     patch_httpx["client"] = _FakeClient([_ok_response()])
     out = await call_openai_compat(

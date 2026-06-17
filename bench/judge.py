@@ -178,6 +178,19 @@ def main():
     target = JUDGE_FILE.with_suffix(JUDGE_FILE.suffix + ".tmp") if args.rescore else JUDGE_FILE
     mode = "w" if args.rescore else "a"
     with target.open(mode, encoding="utf-8") as out:
+        # --rescore + --task rescores ONLY the target task, but the .tmp replaces
+        # the whole file. Seed it with the existing records for the OTHER tasks
+        # so their scores survive the os.replace below.
+        if args.rescore and args.task and JUDGE_FILE.exists():
+            for line in JUDGE_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if d.get("task_id") != args.task:
+                    out.write(line + "\n")
         for i, (mid, tid, text) in enumerate(pairs, 1):
             task = tasks_by_id.get(tid)
             if not task:

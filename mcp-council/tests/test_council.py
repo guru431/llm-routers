@@ -274,6 +274,29 @@ def test_compute_usage_aggregates_calls_tokens_retries():
     assert u["estimated_cost_usd"] is None
 
 
+def test_compute_usage_no_double_count_carried_failed_member():
+    # A failed web_search member is carried forward by identity into round 2's
+    # stage1 (same dict object). Its loop_* usage must be counted only once.
+    failed = {
+        "id": "m3", "status": "error", "loop_calls": 3, "loop_attempts": 4,
+        "loop_tokens_in": 40, "loop_tokens_out": 20,
+        "tool_calls_log": [{}, {}],
+    }
+    ok_r1 = {"attempts": 1, "tokens_in": 100, "tokens_out": 50, "tool_calls_log": []}
+    ok_r2 = {"attempts": 1, "tokens_in": 100, "tokens_out": 50, "tool_calls_log": []}
+    rounds_detail = [
+        {"stage1": [ok_r1, failed], "stage2": [], "aggregate": []},
+        {"stage1": [ok_r2, failed], "stage2": [], "aggregate": []},
+    ]
+    u = _compute_usage(rounds_detail, None)
+    # failed.loop_calls counted once (3) + two ok members (1 each) = 5.
+    assert u["llm_calls"] == 3 + 1 + 1
+    assert u["tokens_in"] == 40 + 100 + 100
+    assert u["tokens_out"] == 20 + 50 + 50
+    assert u["web_search_calls"] == 2  # failed member's 2 tool calls, once
+    assert u["retries"] == 1  # failed: max(0, 4-3)=1; ok members: 0
+
+
 def test_build_summary_winner_failed_and_disagreement():
     stage1 = [
         {"id": "m1", "model": "M1", "status": "ok"},

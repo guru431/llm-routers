@@ -39,7 +39,7 @@
 |---|---|---|
 | `glm` | glm-5.1 | council member (OCG) |
 | `kimi` | kimi-k2.6 | council member (OCG) |
-| `deepseek-pro` | deepseek-v4-pro | council member (DeepSeek direct) |
+| `deepseek-pro` | deepseek-v4-pro | council member (OCG) |
 | `qwen` | qwen3.6-plus | council member (OCG) |
 | `minimax` | minimax-m3 | council member (OCG) |
 | `gemini` | gemini-3.1-pro-preview | council member (Helicone Gateway) |
@@ -58,8 +58,7 @@
 ## Ключи
 
 Все ключи читаются `mcp-council` (передаются через `~/.claude.json` → `mcpServers.council.env`):
-- `DEEPSEEK_KEY` — для deepseek-pro и deepseek-flash
-- `OPENCODE_GO_KEY` — для glm, kimi, qwen, minimax (через OCG)
+- `OPENCODE_GO_KEY` — для glm, kimi, deepseek-pro, qwen, minimax, deepseek-flash (через OCG)
 - `HELICONE_GATEWAY_KEY` — для gemini
 - `CODEX_AGENT_TOKEN` — для codex (bearer к локальному codex-agent-server :8766)
 - `MINIMAX_API_KEY` — для minimax-direct (currently disabled в catalog, billing off)

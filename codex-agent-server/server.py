@@ -60,6 +60,9 @@ logging.basicConfig(
 logger = logging.getLogger("codex-agent-server")
 
 
+# NOTE: _load_dotenv, build_tools_system_prompt, parse_tool_calls and
+# extract_content are kept byte-identical with claude-agent-server/server.py
+# (no shared module on purpose) — apply any fix to both copies.
 def _load_dotenv() -> None:
     """Load KEY=VALUE pairs from a .env file next to this script into the
     environment, without overwriting variables already set. Lets the server
@@ -468,15 +471,22 @@ class Handler(BaseHTTPRequestHandler):
         logger.info("%s %s", self.address_string(), format % args)
 
     def _check_auth(self) -> bool:
-        """Enforce bearer-auth. Returns False after sending 401; caller aborts."""
+        """Enforce bearer-auth at the transport level. Accepts EITHER the
+        read-only token OR the (distinct) workspace-write token, so a request
+        carrying the agent token passes this gate and reaches _handle_chat,
+        where _check_agent_auth is the sole write gate. Returns False after
+        sending 401; caller aborts."""
         if not AUTH_TOKEN:
             return True
         header = self.headers.get("Authorization", "")
         if not header.startswith("Bearer "):
             self._send(401, {"error": {"message": "missing bearer token", "type": "auth_error"}})
             return False
-        presented = header[len("Bearer "):].strip()
-        if not hmac.compare_digest(presented.encode("utf-8"), AUTH_TOKEN.encode("utf-8")):
+        presented = header[len("Bearer "):].strip().encode("utf-8")
+        ok = hmac.compare_digest(presented, AUTH_TOKEN.encode("utf-8"))
+        if AGENT_AUTH_TOKEN:
+            ok = hmac.compare_digest(presented, AGENT_AUTH_TOKEN.encode("utf-8")) or ok
+        if not ok:
             self._send(401, {"error": {"message": "invalid bearer token", "type": "auth_error"}})
             return False
         return True

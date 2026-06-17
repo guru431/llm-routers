@@ -187,9 +187,12 @@ async def run_panel(
 
     start = state.current_round + 1
     for round_n in range(start, rounds + 1):
+        da_id = (
+            devils_advocate_for_round(state.participants, round_n)
+            if devils_advocate_rotation else None
+        )
         rules: dict[str, str] | None = None
         if devils_advocate_rotation:
-            da_id = devils_advocate_for_round(state.participants, round_n)
             rules = {da_id: DEVILS_ADVOCATE_RULE}
 
         await run_round(
@@ -209,7 +212,6 @@ async def run_panel(
         check_round_failures(state, round_n)
 
         if devils_advocate_rotation:
-            da_id = devils_advocate_for_round(state.participants, round_n)
             state.devils_advocates.append(da_id)
         if diversity_monitor:
             responses_this_round = {
@@ -232,6 +234,10 @@ async def run_panel(
                 max_tokens=max_tokens,
                 files_section=files_section,
             )
+            # Re-check after reprompt: a provider that only fails on the heavy
+            # reprompt call adds an error entry to this same round that the
+            # pre-reprompt check above could not have seen.
+            check_round_failures(state, round_n)
 
         # Mid-run persistence — snapshot after each completed round.
         await maybe_dump(state, DUMP_DIR)

@@ -14,13 +14,13 @@ MCP-сервер: Karpathy 3-stage council из 7 LLM с опционально�
 |---|---|---|---|
 | glm | glm-5.1 | OpenCode Go | `OPENCODE_GO_KEY` |
 | kimi | kimi-k2.6 | OpenCode Go | `OPENCODE_GO_KEY` |
-| deepseek | deepseek-v4-pro | DeepSeek direct | `DEEPSEEK_KEY` |
+| deepseek-pro | deepseek-v4-pro | OpenCode Go | `OPENCODE_GO_KEY` |
 | qwen | qwen3.6-plus | OpenCode Go | `OPENCODE_GO_KEY` |
 | minimax | minimax-m3 | OpenCode Go | `OPENCODE_GO_KEY` |
 | gemini | gemini-3.1-pro-preview | Helicone AI Gateway | `HELICONE_GATEWAY_KEY` |
 | codex | gpt-5.5 | codex-agent-server :8766 (read-only) | `CODEX_AGENT_TOKEN` |
 
-DeepSeek сознательно через direct API (не OCG): при OCG outage остаются 2 живых голоса (DeepSeek + Gemini). См. также `_pick_chairman` — DeepSeek используется как fallback chairman.
+`deepseek-pro` теперь идёт через OCG-прокси (DeepSeek direct PAYG исчерпан с 2026-06-07): при OCG outage живым голосом остаётся только Gemini. См. также `_pick_chairman` — DeepSeek используется как fallback chairman.
 
 ## Tools
 
@@ -99,7 +99,7 @@ pytest -v
 ## Run server (stdio)
 
 ```bash
-OPENCODE_GO_KEY=<...> DEEPSEEK_KEY=<...> HELICONE_GATEWAY_KEY=<...> EXA_API_KEY=<...> python server.py
+OPENCODE_GO_KEY=<...> HELICONE_GATEWAY_KEY=<...> CODEX_AGENT_TOKEN=<...> EXA_API_KEY=<...> python server.py
 ```
 
 `EXA_API_KEY` обязательный только если кто-то вызывает с `web_search=True`. Все 4 ключа задаются через переменные окружения (в Claude Code — через `~/.claude.json` → `mcpServers.council.env`).

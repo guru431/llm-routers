@@ -631,13 +631,24 @@ def _compute_usage(
                 cost += rec_out * pout / 1_000_000
                 any_priced = True
 
+    # A failed round-1 member is carried forward by identity (the SAME dict
+    # object) into every later round's stage1, so dedup by id() to avoid
+    # double-counting its tokens/web_search/cost across rounds.
+    seen: set[int] = set()
+
+    def _acc_once(rec: dict) -> None:
+        if id(rec) in seen:
+            return
+        seen.add(id(rec))
+        _acc(rec)
+
     for rd in rounds_detail:
         for s in rd["stage1"]:
-            _acc(s)
+            _acc_once(s)
         for s in rd["stage2"]:
-            _acc(s)
+            _acc_once(s)
     if stage3 is not None:
-        _acc(stage3)
+        _acc_once(stage3)
 
     return {
         "llm_calls": calls,

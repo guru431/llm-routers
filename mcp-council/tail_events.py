@@ -47,6 +47,10 @@ def main() -> int:
     wanted: set[str] | None = None
     if args.events:
         wanted = {e.strip() for e in args.events.split(",") if e.strip()}
+        # With --until-done, the terminal event must survive the filter or the
+        # exit check below never sees it and the tail polls forever.
+        if args.until_done:
+            wanted.add("result_ready")
 
     path = Path(args.path)
     # Wait for the file to appear — useful when this tail is started before

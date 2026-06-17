@@ -211,6 +211,22 @@ async def create_session(
         return s
 
 
+async def reserve_active_slot() -> None:
+    """Re-check the active-session cap before reactivating a terminal session
+    (dialogue_continue). Raises the SAME RuntimeError as create_session when the
+    cap is reached. The resuming session is itself terminal at call time, so it
+    is not counted toward `active` — reactivating it consumes one free slot."""
+    async with _sessions_lock:
+        now = time.time()
+        _gc_locked(now)
+        active = sum(1 for s in _sessions.values() if s.phase not in TERMINAL_PHASES)
+        if active >= MAX_ACTIVE_SESSIONS:
+            raise RuntimeError(
+                f"too many active sessions ({active}/{MAX_ACTIVE_SESSIONS}); "
+                "wait for some to finish or call dialogue_cancel on stale ones"
+            )
+
+
 async def get_session(session_id: str) -> DialogueState | None:
     async with _sessions_lock:
         return _sessions.get(session_id)

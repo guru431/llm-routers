@@ -15,6 +15,7 @@ from dialogue.state import (
     get_session,
     list_sessions,
     mark_phase,
+    reserve_active_slot,
     snapshot,
 )
 
@@ -103,6 +104,29 @@ async def test_active_sessions_hard_cap():
     with pytest.raises(RuntimeError) as exc:
         await create_session(mode="debate", question_preview="q", total_rounds=1)
     assert "active sessions" in str(exc.value).lower()
+
+
+async def test_reserve_active_slot_raises_when_cap_full():
+    """reserve_active_slot (the dialogue_continue gate) raises the same
+    RuntimeError as create_session when MAX_ACTIVE_SESSIONS active sessions
+    exist, so resuming a terminal session cannot bypass the cap."""
+    for _ in range(MAX_ACTIVE_SESSIONS):
+        s = await create_session(mode="debate", question_preview="q", total_rounds=1)
+        mark_phase(s, "round_1_critique")  # active
+    with pytest.raises(RuntimeError) as exc:
+        await reserve_active_slot()
+    assert "active sessions" in str(exc.value).lower()
+
+
+async def test_reserve_active_slot_ok_when_room_for_resume():
+    """A terminal session is not counted toward the cap, so when MAX-1 are
+    active and one is terminal there is room to reserve a slot for resume."""
+    for _ in range(MAX_ACTIVE_SESSIONS - 1):
+        s = await create_session(mode="debate", question_preview="q", total_rounds=1)
+        mark_phase(s, "round_1_critique")  # active
+    terminal = await create_session(mode="debate", question_preview="q", total_rounds=1)
+    mark_phase(terminal, "done")  # terminal -> not counted
+    await reserve_active_slot()  # must not raise
 
 
 async def test_terminal_sessions_do_not_block_cap():
