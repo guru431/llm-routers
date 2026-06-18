@@ -485,6 +485,15 @@ class Handler(BaseHTTPRequestHandler):
                     parts.append(content)
             prompt = "\n\n".join(parts)
 
+        # Reject empty input (e.g. messages with only a system role) BEFORE taking
+        # a concurrency slot: an empty stdin makes the claude CLI spawn for nothing
+        # and waste a _CLAUDE_SEM slot. Fail fast with 400 instead.
+        if not prompt.strip():
+            self._send(400, {"error": {
+                "message": "no user content to send to claude (prompt is empty)",
+                "type": "invalid_request_error"}})
+            return
+
         # Cache lookup: skip если есть tools (нестабильные ответы) или явный bypass
         cache_bypass = body.get("cache") is False
         cache_eligible = CACHE is not None and not tools and not cache_bypass

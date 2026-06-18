@@ -729,7 +729,8 @@ def _build_summary(
     top_disagreements = top_disagreements[:3]
 
     ok_stage1 = sum(1 for s in stage1 if s["status"] == "ok")
-    if failed_models and len(failed_models) >= max(1, len(stage1)) / 2:
+    # "half or more of the members had a failure" — integer math (no float /2).
+    if failed_models and len(failed_models) * 2 >= len(stage1):
         next_action = "Several models failed — run model_healthcheck and retry."
     elif confidence == "low" or top_disagreements:
         next_action = (

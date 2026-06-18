@@ -175,10 +175,13 @@ def main():
             # p90 needs ≥5 samples to be meaningful; below that we return None
             # (renders as '—') instead of falling back to max(), which would
             # be misleadingly labeled p90.
-            "ttft_p90": statistics.quantiles(ttfts, n=10)[8] if len(ttfts) >= 5 else None,
+            # method="inclusive" keeps p90 on the same percentile definition as the
+            # p50 medians above (statistics.median == inclusive 50th pct) — the
+            # default "exclusive" diverges on the small bench samples.
+            "ttft_p90": statistics.quantiles(ttfts, n=10, method="inclusive")[8] if len(ttfts) >= 5 else None,
             "ttft_r_p50": statistics.median(ttfts_r) if ttfts_r else None,
             "total_p50": statistics.median(totals) if totals else None,
-            "total_p90": statistics.quantiles(totals, n=10)[8] if len(totals) >= 5 else None,
+            "total_p90": statistics.quantiles(totals, n=10, method="inclusive")[8] if len(totals) >= 5 else None,
             "quality_avg": statistics.mean(scores) if scores else None,
             "quality_n": len(scores),
             # Coverage-penalized quality: a model that answered 2/8 tasks at Q5
@@ -329,8 +332,10 @@ def main():
                 "mid": mid, "ttft": ttft, "ttft_r": ttft_r, "total": total,
                 "score": score, "heur": h, "display_err": display,
             })
-        # sort by quality desc then ttft asc
+        # error/empty rows last (so they don't hide among merely-unscored rows),
+        # then by quality desc, then ttft asc
         task_rows.sort(key=lambda x: (
+            1 if x["display_err"] else 0,
             -(x["score"] if x["score"] is not None else -1),
             x["ttft"] if x["ttft"] is not None else 9999,
         ))

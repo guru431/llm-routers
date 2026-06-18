@@ -21,7 +21,11 @@ def write_full_dump(call_id: str, dump: dict) -> Path:
     """
     CALLS_DIR.mkdir(parents=True, exist_ok=True)
     path = CALLS_DIR / f"{call_id}.json"
-    path.write_text(json.dumps(dump, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Atomic write (tmp + replace) so a crash mid-write can't leave a truncated
+    # dump that later fails to parse as JSON.
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(dump, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
     return path
 
 

@@ -117,14 +117,14 @@ def format_markdown(question: str, result: dict) -> str:
         lines.append("## Round-by-round progression (compact)")
         lines.append("")
         for ri, rd in enumerate(rounds_detail, 1):
-            rd_stage1 = rd["stage1"]
+            rd_stage1 = rd.get("stage1") or []
             model_by_id = {s["id"]: s["model"] for s in rd_stage1}
             revised = [s["model"] for s in rd_stage1 if s["status"] == "ok"]
             revised_str = ", ".join(revised) if revised else "(none)"
             lines.append(f"- Round {ri}: answered — {revised_str}")
             order = [
                 f"{model_by_id.get(mid, mid)} {mean:.2f}"
-                for mid, mean, _n in rd["aggregate"]
+                for mid, mean, _n in (rd.get("aggregate") or [])
             ]
             if order:
                 lines.append(f"  - aggregate order: {'; '.join(order)}")
@@ -957,8 +957,14 @@ async def _dialogue_runner_guard(state, runner_coro_factory) -> None:
         await runner_coro_factory(state)
     except asyncio.CancelledError:
         # cancel_session no longer flips phase eagerly — we own the transition
-        # here so a near-done task isn't overwritten.
-        dialogue_state.mark_phase(state, "cancelled")
+        # here so a near-done task isn't overwritten. Guard against a cancel that
+        # lands AFTER the runner already reached a terminal phase: debate/socratic/
+        # panel call mark_phase("done") BEFORE the final `await write_dump`, so a
+        # cancel during that await must not clobber the completed run's phase
+        # (which would also wrongly block dialogue_continue). Mirrors the council
+        # guard's terminal-phase check.
+        if state.phase not in dialogue_state.TERMINAL_PHASES:
+            dialogue_state.mark_phase(state, "cancelled")
         raise
     except Exception as e:
         state.error = f"{type(e).__name__}: {e}"

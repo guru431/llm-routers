@@ -710,7 +710,14 @@ class Handler(BaseHTTPRequestHandler):
         try:
             return json.loads(self.rfile.read(length))
         except Exception:
-            self._send(400, {"error": "Invalid JSON"})
+            # The read itself may have failed on a dropped connection
+            # (ConnectionResetError); the error _send would then also fail writing
+            # to the dead socket. Best-effort — don't let it raise out of the
+            # handler as worker-thread noise.
+            try:
+                self._send(400, {"error": "Invalid JSON"})
+            except OSError:
+                pass
             return None
 
     def _send(self, code: int, data: dict):
