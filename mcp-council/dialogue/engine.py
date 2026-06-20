@@ -383,12 +383,11 @@ def write_dump(state: DialogueState, *, base_dir: Path) -> Path:
             time.sleep(0.05)
     # Last resort: overwrite directly. Loses atomicity but a stale dump_path
     # is worse than a successful (non-atomic) write of the latest snapshot.
+    # Keep `tmp` on disk: it already holds the fully-written snapshot, so if
+    # this in-place write crashes mid-way and corrupts dump_path, an intact
+    # copy survives for recovery instead of being lost.
     try:
         dump_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
         return dump_path
     except OSError as e:
         raise last_err or e

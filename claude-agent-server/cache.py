@@ -70,7 +70,9 @@ class ResponseCache:
             if part is None:
                 h.update(b"\x00")
             else:
-                h.update(part.encode("utf-8", errors="replace"))
+                # surrogatepass (не replace): иначе разные суррогаты/эмодзи
+                # схлопываются в U+FFFD → коллизия ключа → чужой кэш-ответ.
+                h.update(part.encode("utf-8", errors="surrogatepass"))
         return h.hexdigest()
 
     def get(self, model: Optional[str], system_prompt: Optional[str], prompt: str) -> Optional[str]:

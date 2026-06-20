@@ -454,6 +454,13 @@ def main():
         # Concurrent runs of run.py for the SAME model are still unsupported
         # (would need filelock) — single-runner is the only supported mode.
         with out_file.open("a", encoding="utf-8") as out_f:
+            # If a previous run was killed mid-write, the file may end with a
+            # partial line lacking a newline. Terminate it so the next append
+            # starts on its own line (the partial stays a single malformed line
+            # that the skip-existing/report readers already tolerate) instead of
+            # being concatenated onto the next good record and corrupting it.
+            if out_file.stat().st_size and not out_file.read_bytes().endswith(b"\n"):
+                out_f.write("\n")
             for t in tasks:
                 cell += 1
                 if t["id"] in existing:

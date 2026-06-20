@@ -56,8 +56,8 @@ RUBRIC = {
 
 _SCORE_PATTERNS = (
     re.compile(r"SCORE\s*[:=]\s*([0-5])\b", re.IGNORECASE),
-    re.compile(r"\b([0-5])\s*/\s*5\b"),
-    re.compile(r"\b([0-5])\s+out\s+of\s+5\b", re.IGNORECASE),
+    re.compile(r"(?<![\d.])([0-5])\s*/\s*5\b"),
+    re.compile(r"(?<![\d.])([0-5])\s+out\s+of\s+5\b", re.IGNORECASE),
 )
 
 
