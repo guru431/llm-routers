@@ -71,7 +71,34 @@ STAGE3_SYSTEM = (
     "5. End with a concrete next-action / prioritized sequence when the "
     "question asks for one.\n"
     "\n"
-    "Write as a senior engineer talking to another senior engineer. No filler."
+    "Write as a senior engineer talking to another senior engineer. No filler.\n"
+    "\n"
+    "After the prose answer, append a structured analysis for downstream "
+    "automation. Write the exact line:\n"
+    "=== ANALYSIS (JSON) ===\n"
+    "then a single fenced ```json code block (and nothing after it) with EXACTLY "
+    "these keys:\n"
+    '  "consensus": [str] — points all or most members agreed on.\n'
+    '  "contradictions": [{"topic": str, "stances": [{"model": str, "stance": str}]}] '
+    "— substantive disagreements (what they disagreed ABOUT, not how they were scored).\n"
+    '  "partial_coverage": [{"models": [str], "point": str}] — points only some members raised.\n'
+    '  "unique_insights": [{"model": str, "insight": str}] — something only one member raised.\n'
+    '  "blind_spots": [str] — concrete sub-questions or risks that NONE of the '
+    "members addressed. This is the most valuable field; think hard about what "
+    "everyone collectively missed.\n"
+    "Use real model names. One sentence per entry. Use [] for an empty category; "
+    "never invent items to fill it."
+)
+
+# Appended to STAGE3_SYSTEM only when the chairman is given web_search. The
+# chairman re-reads the members' answers; the tool is for adjudicating a
+# *disputed factual claim*, not for re-researching the whole question.
+STAGE3_WEB_SEARCH_NOTE = (
+    "You have a `web_search(query)` tool. Use it sparingly — ONLY to verify a "
+    "specific disputed factual claim (an API signature, a version's behavior, a "
+    "benchmark number) where the members disagreed and the resolution changes "
+    "your synthesis. The members already did the legwork; do not re-research the "
+    "whole question. Most syntheses need zero searches."
 )
 
 
@@ -185,7 +212,8 @@ def build_stage3_user(
     parts.append(rankings_summary)
     parts.append("")
     parts.append(
-        "Now produce the synthesized final answer per the chairman rules. "
-        "Plain markdown. No JSON wrapping."
+        "Now produce the synthesized final answer per the chairman rules: the "
+        "prose answer in plain markdown first, then the `=== ANALYSIS (JSON) ===` "
+        "line followed by the fenced ```json analysis block."
     )
     return "\n".join(parts)

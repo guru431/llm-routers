@@ -9,7 +9,9 @@ from council import (
     _assign_pseudonyms,
     _build_summary,
     _compute_usage,
+    _council_failure_reason,
     _extract_json,
+    _split_synthesis_and_analysis,
     run_council,
 )
 from openai_client import CouncilHTTPError
@@ -295,6 +297,44 @@ def test_compute_usage_no_double_count_carried_failed_member():
     assert u["tokens_out"] == 20 + 50 + 50
     assert u["web_search_calls"] == 2  # failed member's 2 tool calls, once
     assert u["retries"] == 1  # failed: max(0, 4-3)=1; ok members: 0
+
+
+@pytest.mark.parametrize("error,expected", [
+    # Council-only failure the healthcheck classifier never sees: map a missing
+    # env var to healthcheck's dedicated `no_key` status, not the generic error.
+    ("env var OPENCODE_GO_KEY not set", "no_key"),
+    # Reuse healthcheck._classify_error for the provider-level failures.
+    ("http 402 insufficient_balance: no funds", "insufficient_balance"),
+    ("http 401: bad key", "auth"),
+    ("timeout after 3 attempts: ReadTimeout", "timeout"),
+    ("overload after 3 attempts (last status 429)", "rate_limited"),
+    # Council-specific stage-2 failure mode — falls through to the generic code.
+    ("invalid_json: rankings is empty", "error"),
+    (None, "error"),
+])
+def test_council_failure_reason(error, expected):
+    assert _council_failure_reason(error) == expected
+
+
+def test_build_summary_failed_models_carry_failure_reason():
+    """Each failed_models entry gets a stable `failure_reason` code alongside the
+    free-form `error` string, so automation can switch on a code."""
+    stage1 = [
+        {"id": "m1", "model": "M1", "status": "ok"},
+        {"id": "m2", "model": "M2", "status": "error",
+         "error": "http 402 insufficient_balance: no funds"},
+        {"id": "m3", "model": "M3", "status": "error",
+         "error": "env var OPENCODE_GO_KEY not set"},
+    ]
+    stage2 = [
+        {"ranker_id": "m1", "status": "error", "error": "invalid_json: rankings is empty"},
+    ]
+    s = _build_summary(stage1, stage2, [], None)
+    by_id = {f["id"]: f for f in s["failed_models"]}
+    assert by_id["m2"]["failure_reason"] == "insufficient_balance"
+    assert by_id["m2"]["error"] == "http 402 insufficient_balance: no funds"  # raw kept
+    assert by_id["m3"]["failure_reason"] == "no_key"
+    assert by_id["m1"]["failure_reason"] == "error"
 
 
 def test_build_summary_winner_failed_and_disagreement():
@@ -809,6 +849,245 @@ async def test_run_council_synthesis_invokes_chairman():
     # Stage 3 prompt must include the original question and the digest.
     assert "=== ORIGINAL QUESTION ===" in stage3_called["prompt"]
     assert "=== PEER RANKINGS DIGEST ===" in stage3_called["prompt"]
+
+
+# ---- Stage 3 chairman web_search -------------------------------------------
+
+
+async def test_synthesis_no_web_chairman_gets_no_tools():
+    """synthesis=True, web_search=False → the chairman call carries no tools."""
+    members = _make_members()
+    stage3_tools: list = []
+
+    async def fake_call(**kwargs):
+        user_msg = kwargs["messages"][1]["content"]
+        if "=== COUNCIL ANSWERS ===" in user_msg:
+            stage3_tools.append(kwargs.get("tools"))
+            return {"content": "## Synthesis", "tokens_in": 1, "tokens_out": 1}
+        if "=== ANSWERS TO RANK ===" in user_msg:
+            return {"content": json.dumps(
+                {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}]}),
+                "tokens_in": 1, "tokens_out": 1}
+        return {"content": "answer", "tokens_in": 1, "tokens_out": 1}
+
+    await run_council(question="q", members=members, call_fn=fake_call,
+                      synthesis=True, web_search=False)
+    assert stage3_tools and all(t is None for t in stage3_tools)
+
+
+async def test_synthesis_web_chairman_searches_then_synthesizes():
+    """synthesis=True + web_search=True → the chairman gets the web_search tool,
+    can run a search, and produces a final synthesis. The chairman's search is
+    counted in usage and recorded in stage3.tool_calls_log."""
+    from unittest.mock import patch
+    from web_search import WEB_SEARCH_TOOL_SPEC
+    members = _make_members()
+    stage3_tools: list = []
+
+    async def fake_call(**kwargs):
+        user_msg = kwargs["messages"][1]["content"]
+        if "=== COUNCIL ANSWERS ===" in user_msg:
+            stage3_tools.append(kwargs.get("tools"))
+            tool_msgs = [m for m in kwargs["messages"] if m.get("role") == "tool"]
+            if not tool_msgs:
+                return {
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "c1",
+                        "function": {"name": "web_search",
+                                     "arguments": '{"query":"verify claim"}'},
+                    }],
+                    "finish_reason": "tool_calls",
+                    "tokens_in": 1, "tokens_out": 1,
+                }
+            return {"content": "## Synthesis grounded in fresh sources",
+                    "tokens_in": 1, "tokens_out": 1}
+        if "=== ANSWERS TO RANK ===" in user_msg:
+            return {"content": json.dumps(
+                {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}]}),
+                "tokens_in": 1, "tokens_out": 1}
+        return {"content": "answer", "tokens_in": 1, "tokens_out": 1}
+
+    async def fake_search(query, num_results=5, *, api_key=None, timeout=30.0):
+        return {"query": query, "results": [
+            {"title": "T", "url": "U", "summary": "S", "highlights": []}],
+            "cost_dollars": 0.001, "latency_ms": 5}
+
+    with patch("web_search_tool.web_search_exa", new=fake_search):
+        result = await run_council(question="q", members=members, call_fn=fake_call,
+                                   synthesis=True, web_search=True)
+
+    assert result["stage3"]["status"] == "ok"
+    assert "fresh sources" in result["stage3"]["synthesis"]
+    # Chairman received the web_search tool on every stage-3 turn.
+    assert stage3_tools and all(t == [WEB_SEARCH_TOOL_SPEC] for t in stage3_tools)
+    # The chairman's search is recorded and counted.
+    assert len(result["stage3"]["tool_calls_log"]) == 1
+    assert result["stage3"]["tool_calls_log"][0]["query"] == "verify claim"
+    assert result["usage"]["web_search_calls"] >= 1
+
+
+async def test_synthesis_web_chairman_loop_exhaust_marks_error_not_raise():
+    """A chairman that loops forever requesting searches is marked stage3 error
+    (no final content), but the council still returns stage1/stage2 materials."""
+    from unittest.mock import patch
+    members = _make_members()
+
+    async def fake_call(**kwargs):
+        user_msg = kwargs["messages"][1]["content"]
+        if "=== COUNCIL ANSWERS ===" in user_msg:
+            if kwargs.get("tool_choice") == "none":
+                # Even when forbidden, return another tool request → no content.
+                return {"content": None, "tool_calls": [{
+                    "id": "z", "function": {"name": "web_search",
+                                            "arguments": '{"query":"x"}'}}],
+                    "finish_reason": "tool_calls", "tokens_in": 1, "tokens_out": 1}
+            return {"content": None, "tool_calls": [{
+                "id": "z", "function": {"name": "web_search",
+                                        "arguments": '{"query":"x"}'}}],
+                "finish_reason": "tool_calls", "tokens_in": 1, "tokens_out": 1}
+        if "=== ANSWERS TO RANK ===" in user_msg:
+            return {"content": json.dumps(
+                {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}]}),
+                "tokens_in": 1, "tokens_out": 1}
+        return {"content": "answer", "tokens_in": 1, "tokens_out": 1}
+
+    async def fake_search(query, num_results=5, *, api_key=None, timeout=30.0):
+        return {"query": query, "results": [], "cost_dollars": 0.0, "latency_ms": 1}
+
+    with patch("web_search_tool.web_search_exa", new=fake_search):
+        result = await run_council(question="q", members=members, call_fn=fake_call,
+                                   synthesis=True, web_search=True)
+
+    assert result["stage3"]["status"] == "error"
+    assert "no final content" in result["stage3"]["error"]
+    assert all(s["status"] == "ok" for s in result["stage1"])
+    assert any("stage3" in n.lower() for n in result["notes"])
+
+
+# ---- Stage 3 structured analysis taxonomy ----------------------------------
+
+
+def test_split_synthesis_extracts_analysis_block():
+    analysis = {
+        "consensus": ["use a queue"],
+        "contradictions": [{"topic": "DB", "stances": [{"model": "M1", "stance": "pg"}]}],
+        "partial_coverage": [{"models": ["M1"], "point": "idx"}],
+        "unique_insights": [{"model": "M3", "insight": "WAL"}],
+        "blind_spots": ["no backups discussed"],
+    }
+    content = (
+        "## Final answer\n\nDo X.\n\n=== ANALYSIS (JSON) ===\n```json\n"
+        + json.dumps(analysis) + "\n```\n"
+    )
+    prose, parsed = _split_synthesis_and_analysis(content)
+    assert "Do X." in prose
+    assert "ANALYSIS (JSON)" not in prose  # sentinel + block stripped from prose
+    assert "```json" not in prose
+    assert parsed["blind_spots"] == ["no backups discussed"]
+    assert parsed["consensus"] == ["use a queue"]
+
+
+def test_split_synthesis_no_block_returns_full_prose_and_none():
+    content = "## Final answer\n\nJust prose, no analysis."
+    prose, parsed = _split_synthesis_and_analysis(content)
+    assert prose == content
+    assert parsed is None
+
+
+def test_split_synthesis_malformed_json_degrades_to_none():
+    content = "Prose body.\n\n=== ANALYSIS (JSON) ===\n```json\n{not valid json,}\n```"
+    prose, parsed = _split_synthesis_and_analysis(content)
+    assert parsed is None
+    assert "Prose body." in prose
+    assert "ANALYSIS (JSON)" not in prose  # sentinel stripped even on parse failure
+
+
+def test_split_synthesis_all_empty_categories_is_none():
+    content = (
+        "Prose.\n\n=== ANALYSIS (JSON) ===\n```json\n"
+        + json.dumps({"consensus": [], "contradictions": [], "blind_spots": []})
+        + "\n```"
+    )
+    _prose, parsed = _split_synthesis_and_analysis(content)
+    assert parsed is None
+
+
+def test_split_synthesis_ignores_json_fence_in_prose():
+    """A ```json sample in the prose must not be mistaken for the analysis — only
+    the sentinel-anchored block counts."""
+    content = (
+        'Here is config:\n```json\n{"foo": 1}\n```\nThat was an example.\n\n'
+        "=== ANALYSIS (JSON) ===\n```json\n"
+        + json.dumps({"blind_spots": ["X"]}) + "\n```"
+    )
+    prose, parsed = _split_synthesis_and_analysis(content)
+    assert parsed["blind_spots"] == ["X"]
+    assert parsed["consensus"] == []  # normalized to the full 5-key shape
+    assert '"foo": 1' in prose  # the prose code example survives
+
+
+async def test_synthesis_produces_structured_analysis():
+    members = _make_members()
+    analysis = {"consensus": ["agreed point"], "blind_spots": ["nobody addressed scaling"]}
+
+    async def fake_call(**kwargs):
+        user_msg = kwargs["messages"][1]["content"]
+        if "=== COUNCIL ANSWERS ===" in user_msg:
+            return {"content": ("## Synthesis\n\nDo X.\n\n=== ANALYSIS (JSON) ===\n```json\n"
+                                + json.dumps(analysis) + "\n```"),
+                    "tokens_in": 1, "tokens_out": 1}
+        if "=== ANSWERS TO RANK ===" in user_msg:
+            return {"content": json.dumps(
+                {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}]}),
+                "tokens_in": 1, "tokens_out": 1}
+        return {"content": "answer", "tokens_in": 1, "tokens_out": 1}
+
+    result = await run_council(question="q", members=members, call_fn=fake_call,
+                               synthesis=True)
+    assert result["stage3"]["analysis"]["blind_spots"] == ["nobody addressed scaling"]
+    assert result["summary"]["analysis"]["consensus"] == ["agreed point"]
+    # Prose synthesis is stripped of the JSON block.
+    assert "Do X." in result["stage3"]["synthesis"]
+    assert "ANALYSIS (JSON)" not in result["stage3"]["synthesis"]
+    assert "```json" not in result["stage3"]["synthesis"]
+
+
+async def test_synthesis_missing_analysis_block_notes_and_summary_none():
+    members = _make_members()
+
+    async def fake_call(**kwargs):
+        user_msg = kwargs["messages"][1]["content"]
+        if "=== COUNCIL ANSWERS ===" in user_msg:
+            return {"content": "## Synthesis prose only, no JSON block",
+                    "tokens_in": 1, "tokens_out": 1}
+        if "=== ANSWERS TO RANK ===" in user_msg:
+            return {"content": json.dumps(
+                {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}]}),
+                "tokens_in": 1, "tokens_out": 1}
+        return {"content": "answer", "tokens_in": 1, "tokens_out": 1}
+
+    result = await run_council(question="q", members=members, call_fn=fake_call,
+                               synthesis=True)
+    assert result["stage3"]["status"] == "ok"  # prose intact
+    assert result["stage3"]["analysis"] is None
+    assert result["summary"]["analysis"] is None
+    assert any("analysis" in n.lower() for n in result["notes"])
+
+
+async def test_summary_analysis_none_when_no_synthesis():
+    members = _make_members()
+
+    async def fake_call(**kwargs):
+        user_msg = kwargs["messages"][1]["content"]
+        if "=== ANSWERS TO RANK ===" in user_msg:
+            return {"content": json.dumps(
+                {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}]}),
+                "tokens_in": 1, "tokens_out": 1}
+        return {"content": "answer", "tokens_in": 1, "tokens_out": 1}
+
+    result = await run_council(question="q", members=members, call_fn=fake_call)
+    assert result["summary"]["analysis"] is None
 
 
 # ---- Multi-round debate ----------------------------------------------------

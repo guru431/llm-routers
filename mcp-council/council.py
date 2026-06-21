@@ -16,6 +16,7 @@ import string
 import time
 from typing import Any, Awaitable, Callable
 
+from healthcheck import _classify_error
 from models import CATALOG, COUNCIL_DEFAULT, resolve_members
 from openai_client import CouncilHTTPError, call_openai_compat
 from prompts import (
@@ -23,6 +24,7 @@ from prompts import (
     STAGE1_SYSTEM,
     STAGE2_SYSTEM,
     STAGE3_SYSTEM,
+    STAGE3_WEB_SEARCH_NOTE,
     build_stage1_round_n_user,
     build_stage1_user,
     build_stage2_user,
@@ -246,6 +248,54 @@ def _extract_json(text: str) -> dict:
     if match:
         return json.loads(match.group(0))
     raise ValueError("no JSON object found in response")
+
+
+# The chairman appends its structured analysis after this exact line, then a
+# single fenced ```json block. Anchoring on the sentinel means a ```json sample
+# inside the prose answer can't be mistaken for the analysis block.
+ANALYSIS_SENTINEL = "=== ANALYSIS (JSON) ==="
+_ANALYSIS_KEYS = (
+    "consensus", "contradictions", "partial_coverage", "unique_insights", "blind_spots",
+)
+
+
+def _normalize_analysis(parsed: object) -> dict | None:
+    """Coerce a parsed analysis object to the fixed 5-key taxonomy: each key
+    becomes a list ([] when missing or the wrong type). Returns None if `parsed`
+    is not a dict or every category is empty (no signal worth surfacing)."""
+    if not isinstance(parsed, dict):
+        return None
+    out = {
+        k: (parsed.get(k) if isinstance(parsed.get(k), list) else [])
+        for k in _ANALYSIS_KEYS
+    }
+    if not any(out[k] for k in _ANALYSIS_KEYS):
+        return None
+    return out
+
+
+def _split_synthesis_and_analysis(content: str) -> tuple[str, dict | None]:
+    """Split the chairman's output into (prose_synthesis, analysis | None).
+
+    The chairman is told to append `=== ANALYSIS (JSON) ===` then a single fenced
+    ```json block. We parse ONLY the sentinel-anchored block. Any failure (no
+    sentinel, no fence, bad JSON, wrong shape, all-empty) degrades to
+    (prose, None): the prose synthesis is the primary deliverable and is never
+    lost — only the optional structured analysis is dropped. The sentinel and
+    everything after it are stripped from the returned prose."""
+    idx = content.rfind(ANALYSIS_SENTINEL)
+    if idx == -1:
+        return content, None
+    prose = content[:idx].rstrip()
+    tail = content[idx + len(ANALYSIS_SENTINEL):]
+    m = re.search(r"```(?:json)?\s*\n?(.*?)```", tail, re.DOTALL)
+    if not m:
+        return prose, None
+    try:
+        parsed = json.loads(m.group(1).strip())
+    except (ValueError, TypeError):
+        return prose, None
+    return prose, _normalize_analysis(parsed)
 
 
 async def _run_member_stage2(
@@ -473,12 +523,20 @@ async def _run_stage3_synthesis(
     files_section: str | None,
     max_response_tokens: int,
     call_fn: CallFn,
+    *,
+    web_search: bool = False,
+    search_cache: RunSearchCache | None = None,
 ) -> dict:
     """Single LLM call to synthesise a final answer from stage1 + stage2 inputs.
 
+    `web_search=True` routes the chairman through the same tool-loop stage-1
+    members use, so it can fact-check a disputed claim before adopting it. The
+    per-run `search_cache` is shared with stage 1 (duplicate queries are free).
+
     Returns:
         {"chairman_id": str, "chairman_model": str, "status": "ok"|"error",
-         "synthesis": str|None, "error": str|None, "latency_ms": int}
+         "synthesis": str|None, "error": str|None, "latency_ms": int,
+         "tool_calls_log": [...]}
     """
     start = time.monotonic()
     api_key = os.environ.get(chairman["env_key"])
@@ -494,8 +552,11 @@ async def _run_stage3_synthesis(
 
     answers = [(s["model"], s["answer"]) for s in stage1 if s["status"] == "ok"]
     rankings_digest = _build_rankings_digest(stage1, aggregate, stage2)
+    system_content = STAGE3_SYSTEM
+    if web_search:
+        system_content = STAGE3_SYSTEM + "\n\n" + STAGE3_WEB_SEARCH_NOTE
     messages = [
-        {"role": "system", "content": STAGE3_SYSTEM},
+        {"role": "system", "content": system_content},
         {
             "role": "user",
             "content": build_stage3_user(
@@ -504,16 +565,25 @@ async def _run_stage3_synthesis(
         },
     ]
     max_tokens = max(max_response_tokens, chairman.get("min_max_tokens", 0))
+    tools = [WEB_SEARCH_TOOL_SPEC] if web_search else None
 
     try:
-        result = await call_fn(
-            base_url=chairman["base_url"],
-            api_key=api_key,
-            model=chairman["model"],
-            messages=messages,
-            max_tokens=max_tokens,
-            extra_payload=chairman.get("extra"),
-        )
+        if tools:
+            result, tool_log = await run_with_tool_loop(
+                member=chairman, api_key=api_key, messages=messages,
+                max_tokens=max_tokens, call_fn=call_fn, tools=tools,
+                search_cache=search_cache,
+            )
+        else:
+            result = await call_fn(
+                base_url=chairman["base_url"],
+                api_key=api_key,
+                model=chairman["model"],
+                messages=messages,
+                max_tokens=max_tokens,
+                extra_payload=chairman.get("extra"),
+            )
+            tool_log = []
     except CouncilHTTPError as e:
         return {
             "chairman_id": chairman["id"],
@@ -524,16 +594,41 @@ async def _run_stage3_synthesis(
             "latency_ms": int((time.monotonic() - start) * 1000),
         }
 
+    # A tool-looping chairman can exhaust its iterations still wanting to search
+    # — mirror the stage-1 contract: mark error so the caller falls back to the
+    # stage 1/2 materials rather than relaying an empty synthesis.
+    if not result.get("content"):
+        return {
+            "chairman_id": chairman["id"],
+            "chairman_model": chairman["model"],
+            "status": "error",
+            "synthesis": None,
+            "error": (
+                f"no final content after {MAX_TOOL_ITERATIONS} tool iterations "
+                f"(finish_reason={result.get('finish_reason')})"
+            ),
+            "latency_ms": int((time.monotonic() - start) * 1000),
+            "tokens_in": result.get("tokens_in"),
+            "tokens_out": result.get("tokens_out"),
+            "attempts": result.get("attempts"),
+            "tool_calls_log": tool_log,
+            **_loop_usage(result),
+        }
+
+    prose, analysis = _split_synthesis_and_analysis(result["content"])
     return {
         "chairman_id": chairman["id"],
         "chairman_model": chairman["model"],
         "status": "ok",
-        "synthesis": result["content"],
+        "synthesis": prose,
+        "analysis": analysis,
         "error": None,
         "latency_ms": int((time.monotonic() - start) * 1000),
         "tokens_in": result.get("tokens_in"),
         "tokens_out": result.get("tokens_out"),
         "attempts": result.get("attempts"),
+        "tool_calls_log": tool_log,
+        **_loop_usage(result),
     }
 
 
@@ -661,6 +756,24 @@ def _compute_usage(
     }
 
 
+def _council_failure_reason(error: str | None) -> str:
+    """Classify a council failed-member error string into the same coarse enum
+    healthcheck uses, so automation can branch on a stable `failure_reason` code
+    instead of substring-matching the human-readable `error`.
+
+    Reuses healthcheck._classify_error for provider-level failures (402/401/5xx/
+    timeout/…). Council-only failure modes the healthcheck classifier never sees:
+    a missing env var maps to `no_key` (healthcheck's dedicated status for that
+    case); malformed-ranking (`invalid_json: …`) and tool-loop-exhaustion strings
+    have no dedicated code and fall through to the generic `error`."""
+    if not error:
+        return "error"
+    low = error.lower()
+    if "env var" in low and "not set" in low:
+        return "no_key"
+    return _classify_error(error)
+
+
 def _build_summary(
     stage1: list[dict],
     stage2: list[dict],
@@ -675,12 +788,14 @@ def _build_summary(
     for s in stage1:
         if s["status"] != "ok":
             failed_models.append({"id": s["id"], "model": s["model"],
-                                  "stage": "stage1", "error": s.get("error")})
+                                  "stage": "stage1", "error": s.get("error"),
+                                  "failure_reason": _council_failure_reason(s.get("error"))})
     for s in stage2:
         if s["status"] != "ok":
             rid = s["ranker_id"]
             failed_models.append({"id": rid, "model": model_by_id.get(rid, rid),
-                                  "stage": "stage2", "error": s.get("error")})
+                                  "stage": "stage2", "error": s.get("error"),
+                                  "failure_reason": _council_failure_reason(s.get("error"))})
 
     # Winner = top of aggregate, else the lone surviving member.
     winner_id = winner_model = None
@@ -748,6 +863,14 @@ def _build_summary(
         "failed_models": failed_models,
         "top_disagreements": top_disagreements,
         "synthesized": bool(stage3 and stage3.get("status") == "ok"),
+        # Structured semantic taxonomy from the chairman (consensus / contradictions
+        # / partial_coverage / unique_insights / blind_spots). None unless synthesis
+        # ran and produced a parseable analysis block.
+        "analysis": (
+            stage3.get("analysis")
+            if stage3 and stage3.get("status") == "ok"
+            else None
+        ),
         "recommended_next_action": next_action,
     }
 
@@ -855,7 +978,8 @@ async def run_council(
     rounds_detail: list[dict] = []
 
     # One shared search cache per run — members issue overlapping queries and
-    # otherwise pay Exa per duplicate. Only round-1 stage 1 uses web_search.
+    # otherwise pay Exa per duplicate. Round-1 stage 1 and (when synthesis runs)
+    # the stage-3 chairman share it; stage 2 and rounds 2+ stay search-free.
     search_cache = RunSearchCache() if web_search else None
 
     # --- Round 1 ---------------------------------------------------------
@@ -963,6 +1087,8 @@ async def run_council(
                 files_section=stage2_files,
                 max_response_tokens=max_response_tokens,
                 call_fn=call_fn,
+                web_search=web_search,
+                search_cache=search_cache,
             )
             progress("stage3", {
                 "id": stage3["chairman_id"],
@@ -975,6 +1101,11 @@ async def run_council(
                 notes.append(
                     f"stage3 synthesis error from {stage3['chairman_id']} "
                     f"({stage3['chairman_model']}): {stage3['error']}"
+                )
+            elif stage3.get("analysis") is None:
+                notes.append(
+                    "stage3 analysis JSON missing/unparseable — prose synthesis "
+                    "intact, structured analysis (blind_spots etc.) unavailable."
                 )
 
     progress("phase", {"phase": "done"})

@@ -110,6 +110,43 @@ def test_format_markdown_empty_stage2():
     assert "stage 2 skipped" in md
 
 
+def test_format_markdown_renders_blind_spots_and_analysis():
+    res = _stub_result()
+    res["stage3"] = {
+        "chairman_id": "m1", "chairman_model": "Model-1", "status": "ok",
+        "synthesis": "Final answer.", "error": None, "latency_ms": 5000,
+        "analysis": {
+            "consensus": ["shared point"],
+            "contradictions": [{"topic": "DB", "stances": [
+                {"model": "Model-1", "stance": "pg"},
+                {"model": "Model-3", "stance": "sqlite"}]}],
+            "partial_coverage": [],
+            "unique_insights": [{"model": "Model-3", "insight": "use WAL"}],
+            "blind_spots": ["no one discussed backups"],
+        },
+    }
+    md = server.format_markdown("q", res)
+    assert "## Cross-cutting analysis" in md
+    assert "Blind spots" in md
+    assert "no one discussed backups" in md
+    assert "shared point" in md
+    assert "use WAL" in md
+    # Blind spots render before consensus (highest-value first).
+    assert md.index("Blind spots") < md.index("Consensus")
+
+
+def test_format_markdown_no_analysis_section_when_absent():
+    """A stage3 without an analysis dict renders no analysis section."""
+    res = _stub_result()
+    res["stage3"] = {
+        "chairman_id": "m1", "chairman_model": "Model-1", "status": "ok",
+        "synthesis": "Final answer.", "error": None, "latency_ms": 5000,
+        "analysis": None,
+    }
+    md = server.format_markdown("q", res)
+    assert "## Cross-cutting analysis" not in md
+
+
 def test_do_council_ask_sandbox_error_logged(monkeypatch, tmp_path):
     """If sandbox raises, we get RuntimeError and log_call is called once."""
     logged: list[dict] = []

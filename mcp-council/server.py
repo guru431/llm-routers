@@ -65,6 +65,56 @@ def _clamp_tokens(n: int) -> int:
     return min(max(n, 1), MAX_RESPONSE_TOKENS_HARD_CAP)
 
 
+def _format_analysis_lines(analysis: dict) -> list[str]:
+    """Render the chairman's structured analysis. Blind spots first — the
+    highest-value 'what did everyone miss' signal. Empty categories are skipped."""
+    lines: list[str] = ["## Cross-cutting analysis", ""]
+    bs = analysis.get("blind_spots") or []
+    if bs:
+        lines.append("**Blind spots (no member addressed):**")
+        lines.extend(f"- {x}" for x in bs)
+        lines.append("")
+    contr = analysis.get("contradictions") or []
+    if contr:
+        lines.append("**Contradictions:**")
+        for c in contr:
+            if not isinstance(c, dict):
+                lines.append(f"- {c}")
+                continue
+            topic = c.get("topic", "?")
+            stances = "; ".join(
+                f"{s.get('model', '?')}: {s.get('stance', '')}"
+                for s in (c.get("stances") or []) if isinstance(s, dict)
+            )
+            lines.append(f"- {topic} — {stances}" if stances else f"- {topic}")
+        lines.append("")
+    cons = analysis.get("consensus") or []
+    if cons:
+        lines.append("**Consensus:**")
+        lines.extend(f"- {x}" for x in cons)
+        lines.append("")
+    pc = analysis.get("partial_coverage") or []
+    if pc:
+        lines.append("**Partial coverage:**")
+        for p in pc:
+            if isinstance(p, dict):
+                models = ", ".join(p.get("models") or [])
+                lines.append(f"- [{models}] {p.get('point', '')}")
+            else:
+                lines.append(f"- {p}")
+        lines.append("")
+    ui = analysis.get("unique_insights") or []
+    if ui:
+        lines.append("**Unique insights:**")
+        for u in ui:
+            if isinstance(u, dict):
+                lines.append(f"- {u.get('model', '?')}: {u.get('insight', '')}")
+            else:
+                lines.append(f"- {u}")
+        lines.append("")
+    return lines
+
+
 def format_markdown(question: str, result: dict) -> str:
     """Render stage1+stage2+aggregate (and optional stage 3 synthesis) into a
     markdown brief for the chairman (Claude in-session, or whoever consumes it)."""
@@ -99,6 +149,9 @@ def format_markdown(question: str, result: dict) -> str:
             lines.append("")
             lines.append(stage3["synthesis"])
             lines.append("")
+            analysis = stage3.get("analysis")
+            if analysis:
+                lines.extend(_format_analysis_lines(analysis))
         else:
             lines.append(
                 f"## Final Synthesis — FAILED (chairman {stage3['chairman_model']}: {stage3['error']})"
@@ -207,7 +260,10 @@ def format_markdown(question: str, result: dict) -> str:
             failed = summary.get("failed_models") or []
             if failed:
                 lines.append(
-                    "- Failed: " + ", ".join(f"{f['model']} ({f['stage']})" for f in failed)
+                    "- Failed: " + ", ".join(
+                        f"{f['model']} ({f['stage']}: {f.get('failure_reason', 'error')})"
+                        for f in failed
+                    )
                 )
             dis = summary.get("top_disagreements") or []
             if dis:
@@ -409,13 +465,17 @@ async def council_ask(
         "best" (все 7), "balanced" (3 модели), "cheap" (2 дешёвых). Нельзя
         задавать вместе с `models`.
       context_paths — опциональные файлы, прокидываются всем участникам (sandbox).
-      synthesis — если True, добавляется stage 3 (auto-synthesis by chairman);
-        если False, возвращаются только материалы stage1+stage2.
+      synthesis — если True, добавляется stage 3 (auto-synthesis by chairman).
+        Chairman дополнительно отдаёт структурный analysis (consensus /
+        contradictions / partial_coverage / unique_insights / blind_spots),
+        который попадает в summary.analysis (machine-readable). Если False,
+        возвращаются только материалы stage1+stage2.
       rounds — 1..3. 2+ = multi-round debate с критикой между раундами.
       web_search — если True, каждая модель в stage 1 получает tool
         `web_search(query)` через Exa.ai (per-model exploration, не shared
-        context). Stage 2/3 без поиска. Добавляет 30-90s к каждому stage 1
-        вызову и расход на Exa API.
+        context). Stage 2 без поиска; при synthesis=True chairman тоже получает
+        web_search для фактчека спорных claim'ов. Добавляет 30-90s к каждому
+        stage 1 вызову и расход на Exa API.
 
     Note: блокирующий вызов; для long-running неблокирующего паттерна
     используй council_ask_async / council_status / council_result.
