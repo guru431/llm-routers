@@ -349,3 +349,54 @@ def test_model_ask_disabled_id_raises(monkeypatch):
     monkeypatch.setattr(server, "log_call", lambda **kw: None)
     with pytest.raises(RuntimeError, match="disabled"):
         asyncio.run(server.model_ask(model_id="minimax-direct", prompt="x"))
+
+
+# -------------------------------------------------------------------------
+# council_result: terminal error/cancelled phases must be ready=True (not a
+# forever-poll). Regression for the P2 finding where only phase=="done" was
+# treated as ready, so a client polling on `ready` looped forever on error.
+# -------------------------------------------------------------------------
+
+
+def test_council_result_terminal_error_is_ready(monkeypatch, tmp_path):
+    import state as job_state
+
+    monkeypatch.setenv("COUNCIL_JOBS_DIR", str(tmp_path / "jobs"))
+
+    async def _run():
+        await job_state._reset_for_tests()
+        try:
+            s = await job_state.create_job(
+                question_preview="q", synthesis=False, rounds=1
+            )
+            s.error = "boom"
+            job_state.mark_phase(s, "error")
+            res = await server.council_result(s.job_id)
+            assert res["ready"] is True
+            assert res["phase"] == "error"
+            assert res["error"] == "boom"
+        finally:
+            await job_state._reset_for_tests()
+
+    asyncio.run(_run())
+
+
+def test_council_result_non_terminal_not_ready(monkeypatch, tmp_path):
+    import state as job_state
+
+    monkeypatch.setenv("COUNCIL_JOBS_DIR", str(tmp_path / "jobs"))
+
+    async def _run():
+        await job_state._reset_for_tests()
+        try:
+            s = await job_state.create_job(
+                question_preview="q", synthesis=False, rounds=1
+            )
+            job_state.mark_phase(s, "stage1")
+            res = await server.council_result(s.job_id)
+            assert res["ready"] is False
+            assert res["phase"] == "stage1"
+        finally:
+            await job_state._reset_for_tests()
+
+    asyncio.run(_run())

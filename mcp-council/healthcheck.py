@@ -13,7 +13,7 @@ import time
 from urllib.parse import urlparse
 
 from models import CATALOG, UnknownModelError
-from openai_client import CouncilHTTPError, call_openai_compat
+from openai_client import call_openai_compat
 
 # A trivial prompt — we only care that the provider answers, not what it says.
 _PING_MESSAGES = [{"role": "user", "content": "Reply with the single word: pong"}]
@@ -58,7 +58,10 @@ def _provider(base_url: str) -> str:
 
 
 async def _check_one(mid: str, cfg: dict, call_fn, timeout: float) -> dict:
-    model = cfg["model"]
+    # `model` may be absent on a disabled/incomplete entry — use .get so a
+    # disabled member is reported (status="disabled") instead of raising KeyError
+    # before the enabled check below.
+    model = cfg.get("model")
     base = {
         "id": mid,
         "model": model,
@@ -95,7 +98,12 @@ async def _check_one(mid: str, cfg: dict, call_fn, timeout: float) -> dict:
             max_attempts=1,
             record_breaker=False,
         )
-    except CouncilHTTPError as e:
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        # Always return a dict so asyncio.gather (no return_exceptions) never
+        # sees a raise: any non-cancellation failure (HTTP, unexpected probe
+        # error) becomes this model's status row and the other probes survive.
         return {**base, "enabled": True, "key_present": True, "ok": False,
                 "status": _classify_error(str(e)),
                 "latency_ms": int((time.monotonic() - start) * 1000),

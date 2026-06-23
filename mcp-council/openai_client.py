@@ -4,7 +4,7 @@ Supports OCG (OpenCode Go), DeepSeek direct, Helicone Gateway — все они 
 один и тот же /v1/chat/completions схему. Различия (thinking/reasoning_effort,
 min max_tokens) задаются через `extra` и `min_max_tokens` в config.COUNCIL.
 
-Retry: до 2 повторов на HTTP 429/500/502/503/529 и на timeout, backoff
+Retry: до 2 повторов на HTTP 408/429/500/502/503/504/529 и на timeout, backoff
 [15s, 45s] между попытками (RETRY_BACKOFFS).
 402 (insufficient balance) — без retry, сразу ошибка.
 
@@ -28,8 +28,9 @@ import circuit_breaker
 DEFAULT_TIMEOUT = 600.0
 # 500/502/503: transient upstream errors observed at OCG (5 outages / 7 weeks
 # per project notes). Worth retrying — they typically clear within a minute.
-# 529: Anthropic-style overload. 429: rate limit.
-RETRY_STATUSES = (429, 500, 502, 503, 529)
+# 504: gateway timeout (typical for an overloaded OCG gateway). 408: request
+# timeout. 529: Anthropic-style overload. 429: rate limit.
+RETRY_STATUSES = (408, 429, 500, 502, 503, 504, 529)
 # Backoff for 5xx is shorter than for 429 because the upstream is usually back
 # within seconds; we still keep two attempts so a longer outage falls through.
 RETRY_BACKOFFS = (15, 45)  # seconds between attempts
@@ -54,6 +55,19 @@ def _get_client() -> "httpx.AsyncClient":
     return _CLIENT
 
 
+async def close_client() -> None:
+    """Close and reset the module-level AsyncClient.
+
+    Wire into a server shutdown/lifecycle hook so the connection pool is
+    released cleanly. Also lets cross-loop tests / hot-reload drop a client
+    bound to a now-dead event loop — the next call lazily re-creates it.
+    """
+    global _CLIENT
+    if _CLIENT is not None:
+        await _CLIENT.aclose()
+        _CLIENT = None
+
+
 def _strip_think(text: str) -> str:
     return re.sub(r"<think>[\s\S]*?</think>\s*", "", text).strip()
 
@@ -74,10 +88,11 @@ async def call_openai_compat(
     max_attempts: int | None = None,
     record_breaker: bool = True,
 ) -> dict:
-    """Один POST к {base_url}/chat/completions с retry на 429/500/502/503/529.
+    """Один POST к {base_url}/chat/completions с retry на 408/429/500/502/503/504/529.
 
-    `max_attempts`: cap on total HTTP attempts (1 = no retries). None = full
-    RETRY_BACKOFFS budget (default council behavior).
+    `max_attempts`: cap on total HTTP attempts, clamped to a minimum of 1
+    (1 = no retries; values <1 are treated as 1). None = full RETRY_BACKOFFS
+    budget (default council behavior).
     `record_breaker`: when False, infra failures do NOT feed the circuit
     breaker (healthcheck uses this so a probe can't trip the breaker for the
     real council path).
@@ -113,7 +128,12 @@ async def call_openai_compat(
         "stream": False,
     }
     if extra_payload:
-        payload.update(extra_payload)
+        # Protected keys must come from explicit args, never from a catalog
+        # `extra` dict (which is attacker-distant but still a footgun). temperature
+        # / max_tokens / response_format stay overridable on purpose — the kimi
+        # catalog entry forces temperature=1 via extra.
+        protected = {"model", "messages", "stream"}
+        payload.update({k: v for k, v in extra_payload.items() if k not in protected})
     if response_format is not None:
         payload["response_format"] = response_format
     if tools:
@@ -130,9 +150,11 @@ async def call_openai_compat(
     client = _get_client()
     # Retry budget: full RETRY_BACKOFFS by default; max_attempts caps it (1 = no
     # retries) so healthcheck can probe without burning the full backoff budget.
+    # Clamp to >=1 attempt so max_attempts=0 still makes one request (the
+    # docstring contract is "1 = no retries", there is no "0 attempts" mode).
     max_retries = len(RETRY_BACKOFFS)
     if max_attempts is not None:
-        max_retries = min(max_retries, max(0, max_attempts - 1))
+        max_retries = min(max_retries, max(0, max(1, max_attempts) - 1))
 
     def _record_failure() -> None:
         if record_breaker:

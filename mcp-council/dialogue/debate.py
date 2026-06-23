@@ -99,6 +99,9 @@ async def run_debate(
     participant seeding, and pick up from state.current_round + 1.
     """
     mark_phase(state, "starting")
+    # Single source of truth: the loop (run_dialogue) and the summary tag both
+    # read state.total_rounds, so sync the rounds param into it at entry.
+    state.total_rounds = rounds
     if not resume:
         positions = await generate_positions(
             moderator_cfg=moderator_cfg,

@@ -44,7 +44,10 @@ CATALOG: dict[str, dict] = {
         "env_key": "OPENCODE_GO_KEY",
         # k2.7-code не поддерживает reasoning_effort="none" (HTTP 400, в отличие
         # от k2.6) — допустимы minimal|low|medium. minimal — ближайшее к none.
-        "extra": {"reasoning_effort": "minimal"},
+        # k2.7-code (Moonshot) принимает ТОЛЬКО temperature=1 ("invalid
+        # temperature: only 1 is allowed for this model") — overrides council
+        # default 0.3 через extra (payload.update(extra) wins, см. openai_client).
+        "extra": {"reasoning_effort": "minimal", "temperature": 1},
         "min_max_tokens": 30000,
         "price_in": None,
         "price_out": None,

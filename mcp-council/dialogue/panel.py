@@ -168,6 +168,9 @@ async def run_panel(
     state — skip seeding and pick up from state.current_round + 1.
     """
     mark_phase(state, "starting")
+    # Single source of truth: the round loop and the summary tag both read
+    # state.total_rounds, so sync the rounds param into it at entry.
+    state.total_rounds = rounds
     if not resume:
         state.participants = [
             _cfg_to_participant(c, role=(roles[i] if roles else None))
@@ -186,7 +189,7 @@ async def run_panel(
     role_descriptors = {p["id"]: role_descriptor(p) for p in state.participants}
 
     start = state.current_round + 1
-    for round_n in range(start, rounds + 1):
+    for round_n in range(start, state.total_rounds + 1):
         da_id = (
             devils_advocate_for_round(state.participants, round_n)
             if devils_advocate_rotation else None

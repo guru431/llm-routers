@@ -24,11 +24,16 @@ Event types currently emitted:
   - "tool_call"       → {"member_id": ..., "name": "web_search",
                           "query": str, "status": "ok"|"error",
                           "num_results": int|None, "latency_ms": int|None}
+  - "result_ready"    → {"status": "ok"|"error"|"cancelled", "error": str|None,
+                          "members_ok_stage1": int, "members_ok_stage2": int,
+                          "dump_path": str|None}  # terminal event — run is
+                          # consumable / finished; Monitor consumers match on it
 """
 
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
 from pathlib import Path
@@ -42,16 +47,20 @@ _lock = threading.Lock()
 
 
 class EventWriter:
-    """Append-only JSONL writer for a single job's event stream."""
+    """Append-only JSONL writer for a single job's event stream.
 
-    def __init__(self, path: Path) -> None:
+    When `_fh` is None the writer is a no-op (the file couldn't be opened — see
+    open_writer's fallback). The event log is best-effort observability, so a
+    bad path must degrade to silence, not crash the council run.
+    """
+
+    def __init__(self, path: Path, *, fh=None) -> None:
         self._path = path
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        # Buffering=1 → line-buffered text mode, so each \n forces a flush.
-        # encoding=utf-8 to keep cyrillic / emoji in event payloads readable.
-        self._fh = self._path.open("a", encoding="utf-8", buffering=1)
+        self._fh = fh
 
     def write(self, event_type: str, payload: dict[str, Any]) -> None:
+        if self._fh is None:
+            return
         line = json.dumps(
             {"ts": time.time(), "event": event_type, "payload": payload},
             ensure_ascii=False,
@@ -63,6 +72,8 @@ class EventWriter:
         self._fh.flush()
 
     def close(self) -> None:
+        if self._fh is None:
+            return
         try:
             self._fh.close()
         except Exception:  # pragma: no cover — close should not throw
@@ -74,12 +85,29 @@ class EventWriter:
 
 
 def open_writer(job_id: str, base_dir: Path) -> EventWriter:
-    """Open (or return existing) writer for `job_id`. Idempotent."""
+    """Open (or return existing) writer for `job_id`. Idempotent.
+
+    If the file can't be created/opened (perms, bad path), returns a no-op
+    writer instead of raising — the event log is best-effort and must never
+    take down the background job that creates it.
+    """
     with _lock:
         if job_id in _writers:
             return _writers[job_id]
         path = base_dir / "events" / f"{job_id}.jsonl"
-        writer = EventWriter(path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # Buffering=1 → line-buffered text mode, so each \n forces a flush.
+            # encoding=utf-8 to keep cyrillic / emoji in event payloads readable.
+            fh = path.open("a", encoding="utf-8", buffering=1)
+        except OSError as e:
+            print(
+                f"[mcp-council] event log unavailable for {job_id} "
+                f"({type(e).__name__}: {e}) — continuing without it",
+                file=sys.stderr,
+            )
+            fh = None
+        writer = EventWriter(path, fh=fh)
         _writers[job_id] = writer
         return writer
 

@@ -155,11 +155,11 @@ def main():
                 empty_text += 1
                 continue
             ok += 1
-            if r["ttft_s"] is not None:
+            if r.get("ttft_s") is not None:
                 ttfts.append(r["ttft_s"])
             if r.get("ttft_reasoning_s") is not None:
                 ttfts_r.append(r["ttft_reasoning_s"])
-            if r["total_s"] is not None:
+            if r.get("total_s") is not None:
                 totals.append(r["total_s"])
             j = judges.get((mid, tid))
             if j and j.get("score") is not None:
@@ -315,9 +315,9 @@ def main():
             if not r:
                 continue
             j = judges.get((mid, tid))
-            ttft = r["ttft_s"]
+            ttft = r.get("ttft_s")
             ttft_r = r.get("ttft_reasoning_s")
-            total = r["total_s"]
+            total = r.get("total_s")
             err = r.get("error")
             text = r.get("text") or ""
             h = heuristic(tid, text) if not err else ""

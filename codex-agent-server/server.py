@@ -421,7 +421,12 @@ def run_codex(prompt: str, *, model_base: str, sandbox: str,
                 pass
             raise
         if proc.returncode != 0:
-            raise RuntimeError((stderr or "").strip() or f"codex exit code {proc.returncode}")
+            # Log the raw codex stderr server-side only — it can contain workspace
+            # paths, code fragments and CLI internals. The exception message stays
+            # generic so _handle_chat never leaks it to the client (worse on LAN).
+            detail = (stderr or "").strip()
+            logger.error("codex exit code %s; stderr: %s", proc.returncode, detail or "(empty)")
+            raise RuntimeError("codex command failed")
         with open(outfile, encoding="utf-8") as f:
             return f.read().strip()
     finally:
@@ -533,7 +538,7 @@ class Handler(BaseHTTPRequestHandler):
                 "status": "ok",
                 "model": DEFAULT_MODEL,
                 "default_sandbox": DEFAULT_SANDBOX,
-                "uptime": int(time.time() - SERVER_START),
+                "uptime": int(time.monotonic() - SERVER_START_MONO),
                 "security": "authenticated" if AUTH_TOKEN else "unauthenticated",
             })
         elif self.path == "/v1/models":
@@ -564,9 +569,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_chat(self, body: dict):
         """OpenAI-compatible chat completions with sandbox/workdir routing."""
+        # Validate body shape before touching it: a non-dict body or non-list
+        # messages/tools would otherwise raise AttributeError/TypeError → a bare
+        # 500 (and via str(exc) could leak internals). Return 400 instead.
+        if not isinstance(body, dict):
+            self._send(400, {"error": {"message": "request body must be a JSON object", "type": "invalid_request_error"}})
+            return
         messages = body.get("messages", [])
+        if not isinstance(messages, list):
+            self._send(400, {"error": {"message": "messages must be a list", "type": "invalid_request_error"}})
+            return
         if not messages:
             self._send(400, {"error": {"message": "messages is required", "type": "invalid_request_error"}})
+            return
+        tools = body.get("tools")
+        if tools is not None and not isinstance(tools, list):
+            self._send(400, {"error": {"message": "tools must be a list", "type": "invalid_request_error"}})
             return
 
         try:
@@ -574,7 +592,6 @@ class Handler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             timeout = 300
         timeout = max(10, min(timeout, 600))
-        tools = body.get("tools")
 
         # Per-request reasoning effort overrides the server default (REASONING).
         # Token-sensitive consumers (code-review) can request 'low'/'minimal'
@@ -583,6 +600,12 @@ class Handler(BaseHTTPRequestHandler):
         if req_reasoning not in ("minimal", "low", "medium", "high"):
             req_reasoning = None
         effective_reasoning = req_reasoning or REASONING
+
+        # codex exec is non-streaming (final message only via -o), so we can't
+        # stream incrementally. Honour stream=true with a minimal SSE wrap: the
+        # complete response is emitted as one chunk followed by [DONE], so OpenAI
+        # SSE clients work instead of silently getting a non-stream JSON body.
+        stream = bool(body.get("stream"))
 
         try:
             model_base, suffix_mode = resolve_model(body.get("model"))
@@ -666,30 +689,43 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 resp_message["content"] = content
 
-            self._send(200, {
-                "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": body.get("model") or DEFAULT_MODEL,
-                "choices": [{
-                    "index": 0,
-                    "message": resp_message,
-                    "finish_reason": "tool_calls" if tool_calls else "stop",
-                }],
+            completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+            created = int(time.time())
+            resp_model = body.get("model") or DEFAULT_MODEL
+            finish_reason = "tool_calls" if tool_calls else "stop"
+            usage = {
                 # Rough estimate (chars/4). Codex doesn't expose real token
                 # counts in -o output; for ru/CJK this undercounts.
-                "usage": {
-                    "prompt_tokens": len(prompt) // 4,
-                    "completion_tokens": len(result) // 4,
-                    "total_tokens": (len(prompt) + len(result)) // 4,
-                    "estimate": True,
-                },
-            })
+                "prompt_tokens": len(prompt) // 4,
+                "completion_tokens": len(result) // 4,
+                "total_tokens": (len(prompt) + len(result)) // 4,
+                "estimate": True,
+            }
+
+            if stream:
+                self._send_stream(completion_id, created, resp_model,
+                                  resp_message, finish_reason, usage)
+            else:
+                self._send(200, {
+                    "id": completion_id,
+                    "object": "chat.completion",
+                    "created": created,
+                    "model": resp_model,
+                    "choices": [{
+                        "index": 0,
+                        "message": resp_message,
+                        "finish_reason": finish_reason,
+                    }],
+                    "usage": usage,
+                })
         except subprocess.TimeoutExpired:
             self._send(504, {"error": {"message": "codex timeout", "type": "timeout"}})
-        except Exception as exc:
+        except Exception:
+            # Full traceback (incl. any workspace paths / codex output) goes to the
+            # server log only; the client gets a generic message so a bound LAN peer
+            # can't harvest internals from the 500 body.
             logger.exception("codex error")
-            self._send(500, {"error": {"message": str(exc), "type": "server_error"}})
+            self._send(500, {"error": {"message": "internal server error", "type": "server_error"}})
         finally:
             _CODEX_SEM.release()
 
@@ -728,6 +764,37 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_stream(self, completion_id, created, model, resp_message,
+                     finish_reason, usage):
+        """Minimal OpenAI SSE wrap for stream=true. codex exec yields only the
+        final message, so we can't stream token-by-token: emit the whole
+        completion as a single chat.completion.chunk, then [DONE]."""
+        delta = {"role": "assistant"}
+        if resp_message.get("content") is not None:
+            delta["content"] = resp_message["content"]
+        if resp_message.get("tool_calls"):
+            delta["tool_calls"] = resp_message["tool_calls"]
+        chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason,
+            }],
+            "usage": usage,
+        }
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        payload = json.dumps(chunk, ensure_ascii=False)
+        self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+        self.wfile.write(b"data: [DONE]\n\n")
+
 
 class SingleInstanceServer(ThreadingHTTPServer):
     # HTTPServer sets allow_reuse_address=1 (SO_REUSEADDR). On Windows that lets
@@ -741,6 +808,9 @@ class SingleInstanceServer(ThreadingHTTPServer):
 
 
 SERVER_START = time.time()
+# Monotonic clock for uptime: time.time() can jump (NTP/manual clock shift) and
+# make uptime go negative. SERVER_START stays wall-clock for the `created` field.
+SERVER_START_MONO = time.monotonic()
 
 
 def main():
@@ -762,6 +832,18 @@ def main():
             "and restart."
         )
         sys.exit(2)
+
+    # Equal read-only and agent tokens collapse the privilege separation: a
+    # leaked read-only token would then also unlock workspace-write. Warn loudly
+    # rather than silently breaking the read-only/agent split.
+    if AGENT_AUTH_TOKEN and hmac.compare_digest(
+        AGENT_AUTH_TOKEN.encode("utf-8"), AUTH_TOKEN.encode("utf-8")
+    ):
+        logger.warning(
+            "CODEX_AGENT_AGENT_TOKEN equals CODEX_AGENT_TOKEN — read-only/agent "
+            "privilege separation is broken; a leaked read token also grants "
+            "workspace-write. Use a DISTINCT agent token."
+        )
 
     try:
         subprocess.run([CODEX_BIN, "--version"], capture_output=True, check=True, creationflags=CREATE_NO_WINDOW)
@@ -789,9 +871,9 @@ def main():
             "CODEX_AGENT_READ_ROOT not set: read-only codex runs with full host "
             "read access (full host read access). Set CODEX_AGENT_READ_ROOT to pin its cwd."
         )
-    logger.info("Auth: bearer token required on /v1/* (read-token len=%d)", len(AUTH_TOKEN))
+    logger.info("Auth: bearer token required on /v1/*")
     if AGENT_AUTH_TOKEN:
-        logger.info("workspace-write: enabled (separate agent token, len=%d)", len(AGENT_AUTH_TOKEN))
+        logger.info("workspace-write: enabled (separate agent token)")
     else:
         logger.info("workspace-write: DISABLED (set CODEX_AGENT_AGENT_TOKEN to enable agentic mode)")
     logger.info("Endpoints: POST /v1/chat/completions, GET /v1/models, GET /health")

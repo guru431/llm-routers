@@ -67,6 +67,21 @@ def test_extract_json_failure_raises():
         _extract_json("no json here")
 
 
+def test_extract_json_stops_at_first_balanced_object():
+    """Trailing prose with stray braces must not be swallowed into the object —
+    the balanced-brace scanner stops at the first complete {...}."""
+    text = 'Ranking: {"rankings": [{"member": "A", "score": 7}]} — note: use {curly} later.'
+    out = _extract_json(text)
+    assert out == {"rankings": [{"member": "A", "score": 7}]}
+
+
+def test_extract_json_braces_inside_strings_dont_break_scan():
+    """Braces inside JSON string values must not skew the depth count."""
+    text = 'prose {"rankings": [{"member": "A", "score": 7, "reasoning": "use {} sparingly"}]} done'
+    out = _extract_json(text)
+    assert out["rankings"][0]["reasoning"] == "use {} sparingly"
+
+
 def test_aggregate_means_and_sorts():
     stage2 = [
         {
@@ -1027,6 +1042,27 @@ def test_split_synthesis_ignores_json_fence_in_prose():
     assert '"foo": 1' in prose  # the prose code example survives
 
 
+def test_split_synthesis_block_must_follow_sentinel_immediately():
+    """Extraction is anchored: the fenced JSON must follow the sentinel with only
+    whitespace in between. A foreign fence placed first means the analysis is NOT
+    silently pulled from a later block — the prose stays intact, analysis None.
+
+    Old greedy `re.search` would skip the python block and capture the json block
+    out of position; the anchored `re.match` refuses anything but a fence right
+    after the sentinel."""
+    content = (
+        "## Final answer\n\nDo X.\n\n=== ANALYSIS (JSON) ===\n"
+        "```python\nprint('hi')\n```\n"
+        "```json\n" + json.dumps({"blind_spots": ["real one"]}) + "\n```"
+    )
+    prose, parsed = _split_synthesis_and_analysis(content)
+    # The python fence (not valid JSON) sits immediately after the sentinel, so
+    # the anchored matcher tries it and fails JSON parse → degrade to None
+    # instead of reaching past it to the later json block.
+    assert parsed is None
+    assert "Do X." in prose
+
+
 async def test_synthesis_produces_structured_analysis():
     members = _make_members()
     analysis = {"consensus": ["agreed point"], "blind_spots": ["nobody addressed scaling"]}
@@ -1129,6 +1165,43 @@ async def test_run_council_rounds_2_does_second_pass():
     assert all("round2" in s["answer"] for s in result["stage1"] if s["status"] == "ok")
     # rounds_detail has both rounds.
     assert len(result["rounds_detail"]) == 2
+
+
+async def test_run_council_round2_all_fail_restores_round1_as_final():
+    """If round 2 stage1 loses every survivor, the final payload must reference
+    round 1 (which had live answers): stage1 ok, stage2/aggregate populated, and
+    stage3 synthesis still runs. Regression for inconsistent-restore bug."""
+    members = _make_members()
+    round_n = {"i": 0}
+
+    async def fake_call(**kwargs):
+        user_msg = kwargs["messages"][1]["content"]
+        if "=== COUNCIL ANSWERS ===" in user_msg:
+            return {"content": "## Final synthesis from round 1",
+                    "tokens_in": 1, "tokens_out": 1}
+        if "=== ANSWERS TO RANK ===" in user_msg:
+            return {"content": json.dumps(
+                {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}]}),
+                "tokens_in": 1, "tokens_out": 1}
+        # Round 2 stage1 (carries prior answer) → every member fails.
+        if "=== YOUR PREVIOUS ANSWER ===" in user_msg:
+            raise CouncilHTTPError("round2 boom")
+        return {"content": f"round1 answer from {kwargs['model']}",
+                "tokens_in": 1, "tokens_out": 1}
+
+    result = await run_council(
+        question="q", members=members, call_fn=fake_call, rounds=2, synthesis=True
+    )
+    # Final stage1 is round 1's live answers (not the all-error round 2).
+    assert all(s["status"] == "ok" for s in result["stage1"])
+    assert all("round1" in s["answer"] for s in result["stage1"])
+    # stage2 + aggregate are consistent with that stage1.
+    assert result["stage2"] and all(s["status"] == "ok" for s in result["stage2"])
+    assert result["aggregate"]
+    # Stage 3 ran against the restored survivors instead of being skipped.
+    assert result["stage3"] is not None
+    assert result["stage3"]["status"] == "ok"
+    assert any("no survivors" in n for n in result["notes"])
 
 
 async def test_run_council_rounds_rejects_out_of_range():

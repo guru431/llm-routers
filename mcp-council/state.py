@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -83,6 +84,14 @@ def _persist(state: "JobState", *, force: bool = True) -> None:
             _last_member_persist_at[state.job_id] = time.time()
     except OSError:
         pass
+    except TypeError as e:
+        # A non-serializable usage/summary (e.g. an exception object leaked in)
+        # would make json.dumps raise — skip the persist, never crash the run.
+        print(
+            f"[mcp-council] skipping job persist for {state.job_id}: "
+            f"non-serializable payload ({e})",
+            file=sys.stderr,
+        )
 
 
 def _unlink_persisted(job_id: str) -> None:
@@ -149,7 +158,19 @@ def load_persisted_jobs() -> int:
         jid = data.get("job_id")
         if not jid or jid in _jobs:
             continue
-        _jobs[jid] = _state_from_snapshot(data)
+        # _state_from_snapshot does MemberProgress(**m) — a snapshot with
+        # extra/changed keys raises TypeError (and KeyError on a missing "id").
+        # One bad file must not down the whole server: skip it with a warning
+        # and keep loading the rest. Mirrors load_persisted_dialogues.
+        try:
+            _jobs[jid] = _state_from_snapshot(data)
+        except (KeyError, TypeError, ValueError) as e:
+            print(
+                f"[mcp-council] skipping unreadable job snapshot {f.name}: "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
+            continue
         loaded += 1
     return loaded
 

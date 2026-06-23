@@ -128,7 +128,13 @@ def _state_from_dump(data: dict) -> DialogueState:
     s.max_tokens = data.get("max_tokens") or 4096
     s.context_paths = data.get("context_paths") or []
     s.diversity_monitor = bool(data.get("diversity_monitor", True))
-    s.diversity_threshold = data.get("diversity_threshold") or 7
+    # A restored threshold of 0 ("re-prompt on ANY agreement") is legitimate,
+    # so `or 7` would corrupt it — guard explicitly on None instead.
+    s.diversity_threshold = (
+        data.get("diversity_threshold")
+        if data.get("diversity_threshold") is not None
+        else 7
+    )
     s.devils_advocate_rotation = bool(data.get("devils_advocate_rotation", True))
     phase = data.get("phase") or "starting"
     now = time.time()

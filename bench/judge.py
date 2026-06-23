@@ -157,7 +157,9 @@ def main():
                 continue
             if r.get("error") or not r.get("text"):
                 continue
-            tid = r["task_id"]
+            tid = r.get("task_id")
+            if tid is None:
+                continue
             if args.task and tid != args.task:
                 continue
             if (model_id, tid) in judged:

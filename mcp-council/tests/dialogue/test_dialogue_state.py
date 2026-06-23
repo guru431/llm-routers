@@ -164,6 +164,16 @@ async def test_active_sessions_cap_releases_done_first():
     assert new_s.session_id.startswith("dlg-")
 
 
+def test_restored_diversity_threshold_zero_is_preserved():
+    """A persisted threshold of 0 ("re-prompt on ANY agreement") must survive
+    restore — the old `or 7` turned it into 7. A missing key still defaults to 7."""
+    base = {"session_id": "dlg-x", "mode": "panel", "total_rounds": 3, "phase": "done"}
+    s_zero = dialogue_state._state_from_dump({**base, "diversity_threshold": 0})
+    assert s_zero.diversity_threshold == 0
+    s_missing = dialogue_state._state_from_dump(dict(base))
+    assert s_missing.diversity_threshold == 7
+
+
 async def test_attach_task_and_cancel_propagates():
     """cancel_session should call task.cancel() on the bound asyncio.Task."""
     s = await create_session(mode="debate", question_preview="q", total_rounds=1)

@@ -453,14 +453,23 @@ def main():
         # second run.py for the same model could race the existence check.
         # Concurrent runs of run.py for the SAME model are still unsupported
         # (would need filelock) — single-runner is the only supported mode.
-        with out_file.open("a", encoding="utf-8") as out_f:
+        with out_file.open("a+", encoding="utf-8") as out_f:
             # If a previous run was killed mid-write, the file may end with a
             # partial line lacking a newline. Terminate it so the next append
             # starts on its own line (the partial stays a single malformed line
             # that the skip-existing/report readers already tolerate) instead of
             # being concatenated onto the next good record and corrupting it.
-            if out_file.stat().st_size and not out_file.read_bytes().endswith(b"\n"):
-                out_f.write("\n")
+            # Check the tail on the SAME handle's binary buffer (seek to end +
+            # read one byte) — no second open and no full read into memory. Bytes,
+            # not text, sidesteps text-mode seek/decode pitfalls; writes still go
+            # through the text wrapper (append mode → always lands at EOF).
+            buf = out_f.buffer
+            end = buf.seek(0, os.SEEK_END)
+            if end:
+                buf.seek(end - 1)
+                if buf.read(1) != b"\n":
+                    out_f.write("\n")
+                    out_f.flush()
             for t in tasks:
                 cell += 1
                 if t["id"] in existing:

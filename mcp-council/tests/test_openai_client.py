@@ -315,6 +315,27 @@ async def test_extra_payload_merged(patch_httpx):
     assert sent["model"] == "m"
 
 
+async def test_extra_payload_overrides_temperature_but_not_protected_keys(patch_httpx):
+    # kimi-k2.7-code accepts only temperature=1; the catalog forces it via
+    # `extra` (must win over the council default). model/messages/stream are
+    # protected — extra must NOT be able to clobber them.
+    fake = _FakeClient([_ok_response()])
+    patch_httpx["client"] = fake
+    await call_openai_compat(
+        base_url="https://example.com/v1",
+        api_key="k",
+        model="m",
+        messages=[{"role": "user", "content": "q"}],
+        max_tokens=10,
+        temperature=0.3,
+        extra_payload={"temperature": 1, "model": "evil", "stream": True},
+    )
+    sent = fake.calls[0]["json"]
+    assert sent["temperature"] == 1     # extra overrode the 0.3 default
+    assert sent["model"] == "m"          # protected — not clobbered
+    assert sent["stream"] is False       # protected — not clobbered
+
+
 async def test_network_error_raises(patch_httpx, monkeypatch):
     class _RaisingClient:
         async def __aenter__(self):

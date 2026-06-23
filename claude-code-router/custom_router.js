@@ -54,7 +54,8 @@ module.exports = async function router(req, config) {
 
   // Unknown non-claude model: silent fallback to Router.default would mask a
   // typo'd/decommissioned model id, so surface it.
-  if (!model.startsWith('claude-')) {
+  // Guard: a non-string model (number/object) would throw on .startsWith.
+  if (typeof model !== 'string' || !model.startsWith('claude-')) {
     console.warn(`[custom_router] unknown model "${model}" — falling back to Router.default`);
   }
 

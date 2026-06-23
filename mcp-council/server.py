@@ -10,6 +10,7 @@ Exposes two flavours of the council deliberation:
 from __future__ import annotations
 
 import asyncio
+import string
 import sys
 import time
 from pathlib import Path
@@ -115,6 +116,18 @@ def _format_analysis_lines(analysis: dict) -> list[str]:
     return lines
 
 
+def _member_label(i: int) -> str:
+    """Stable display label for member index `i`: A..Z, then AA, AB, … (base-26)
+    so councils with >26 members don't IndexError out of a fixed alphabet."""
+    letters = string.ascii_uppercase
+    label = ""
+    i += 1  # 1-based so 0→A, 25→Z, 26→AA (bijective base-26)
+    while i > 0:
+        i, rem = divmod(i - 1, 26)
+        label = letters[rem] + label
+    return label
+
+
 def format_markdown(question: str, result: dict) -> str:
     """Render stage1+stage2+aggregate (and optional stage 3 synthesis) into a
     markdown brief for the chairman (Claude in-session, or whoever consumes it)."""
@@ -129,9 +142,8 @@ def format_markdown(question: str, result: dict) -> str:
     # in stage1 order (so reading is consistent). Stage 2 rankers used their own
     # randomized mapping internally; for display we de-anonymize anyway.
     display_letter: dict[str, str] = {}
-    letters = "ABCDEFGHIJ"
     for i, s in enumerate(stage1):
-        display_letter[s["id"]] = letters[i]
+        display_letter[s["id"]] = _member_label(i)
 
     lines: list[str] = []
     lines.append("# Council deliberation")
@@ -334,8 +346,10 @@ async def _do_council_ask_async(
         max_tokens = _clamp_tokens(max_response_tokens)
         files_section: str | None = None
         if context_paths:
-            validated = resolve_and_validate(context_paths)
-            files = read_files_with_limit(validated)
+            # Sandbox path resolution + file reads are blocking disk I/O; offload
+            # them so they don't stall the event loop inside this async handler.
+            validated = await asyncio.to_thread(resolve_and_validate, context_paths)
+            files = await asyncio.to_thread(read_files_with_limit, validated)
             files_section = _build_files_section(files)
         prompt_for_size = (files_section or "") + question
         prompt_size = len(prompt_for_size.encode("utf-8"))
@@ -561,14 +575,19 @@ async def _run_job(
     call_id = _new_call_id()
     prompt_size = 0
     log_dump_rel: str | None = None
-    on_progress = _make_progress_callback(state)
+    # Built inside the try so a setup failure (open_writer mkdir/open) marks the
+    # job terminal (error) and frees its MAX_ACTIVE_JOBS slot, instead of letting
+    # the exception escape _run_job and leave the job stuck non-terminal until TTL.
+    on_progress = None
     try:
+        on_progress = _make_progress_callback(state)
         try:
             max_tokens = _clamp_tokens(max_response_tokens)
             files_section: str | None = None
             if context_paths:
-                validated = resolve_and_validate(context_paths)
-                files = read_files_with_limit(validated)
+                # Blocking disk I/O — offload off the event loop.
+                validated = await asyncio.to_thread(resolve_and_validate, context_paths)
+                files = await asyncio.to_thread(read_files_with_limit, validated)
                 files_section = _build_files_section(files)
             prompt_for_size = (files_section or "") + question
             prompt_size = len(prompt_for_size.encode("utf-8"))
@@ -633,22 +652,34 @@ async def _run_job(
         state.summary = result.get("summary")
         state.result_markdown = format_markdown(question, result)
         job_state.mark_phase(state, "done")
-        # Emit a terminal event with a stable string so Monitor consumers can
-        # match on `"event": "result_ready"` and know the run is consumable.
-        on_progress("result_ready", {
-            "status": "ok",
-            "members_ok_stage1": members_ok_stage1,
-            "members_ok_stage2": members_ok_stage2,
-            "dump_path": log_dump_rel,
-        })
+        # Post-`done` side effects (result_ready emit + final audit log_call) are
+        # wrapped separately: once phase=='done' the outer catch-all skips them
+        # (phase is terminal), so a failure here would otherwise vanish silently
+        # and leave the audit log missing its "ok" record. Log to stderr instead;
+        # control flow is unchanged (the result is already stored on state).
+        try:
+            # Emit a terminal event with a stable string so Monitor consumers can
+            # match on `"event": "result_ready"` and know the run is consumable.
+            on_progress("result_ready", {
+                "status": "ok",
+                "members_ok_stage1": members_ok_stage1,
+                "members_ok_stage2": members_ok_stage2,
+                "dump_path": log_dump_rel,
+            })
 
-        latency_ms = int((time.monotonic() - start) * 1000)
-        log_call(
-            call_id=call_id, members_total=len(members),
-            members_ok_stage1=members_ok_stage1, members_ok_stage2=members_ok_stage2,
-            prompt_size_bytes=prompt_size, total_latency_ms=latency_ms,
-            status="ok", log_dump=log_dump_rel,
-        )
+            latency_ms = int((time.monotonic() - start) * 1000)
+            log_call(
+                call_id=call_id, members_total=len(members),
+                members_ok_stage1=members_ok_stage1, members_ok_stage2=members_ok_stage2,
+                prompt_size_bytes=prompt_size, total_latency_ms=latency_ms,
+                status="ok", log_dump=log_dump_rel,
+            )
+        except Exception as e:
+            print(
+                f"[mcp-council] job {state.job_id} succeeded but post-done "
+                f"bookkeeping failed ({type(e).__name__}: {e}); result is intact",
+                file=sys.stderr,
+            )
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -777,8 +808,8 @@ async def council_result(job_id: str) -> dict:
     state = await job_state.get_job(job_id)
     if state is None:
         return {"error": f"unknown job_id: {job_id}"}
-    if state.phase != "done":
-        interrupted = state.phase == "interrupted"
+    # Non-terminal (queued/stage1/…) → genuinely not ready yet, poll again.
+    if state.phase not in job_state.TERMINAL_PHASES:
         return {
             "ready": False,
             "phase": state.phase,
@@ -788,14 +819,11 @@ async def council_result(job_id: str) -> dict:
             ),
             "usage": state.usage,
             "summary": state.summary,
-            "hint": (
-                "Job was interrupted by a server restart and is not resumable. "
-                "Call council_status(job_id) for the partial per-stage progress, "
-                "then re-run council_ask_async if you need a complete result."
-                if interrupted
-                else "Call council_status(job_id) for live progress, retry later."
-            ),
+            "hint": "Call council_status(job_id) for live progress, retry later.",
         }
+    # Terminal phases (done/error/cancelled/interrupted) → ready=True so a client
+    # polling on `ready` stops instead of looping forever. error/cancelled/
+    # interrupted carry the error + any partial result, mirroring dialogue_result.
     return {
         "ready": True,
         "phase": state.phase,
@@ -803,6 +831,12 @@ async def council_result(job_id: str) -> dict:
         "dump_path": state.dump_path,
         "usage": state.usage,
         "summary": state.summary,
+        "error": (
+            state.error
+            or ("interrupted by server restart — not resumable; re-run "
+                "council_ask_async for a complete result"
+                if state.phase == "interrupted" else None)
+        ),
     }
 
 
@@ -910,14 +944,23 @@ async def model_ask(
         # documented budget). resolve_and_validate caps count per call, so add
         # an explicit combined count check, then read both lists through one
         # byte-budgeted pass and split the result back by count.
-        validated_ctx = resolve_and_validate(context_paths) if context_paths else []
-        validated_ex = resolve_and_validate(example_paths) if example_paths else []
+        # Blocking disk I/O — offload off the event loop.
+        validated_ctx = (
+            await asyncio.to_thread(resolve_and_validate, context_paths)
+            if context_paths else []
+        )
+        validated_ex = (
+            await asyncio.to_thread(resolve_and_validate, example_paths)
+            if example_paths else []
+        )
         if len(validated_ctx) + len(validated_ex) > sandbox.MAX_FILE_COUNT:
             raise SandboxError(
                 f"file count limit exceeded: "
                 f"{len(validated_ctx) + len(validated_ex)} > {sandbox.MAX_FILE_COUNT}"
             )
-        all_files = read_files_with_limit(validated_ctx + validated_ex)
+        all_files = await asyncio.to_thread(
+            read_files_with_limit, validated_ctx + validated_ex
+        )
         ctx_files = all_files[: len(validated_ctx)]
         ex_files = all_files[len(validated_ctx):]
 
@@ -1004,8 +1047,9 @@ def _resolve_engine_cfg(model_id: str) -> dict:
 async def _build_files_section_or_none(context_paths: list[str] | None) -> str | None:
     if not context_paths:
         return None
-    validated = resolve_and_validate(context_paths)
-    files = read_files_with_limit(validated)
+    # Blocking disk I/O — offload off the event loop.
+    validated = await asyncio.to_thread(resolve_and_validate, context_paths)
+    files = await asyncio.to_thread(read_files_with_limit, validated)
     return _build_files_section(files) or None
 
 

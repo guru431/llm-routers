@@ -18,7 +18,7 @@ from typing import Any, Awaitable, Callable
 
 from healthcheck import _classify_error
 from models import CATALOG, COUNCIL_DEFAULT, resolve_members
-from openai_client import CouncilHTTPError, call_openai_compat
+from openai_client import call_openai_compat
 from prompts import (
     STAGE1_ROUND_N_SYSTEM,
     STAGE1_SYSTEM,
@@ -117,7 +117,13 @@ async def _run_member_stage1(
                 extra_payload=member.get("extra"),
             )
             tool_log = []
-    except CouncilHTTPError as e:
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        # Always return a dict so asyncio.gather (no return_exceptions) never
+        # sees a raise: any non-cancellation failure (HTTP, KeyError on a
+        # malformed result, …) becomes this member's status="error" and the
+        # rest of the fan-out keeps its answers.
         return {
             "id": member["id"],
             "model": member["model"],
@@ -207,7 +213,11 @@ async def _run_member_stage1_round_n(
             max_tokens=max_tokens,
             extra_payload=member.get("extra"),
         )
-    except CouncilHTTPError as e:
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        # Always return a dict (see _run_member_stage1): any non-cancellation
+        # failure becomes status="error" so gather doesn't abort the fan-out.
         return {
             "id": member["id"], "model": member["model"], "status": "error",
             "error": str(e), "answer": None,
@@ -236,6 +246,40 @@ def _assign_pseudonyms(member_ids: list[str], seed: int | None = None) -> dict[s
     return dict(zip(member_ids, letters))
 
 
+def _first_json_object(text: str) -> str | None:
+    """Return the first complete top-level {...} object as a substring, or None.
+
+    A balanced-brace scanner that respects JSON string literals (and their
+    escapes) so braces inside string values don't skew the depth count. Unlike a
+    greedy `\\{[\\s\\S]*\\}` regex, it stops at the matching close brace instead
+    of swallowing trailing prose with extra braces and mangling valid JSON."""
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
 def _extract_json(text: str) -> dict:
     """Extract a JSON object from text. Tries json.loads first; on failure tries
     to find the first {...} block. Returns the parsed dict or raises ValueError."""
@@ -244,9 +288,9 @@ def _extract_json(text: str) -> dict:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    match = re.search(r"\{[\s\S]*\}", text)
-    if match:
-        return json.loads(match.group(0))
+    candidate = _first_json_object(text)
+    if candidate is not None:
+        return json.loads(candidate)
     raise ValueError("no JSON object found in response")
 
 
@@ -288,7 +332,11 @@ def _split_synthesis_and_analysis(content: str) -> tuple[str, dict | None]:
         return content, None
     prose = content[:idx].rstrip()
     tail = content[idx + len(ANALYSIS_SENTINEL):]
-    m = re.search(r"```(?:json)?\s*\n?(.*?)```", tail, re.DOTALL)
+    # Anchor to the fence that immediately follows the sentinel (only whitespace/
+    # newlines allowed in between). A foreign ```code``` block placed between the
+    # sentinel and the real JSON must NOT be captured as the analysis — re.match
+    # anchors at position 0 so the leading \s* can't skip past intervening prose.
+    m = re.match(r"\s*```(?:json)?\s*\n?(.*?)```", tail, re.DOTALL)
     if not m:
         return prose, None
     try:
@@ -352,7 +400,11 @@ async def _run_member_stage2(
             max_tokens=max_tokens,
             extra_payload=extra,
         )
-    except CouncilHTTPError as e:
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        # Always return a dict (see _run_member_stage1): any non-cancellation
+        # failure becomes status="error" so gather doesn't abort the fan-out.
         return {
             "ranker_id": ranker["id"],
             "status": "error",
@@ -584,7 +636,12 @@ async def _run_stage3_synthesis(
                 extra_payload=chairman.get("extra"),
             )
             tool_log = []
-    except CouncilHTTPError as e:
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        # Always return a dict (see _run_member_stage1): any non-cancellation
+        # failure becomes status="error" so the caller falls back to the
+        # stage 1/2 materials instead of the whole call aborting.
         return {
             "chairman_id": chairman["id"],
             "chairman_model": chairman["model"],
@@ -1058,6 +1115,15 @@ async def run_council(
             notes.append(
                 f"round {round_idx} stage1 had no survivors — keeping round {round_idx - 1} as final"
             )
+            # Restore the prior round's snapshots so the returned payload is
+            # self-consistent: stage1/stage2/aggregate (and ok_stage1, used by
+            # stage 3) all reference round N-1, which had live answers. Without
+            # this, stage1 would point at the all-error round while stage2/
+            # aggregate still came from N-1 — and stage 3 would be skipped.
+            stage1 = prior_stage1
+            ok_stage1 = [s for s in prior_stage1 if s["status"] == "ok"]
+            stage2 = prior_stage2
+            aggregate = prior_aggregate
             break
 
         stage2, stage2_notes = await _run_stage2_for_round(

@@ -54,6 +54,9 @@ async def run_socratic(
     resume: bool = False,
 ) -> None:
     mark_phase(state, "starting")
+    # Single source of truth: the round loop and the summary tag both read
+    # state.total_rounds, so sync the rounds param into it at entry.
+    state.total_rounds = rounds
     # Carry transport fields so engine helpers can reconstruct calls if needed.
     def _project(cfg: dict, role: str) -> dict:
         base = {"id": cfg["id"], "model": cfg["model"], "position": None, "role": role}
@@ -72,8 +75,23 @@ async def run_socratic(
             {"id": moderator_cfg["id"], "model": moderator_cfg["model"]} if moderator_cfg else None
         )
 
+    # Invariant: moderator-note failures must NOT count toward the failure
+    # threshold. check_round_failures only tallies ids present in
+    # state.participants, so this holds *only* while the moderator id is
+    # disjoint from the participant ids. Enforce it explicitly — a moderator
+    # that overlaps a participant would let its note failures corrupt the
+    # participants' failure accounting.
+    if state.moderator is not None:
+        participant_ids = {p["id"] for p in state.participants}
+        if state.moderator["id"] in participant_ids:
+            raise ValueError(
+                f"socratic moderator id {state.moderator['id']!r} overlaps a "
+                "participant id; moderator must be distinct so its note failures "
+                "are not counted toward the failure threshold"
+            )
+
     start = state.current_round + 1
-    for round_n in range(start, rounds + 1):
+    for round_n in range(start, state.total_rounds + 1):
         # --- question phase ---
         mark_phase(state, f"round_{round_n}_question")
         q_prompt = render_socratic_questioner_prompt(

@@ -265,12 +265,20 @@ def run_claude(prompt: str, system_prompt: str | None = None,
                     timeout=15,
                 )
             except subprocess.TimeoutExpired:
-                proc.kill()
+                # proc may already be dead (ProcessLookupError) — don't let a
+                # fallback kill turn a 504 timeout into a 500.
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
         else:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
-                proc.kill()
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
         try:
             proc.communicate(timeout=10)
         except subprocess.TimeoutExpired:
@@ -359,7 +367,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = {
                 "status": "ok",
                 "model": MODEL,
-                "uptime": int(time.time() - SERVER_START),
+                "uptime": int(time.monotonic() - SERVER_START_MONO),
                 "security": "authenticated" if AUTH_TOKEN else "unauthenticated",
             }
             if CACHE is not None:
@@ -413,6 +421,14 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         model = body.get("model")
+        # Reject an unknown model with 400 invalid_request_error rather than
+        # letting run_claude raise ValueError → broad except → 500 server_error.
+        # `model` omitted falls back to the (validated-at-startup) default MODEL.
+        if model is not None and model not in MODELS:
+            self._send(400, {"error": {
+                "message": f"model not in whitelist: {model!r}",
+                "type": "invalid_request_error"}})
+            return
         # Clamp client-provided timeout to [10s, 600s] to prevent DoS via
         # `timeout: 0` (instant fail) or `timeout: 999999` (hung worker).
         try:
@@ -606,7 +622,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        # A client that disconnected (common after a timeout) makes wfile.write
+        # raise ConnectionError/BrokenPipe. Swallow it so it doesn't bubble to
+        # _handle_chat's `except Exception`, which would log a false "claude error"
+        # and try to write a second 500 status to the already-dead socket.
+        try:
+            self.wfile.write(body)
+        except (ConnectionError, BrokenPipeError):
+            return
 
     def _send_stream(self, resp_id: str, created: int, model: str,
                      resp_message: dict, finish_reason: str):
@@ -669,6 +692,9 @@ class SingleInstanceServer(ThreadingHTTPServer):
 
 
 SERVER_START = time.time()
+# Monotonic clock for uptime: immune to wall-clock jumps (NTP sync, manual set,
+# DST) that can make a time.time()-based uptime go negative or spike.
+SERVER_START_MONO = time.monotonic()
 
 
 def main():
@@ -721,7 +747,7 @@ def main():
         logger.info("Cache: enabled (max=%d entries, ttl=%.0fs)", _CACHE_SIZE, _CACHE_TTL)
     else:
         logger.info("Cache: disabled (CLAUDE_AGENT_CACHE=0)")
-    logger.info("Auth: bearer token required on /v1/* and DELETE /cache (token len=%d)", len(AUTH_TOKEN))
+    logger.info("Auth: bearer token required on /v1/* and DELETE /cache")
     logger.info("Endpoints: POST /v1/chat/completions, GET /v1/models, GET /health, DELETE /cache")
     try:
         server.serve_forever()

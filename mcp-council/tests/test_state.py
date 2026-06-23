@@ -192,6 +192,33 @@ async def test_member_persists_coalesced_within_interval():
     assert {m["id"] for m in disk["stage1"]} == {"glm", "kimi"}
 
 
+async def test_load_persisted_skips_bad_snapshot(tmp_path):
+    # A snapshot whose member dict carries an unexpected key makes
+    # MemberProgress(**m) raise TypeError. One bad file must not down startup —
+    # it's skipped and the good ones still load. Regression for the snapshot-start
+    # finding (load only caught OSError/ValueError before).
+    import json
+    good = await state.create_job(question_preview="ok", synthesis=False, rounds=1)
+    state.mark_phase(good, "stage1")
+    state.update_member_stage1(
+        good, id="glm", model="glm-5.1", status="ok", error=None, latency_ms=1000
+    )
+    # Hand-craft a corrupt snapshot file alongside the good one.
+    bad = {
+        "job_id": "job-corrupt", "question_preview": "bad",
+        "created_at": time.time(), "phase": "stage1",
+        "stage1": [{"id": "x", "model": "m", "bogus_key": 1}],
+    }
+    (state._persist_dir() / "job-corrupt.json").write_text(
+        json.dumps(bad), encoding="utf-8"
+    )
+    state._jobs.clear()
+    loaded = state.load_persisted_jobs()
+    assert loaded == 1  # only the good one
+    assert await state.get_job(good.job_id) is not None
+    assert await state.get_job("job-corrupt") is None
+
+
 async def test_terminal_state_always_flushed():
     # The final (terminal) state must always be persisted, never coalesced away.
     s = await state.create_job(question_preview="q", synthesis=False, rounds=1)
