@@ -20,6 +20,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import event_log
+
 # Jobs older than this (since creation) are GC'd. 24h is enough that the same
 # session can come back later and read its result, but not so long that an
 # always-on server accumulates stale jobs.
@@ -100,6 +102,9 @@ def _unlink_persisted(job_id: str) -> None:
         (_persist_dir() / f"{job_id}.json").unlink(missing_ok=True)
     except OSError:
         pass
+    # Mirror the job-snapshot cleanup for the sibling event-log file, which used
+    # to leak forever (logs/events/<id>.jsonl was never unlinked by GC).
+    event_log.delete_log(job_id)
 
 
 def _state_from_snapshot(data: dict) -> "JobState":
@@ -147,7 +152,15 @@ def load_persisted_jobs() -> int:
     for f in d.glob("*.json"):
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except OSError:
+            continue
+        except ValueError:
+            # Permanently corrupt/truncated snapshot — delete it so it isn't
+            # re-read and re-failed on every restart.
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:
+                pass
             continue
         if now - (data.get("created_at") or 0) > JOB_TTL_SECONDS:
             try:
@@ -225,7 +238,13 @@ def _gc_locked(now: float) -> None:
     over MAX_JOBS drops the oldest finished ones."""
     expired = [jid for jid, j in _jobs.items() if now - j.created_at > JOB_TTL_SECONDS]
     for jid in expired:
-        del _jobs[jid]
+        j = _jobs.pop(jid)
+        # A non-terminal job hitting TTL (only reachable if job durations ever
+        # grow past the 24h horizon) still owns a running asyncio.Task — cancel
+        # it so we don't orphan a background fan-out that would later re-create
+        # its persisted snapshot.
+        if j.phase not in TERMINAL_PHASES and j._task is not None and not j._task.done():
+            j._task.cancel()
         _unlink_persisted(jid)
     if len(_jobs) <= MAX_JOBS:
         return
@@ -310,11 +329,12 @@ async def cancel_job(job_id: str) -> bool:
         task = j._task
     if task is not None and not task.done():
         task.cancel()
-        # Brief drain so any CancelledError handler can run and flip phase.
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=0.05)
-        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-            pass
+        # Brief drain so the task's CancelledError handler can run and flip phase.
+        # asyncio.wait (unlike wait_for+asyncio.shield) never re-raises the task's
+        # own exception AND does not swallow a CancelledError delivered to
+        # cancel_job itself — so cancelling the cancel handler still propagates
+        # instead of being silently absorbed by a broad `except`.
+        await asyncio.wait({task}, timeout=0.05)
     if j.phase not in TERMINAL_PHASES:
         # No handler ran (e.g. bare coroutine in tests) or it ran but didn't
         # call mark_phase — finalize synchronously.
@@ -418,6 +438,13 @@ async def _reset_for_tests() -> None:
     _last_member_persist_at.clear()
     try:
         for f in _persist_dir().glob("*.json*"):
+            f.unlink(missing_ok=True)
+    except OSError:
+        pass
+    # Also clear the sibling event-log dir so leftover .jsonl files from a prior
+    # test don't linger (they're keyed by job_id and never overwritten).
+    try:
+        for f in (event_log._DEFAULT_BASE_DIR / "events").glob("*.jsonl"):
             f.unlink(missing_ok=True)
     except OSError:
         pass

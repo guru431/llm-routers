@@ -23,8 +23,14 @@ import time
 FAILURE_THRESHOLD = 4
 # How long a host stays open before the next call is allowed through to probe it.
 COOLDOWN_SECONDS = 120.0
+# A failure streak only reflects a real *recent* outage. If the previous failure
+# for a host was longer ago than this, the streak is stale (the host was fine in
+# between) and is reset before counting the new one — otherwise isolated failures
+# spaced hours apart across runs could accumulate to the threshold and open the
+# breaker with no ongoing outage.
+FAILURE_DECAY_SECONDS = 120.0
 
-_state: dict[str, dict] = {}  # host -> {"fails": int, "open_until": float}
+_state: dict[str, dict] = {}  # host -> {"fails": int, "open_until": float, "last_failure": float}
 
 
 def open_for(host: str) -> float:
@@ -42,11 +48,19 @@ def record_success(host: str) -> None:
 
 
 def record_failure(host: str) -> None:
-    """Count one infra failure; open the breaker once the threshold is reached."""
-    st = _state.setdefault(host, {"fails": 0, "open_until": 0.0})
+    """Count one infra failure; open the breaker once the threshold is reached.
+
+    A streak whose previous failure is older than FAILURE_DECAY_SECONDS is stale
+    (the host was fine in between) and is reset before counting the new one, so
+    only failures clustered in time accumulate toward the threshold."""
+    now = time.monotonic()
+    st = _state.setdefault(host, {"fails": 0, "open_until": 0.0, "last_failure": 0.0})
+    if st["fails"] and (now - st["last_failure"]) > FAILURE_DECAY_SECONDS:
+        st["fails"] = 0
     st["fails"] += 1
+    st["last_failure"] = now
     if st["fails"] >= FAILURE_THRESHOLD:
-        st["open_until"] = time.monotonic() + COOLDOWN_SECONDS
+        st["open_until"] = now + COOLDOWN_SECONDS
 
 
 def snapshot() -> dict[str, dict]:

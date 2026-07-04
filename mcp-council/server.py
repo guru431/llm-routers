@@ -18,7 +18,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from models import COUNCIL_DEFAULT, resolve_member, resolve_members, resolve_preset
+from models import resolve_member, resolve_members, resolve_preset
 from council import _aggregate as _aggregate_helper  # noqa: F401 — re-exported for tests
 from council import run_council
 from council import MAX_ROUNDS as COUNCIL_MAX_ROUNDS
@@ -51,6 +51,22 @@ def _resolve_models_arg(
             raise RuntimeError("pass either models or models_preset, not both")
         return resolve_preset(models_preset)
     return models
+
+
+def _validate_council_args(
+    models: list[str] | None, rounds: int, *, tool: str = "council_ask"
+) -> None:
+    """Fail-fast validation shared by council_ask / council_ask_async: ≥2 distinct
+    models (when a subset is given) and rounds in [1, MAX_ROUNDS]. Raising a
+    RuntimeError here — rather than letting a bad `rounds` reach run_council's
+    ValueError (which the audit-logging except paths don't catch) — keeps error
+    types consistent across both call sites and avoids a half-started job."""
+    if models is not None and len(set(models)) < 2:
+        raise RuntimeError(
+            f"{tool} requires at least 2 distinct models; use model_ask for single-model"
+        )
+    if not (1 <= rounds <= COUNCIL_MAX_ROUNDS):
+        raise RuntimeError(f"rounds must be in [1, {COUNCIL_MAX_ROUNDS}], got {rounds}")
 
 
 def _build_files_section(files: list[tuple[Path, str]]) -> str:
@@ -329,17 +345,7 @@ async def _do_council_ask_async(
 
     # Resolve member subset before touching the sandbox. Validation errors here
     # are immediate — no half-started runs.
-    if models is not None and len(set(models)) < 2:
-        raise RuntimeError(
-            "council_ask requires at least 2 distinct models; "
-            "use model_ask for single-model"
-        )
-    # Validate rounds with the same RuntimeError the async tool raises. Without
-    # this a bad rounds reaches run_council as a ValueError, which is not caught
-    # by the except (SandboxError, RuntimeError) below (no audit log, worse error
-    # than council_ask_async).
-    if not (1 <= rounds <= COUNCIL_MAX_ROUNDS):
-        raise RuntimeError(f"rounds must be in [1, {COUNCIL_MAX_ROUNDS}], got {rounds}")
+    _validate_council_args(models, rounds, tool="council_ask")
     members = resolve_members(models)
 
     try:
@@ -516,36 +522,48 @@ def _make_progress_callback(state: job_state.JobState):
     writer = event_log.open_writer(state.job_id, LOGS_DIR)
 
     def progress(event_type: str, payload: dict[str, Any]) -> None:
-        if event_type == "phase":
-            phase = payload.get("phase")
-            if phase:
-                job_state.mark_phase(state, phase)
-        elif event_type == "stage1_member":
-            job_state.update_member_stage1(
-                state,
-                id=payload["id"],
-                model=payload["model"],
-                status=payload["status"],
-                error=payload.get("error"),
-                latency_ms=payload.get("latency_ms"),
-            )
-        elif event_type == "stage2_ranker":
-            job_state.update_member_stage2(
-                state,
-                id=payload["id"],
-                model=payload["model"],
-                status=payload["status"],
-                error=payload.get("error"),
-                latency_ms=payload.get("latency_ms"),
-            )
-        elif event_type == "stage3":
-            job_state.update_stage3(
-                state,
-                id=payload["id"],
-                model=payload["model"],
-                status=payload["status"],
-                error=payload.get("error"),
-                latency_ms=payload.get("latency_ms"),
+        # State updates are best-effort observability: run_council calls progress()
+        # OUTSIDE its per-member try/except and gathers members WITHOUT
+        # return_exceptions, so a raise here (bad payload key, disk error inside
+        # mark_phase) would propagate through asyncio.gather and discard every
+        # already-computed answer of a 2-8 min run. Swallow + log instead.
+        try:
+            if event_type == "phase":
+                phase = payload.get("phase")
+                if phase:
+                    job_state.mark_phase(state, phase)
+            elif event_type == "stage1_member":
+                job_state.update_member_stage1(
+                    state,
+                    id=payload["id"],
+                    model=payload["model"],
+                    status=payload["status"],
+                    error=payload.get("error"),
+                    latency_ms=payload.get("latency_ms"),
+                )
+            elif event_type == "stage2_ranker":
+                job_state.update_member_stage2(
+                    state,
+                    id=payload["id"],
+                    model=payload["model"],
+                    status=payload["status"],
+                    error=payload.get("error"),
+                    latency_ms=payload.get("latency_ms"),
+                )
+            elif event_type == "stage3":
+                job_state.update_stage3(
+                    state,
+                    id=payload["id"],
+                    model=payload["model"],
+                    status=payload["status"],
+                    error=payload.get("error"),
+                    latency_ms=payload.get("latency_ms"),
+                )
+        except Exception as e:  # noqa: BLE001 — best-effort progress must not raise
+            print(
+                f"[mcp-council] progress state update failed for job "
+                f"{state.job_id} ({type(e).__name__}: {e}); run continues",
+                file=sys.stderr,
             )
         # tool_call events have no state mirror — they're purely observability.
         # Mirror everything to the event log regardless of type so consumers
@@ -736,19 +754,11 @@ async def council_ask_async(
     `models_preset` — str | None. "best" | "balanced" | "cheap" instead of a
         hand-listed `models` (mutually exclusive with it).
     """
-    # Validate + resolve BEFORE creating job state, so bad inputs fail fast.
+    # Validate + resolve BEFORE creating job state, so bad inputs fail fast
+    # (a bad rounds reaching the background task would otherwise leave the job
+    # stuck non-terminal until TTL).
     models = _resolve_models_arg(models, models_preset)
-    if models is not None and len(set(models)) < 2:
-        raise RuntimeError(
-            "council_ask_async requires at least 2 distinct models; "
-            "use model_ask for single-model"
-        )
-    # Validate rounds BEFORE create_job. run_council raises ValueError on a bad
-    # rounds value; if that fired inside the background task it would leave the
-    # job stuck non-terminal (the catch-all now also guards this, but failing
-    # fast here gives the caller a clean error instead of a dead job_id).
-    if not (1 <= rounds <= COUNCIL_MAX_ROUNDS):
-        raise RuntimeError(f"rounds must be in [1, {COUNCIL_MAX_ROUNDS}], got {rounds}")
+    _validate_council_args(models, rounds, tool="council_ask_async")
     members = resolve_members(models)
 
     state = await job_state.create_job(
@@ -864,7 +874,7 @@ async def model_healthcheck(models: list[str] | None = None) -> dict:
     that keeps erroring. Each model gets one cheap call (~"pong"); disabled
     models are reported as status="disabled" (not called). `status` per model is
     one of: ok | disabled | no_key | auth | insufficient_balance | rate_limited
-    | timeout | empty_response | network | error.
+    | timeout | empty_response | network | circuit_open | error.
 
     Also surfaces whether the COUNCIL_CONTEXT_ROOTS guardrail is configured.
     """
@@ -924,7 +934,7 @@ async def model_ask(
 
     Parameters:
       model_id — id из models.CATALOG. Доступные: glm, kimi, deepseek-pro, qwen,
-        minimax, gemini, deepseek-flash. (minimax-direct — disabled, billing off.)
+        minimax, gemini, codex, deepseek-flash. (minimax-direct — disabled, billing off.)
       prompt — собственно вопрос / задача.
       context_paths — sandbox-файлы, прокидываются как CONTEXT FILES.
       example_paths — sandbox-файлы стиля, прокидываются как STYLE EXAMPLES.
@@ -1273,6 +1283,15 @@ async def model_socratic(
         raise RuntimeError(
             f"questioner and respondent must be distinct, both are '{q_id}'"
         )
+    # A moderator equal to a participant is otherwise caught only by a ValueError
+    # deep inside run_socratic (after the background session has started, burned
+    # setup and flipped to phase=error). Fail fast here with a clear message.
+    if moderator is not None and moderator in (q_id, r_id):
+        raise RuntimeError(
+            f"socratic moderator '{moderator}' must be distinct from questioner "
+            f"and respondent (its note failures would otherwise count toward the "
+            f"participant failure threshold)"
+        )
     q_cfg = _resolve_engine_cfg(q_id)
     r_cfg = _resolve_engine_cfg(r_id)
     m_cfg = _resolve_engine_cfg(moderator) if moderator else None
@@ -1493,6 +1512,10 @@ def _run_startup_recovery() -> None:
     """Warn about an unset context-roots allow-list and reload persisted job /
     dialogue snapshots, marking still-running ones 'interrupted'."""
     _warn_if_context_roots_unset()
+    # Reap event-log files older than the job TTL: a job whose in-memory state
+    # was lost on a prior restart otherwise leaves its logs/events/<id>.jsonl
+    # behind forever (GC only reaps live jobs).
+    event_log.prune_logs(LOGS_DIR, max_age_seconds=job_state.JOB_TTL_SECONDS)
     n_jobs = job_state.load_persisted_jobs()
     n_dlg = dialogue_state.load_persisted_dialogues()
     if n_jobs or n_dlg:

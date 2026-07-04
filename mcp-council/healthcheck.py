@@ -33,16 +33,19 @@ def _classify_error(msg: str) -> str:
         return "insufficient_balance"
     if "401" in m or "403" in m or " auth" in m:
         return "auth"
-    # Exhausted 5xx surface as "overload after N attempts (last status 5xx)" —
-    # that's a server/network outage, not throttling. Classify by the real
-    # status so a 503 outage isn't mislabeled rate_limited. Only genuine
-    # throttling (429/529/the word "rate") maps to rate_limited.
-    if "last status 5" in m:
-        return "network"
+    # 529 (Anthropic-style overload) / 429 (rate limit) are throttling, not an
+    # outage — classify them BEFORE the generic 'last status 5' branch, because
+    # the exhausted-retry string "overload after N attempts (last status 529)"
+    # also contains the substring "last status 5" (which would otherwise win and
+    # mislabel a 529 as network, leaving this branch dead).
     if "429" in m or "529" in m or "rate" in m:
         return "rate_limited"
+    # Other exhausted 5xx (500/502/503/504) surface as "overload after N attempts
+    # (last status 5xx)" — a server/network outage, not throttling.
+    if "last status 5" in m:
+        return "network"
     if "overload" in m:
-        # "overload" without a 5xx status (e.g. last status 429/529) is throttling.
+        # "overload" without a 5xx/rate status is treated as throttling.
         return "rate_limited"
     if "timeout" in m:
         return "timeout"

@@ -15,6 +15,10 @@ BLOCK_NAMES = frozenset({
     ".pgpass",
     ".dockercfg",
     "kubeconfig",
+    # gcloud Application Default Credentials (the real default filename; the
+    # ~/.kube/config / ~/.docker/config.json basenames are too generic to block
+    # by name, so they're caught by BLOCK_DIR_SEGMENTS below instead).
+    "application_default_credentials.json",
     # Common private-key basenames copied outside ~/.ssh (no extension).
     "id_rsa",
     "id_dsa",
@@ -31,7 +35,13 @@ BLOCK_NAME_SUFFIXES = (
     # Any *.env (vault.env, prod.env, …), not just the literal ".env" name.
     ".env",
 )
-BLOCK_DIR_SEGMENTS = ("/.ssh/", "/.aws/", "/.gcp/", "/secrets/")
+# Directory segments whose contents are credentials regardless of basename:
+# ~/.kube/config, ~/.config/gcloud/*, ~/.docker/config.json and ~/.azure/* all
+# carry live cloud creds under generic file names ('config', 'config.json').
+BLOCK_DIR_SEGMENTS = (
+    "/.ssh/", "/.aws/", "/.gcp/", "/secrets/",
+    "/.kube/", "/.config/gcloud/", "/.docker/", "/.azure/",
+)
 BLOCK_NAMES_IN_CLAUDE_DIR = frozenset({"settings.json", "settings.local.json"})
 
 

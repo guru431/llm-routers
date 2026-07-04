@@ -20,12 +20,12 @@ import httpx
 
 import circuit_breaker
 
-# Read timeout for the upstream LLM. Thinking-style models routed via OCG can
-# spend 2-5 minutes before any bytes are returned (full response held until
-# completion); 120s caused Kimi/Qwen/MiniMax to all ReadTimeout silently.
-# DeepSeek direct streams its body in chunks so it never hit the cap even when
-# total wall-time exceeded 6 minutes.
-DEFAULT_TIMEOUT = 600.0
+# Per-phase timeout. The 600s READ ceiling is needed for thinking-style models
+# routed via OCG (they hold the connection 2-5 min before any bytes; 120s caused
+# Kimi/Qwen/MiniMax to ReadTimeout silently). But a bare float would apply 600s
+# to CONNECT too, so a dead/black-holed host could eat a long connect wait — pin
+# a short connect/pool timeout while keeping the long read ceiling.
+DEFAULT_TIMEOUT = httpx.Timeout(connect=5.0, read=600.0, write=30.0, pool=5.0)
 # 500/502/503: transient upstream errors observed at OCG (5 outages / 7 weeks
 # per project notes). Worth retrying — they typically clear within a minute.
 # 504: gateway timeout (typical for an overloaded OCG gateway). 408: request
@@ -51,7 +51,12 @@ _CLIENT: "httpx.AsyncClient | None" = None
 def _get_client() -> "httpx.AsyncClient":
     global _CLIENT
     if _CLIENT is None:
-        _CLIENT = httpx.AsyncClient()
+        # Explicit pool limits so behaviour under several concurrent async jobs
+        # (each fanning out to 7 members × multi-turn web_search) is predictable
+        # instead of relying on httpx defaults (100/20).
+        _CLIENT = httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=64, max_keepalive_connections=16),
+        )
     return _CLIENT
 
 
@@ -84,7 +89,7 @@ async def call_openai_compat(
     response_format: dict | None = None,
     tools: list[dict] | None = None,
     tool_choice: str | dict | None = None,
-    timeout: float = DEFAULT_TIMEOUT,
+    timeout: "float | httpx.Timeout" = DEFAULT_TIMEOUT,
     max_attempts: int | None = None,
     record_breaker: bool = True,
 ) -> dict:
@@ -174,6 +179,12 @@ async def call_openai_compat(
                 raise CouncilHTTPError(
                     f"timeout after {attempt + 1} attempts: {detail}"
                 ) from e
+            # A concurrent member of the same fan-out may have tripped the breaker
+            # while we were failing — re-check before spending another backoff so
+            # one provider outage doesn't make every co-hosted member burn its
+            # full retry budget before the breaker helps.
+            if circuit_breaker.open_for(host):
+                raise CouncilHTTPError(f"circuit_open for {host}: tripped mid-retry")
             await asyncio.sleep(RETRY_BACKOFFS[attempt])
             last_error = f"timeout {detail} (retry)"
             continue
@@ -194,6 +205,10 @@ async def call_openai_compat(
                 raise CouncilHTTPError(
                     f"overload after {attempt + 1} attempts (last status {resp.status_code})"
                 )
+            # See the timeout branch: short-circuit if a sibling already opened
+            # the breaker for this host mid-retry.
+            if circuit_breaker.open_for(host):
+                raise CouncilHTTPError(f"circuit_open for {host}: tripped mid-retry")
             await asyncio.sleep(RETRY_BACKOFFS[attempt])
             last_error = f"http {resp.status_code} (retry)"
             continue
@@ -201,6 +216,12 @@ async def call_openai_compat(
         if resp.status_code != 200:
             body = resp.text[:200] if resp.text else ""
             raise CouncilHTTPError(f"http {resp.status_code}: {body}")
+
+        # HTTP 200 = the host is up: clear any accumulated infra-failure streak
+        # NOW, even if the body turns out empty/malformed below (those are not
+        # infra outages). record_failure stays reserved for transport/timeout/5xx.
+        if record_breaker:
+            circuit_breaker.record_success(host)
 
         try:
             data = resp.json()
@@ -234,8 +255,6 @@ async def call_openai_compat(
             )
 
         usage = data.get("usage", {}) or {}
-        if record_breaker:
-            circuit_breaker.record_success(host)
         return {
             "content": _strip_think(content) if content else None,
             "tool_calls": tool_calls,

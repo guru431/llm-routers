@@ -38,6 +38,15 @@ def _dump_dir() -> Path:
     return Path(os.environ.get("COUNCIL_DIALOGUES_DIR") or _DEFAULT_DUMP_DIR)
 
 
+def _unlink_dump(session_id: str) -> None:
+    """Delete a session's persisted snapshot (logs/dialogues/<id>.json).
+    Best-effort — a missing file / perms error is ignored."""
+    try:
+        (_dump_dir() / f"{session_id}.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 @dataclass
 class DialogueState:
     session_id: str
@@ -99,6 +108,9 @@ def _gc_locked(now: float) -> None:
     ]
     for sid in stale:
         del _sessions[sid]
+        # Delete the on-disk snapshot too — GC used to evict from memory only,
+        # leaving logs/dialogues/<id>.json to accumulate forever.
+        _unlink_dump(sid)
 
 
 def _state_from_dump(data: dict) -> DialogueState:
@@ -160,11 +172,24 @@ def load_persisted_dialogues() -> int:
     for f in d.glob("*.json"):
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except OSError:
+            continue
+        except ValueError:
+            # Permanently corrupt/truncated snapshot — delete it so it isn't
+            # re-read and re-failed on every restart.
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:
+                pass
             continue
         # Drop snapshots past the inactive timeout so a restart doesn't resurrect
-        # ancient sessions; matches the in-memory GC horizon.
+        # ancient sessions; matches the in-memory GC horizon. Unlink so the file
+        # isn't rescanned on every subsequent restart.
         if now - (data.get("created_at") or 0) > INACTIVE_TIMEOUT_SECONDS:
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:
+                pass
             continue
         sid = data.get("session_id")
         if not sid or sid in _sessions:
@@ -317,9 +342,15 @@ def snapshot(state: DialogueState) -> dict:
 
 
 async def _reset_for_tests() -> None:
-    """Test-only: clear the store and cancel any bound tasks."""
+    """Test-only: clear the store, cancel any bound tasks, and remove persisted
+    dump files so a later test's load_persisted_dialogues starts clean."""
     async with _sessions_lock:
         for s in _sessions.values():
             if s._task is not None and not s._task.done():
                 s._task.cancel()
         _sessions.clear()
+    try:
+        for f in _dump_dir().glob("*.json*"):
+            f.unlink(missing_ok=True)
+    except OSError:
+        pass

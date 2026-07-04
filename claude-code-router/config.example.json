@@ -1,6 +1,6 @@
  {
-   "LOG": true,
-   "LOG_LEVEL": "debug",
+   "LOG": false,
+   "LOG_LEVEL": "info",
    "HOST": "127.0.0.1",
    "PORT": 3456,
    "APIKEY": "<CCR_APIKEY_HERE>",

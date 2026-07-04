@@ -17,7 +17,7 @@ import time
 from typing import Any, Awaitable, Callable
 
 from healthcheck import _classify_error
-from models import CATALOG, COUNCIL_DEFAULT, resolve_members
+from models import CATALOG, resolve_members
 from openai_client import call_openai_compat
 from prompts import (
     STAGE1_ROUND_N_SYSTEM,
@@ -281,17 +281,23 @@ def _first_json_object(text: str) -> str | None:
 
 
 def _extract_json(text: str) -> dict:
-    """Extract a JSON object from text. Tries json.loads first; on failure tries
-    to find the first {...} block. Returns the parsed dict or raises ValueError."""
+    """Extract a JSON *object* from text. Tries json.loads first; on failure
+    tries to find the first {...} block. Returns the parsed dict or raises
+    ValueError — including when the top-level JSON is a non-object (bare array,
+    string, number, null), so callers can rely on getting a dict and never hit
+    an AttributeError on `.get`."""
     text = text.strip()
+    parsed: object
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
     except json.JSONDecodeError:
-        pass
-    candidate = _first_json_object(text)
-    if candidate is not None:
-        return json.loads(candidate)
-    raise ValueError("no JSON object found in response")
+        candidate = _first_json_object(text)
+        if candidate is None:
+            raise ValueError("no JSON object found in response")
+        parsed = json.loads(candidate)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"expected a JSON object, got {type(parsed).__name__}")
+    return parsed
 
 
 # The chairman appends its structured analysis after this exact line, then a
@@ -425,7 +431,7 @@ async def _run_member_stage2(
         # council_status instead of a silent degradation of council quality.
         if not rankings:
             raise ValueError("rankings is empty")
-    except (ValueError, KeyError) as e:
+    except (ValueError, KeyError, AttributeError, TypeError) as e:
         return {
             "ranker_id": ranker["id"],
             "status": "error",
@@ -867,12 +873,16 @@ def _build_summary(
             winner_id = survivors[0]["id"]
             winner_model = survivors[0]["model"]
 
-    # Confidence from the margin between the top two aggregate means.
-    if not aggregate:
+    # Confidence from the margin between the top two aggregate means. A single
+    # ranked member (len<2) has no runner-up to compare against — the previous
+    # `margin = top` fallback let one uncontested score trivially read as high
+    # confidence (reachable with only 2 survivors when one ranker fails), so
+    # treat "fewer than two ranked members" as low, never high.
+    if len(aggregate) < 2:
         confidence = "low"
     else:
         top = aggregate[0][1]
-        margin = top - aggregate[1][1] if len(aggregate) >= 2 else top
+        margin = top - aggregate[1][1]
         if margin >= 1.5 and top >= 7:
             confidence = "high"
         elif margin >= 0.7:
@@ -1115,6 +1125,14 @@ async def run_council(
             notes.append(
                 f"round {round_idx} stage1 had no survivors — keeping round {round_idx - 1} as final"
             )
+            # Record the collapsed round's (failed) stage-1 calls for usage
+            # accounting BEFORE discarding it: _compute_usage iterates
+            # rounds_detail, so without this the real LLM calls this round
+            # actually made never show up in llm_calls/tokens/cost. Empty
+            # stage2/aggregate — the round produced no rankings. Members carried
+            # forward from N-1 by identity are deduped by id() in _compute_usage,
+            # so only the freshly-attempted calls are added.
+            rounds_detail.append({"stage1": stage1, "stage2": [], "aggregate": []})
             # Restore the prior round's snapshots so the returned payload is
             # self-consistent: stage1/stage2/aggregate (and ok_stage1, used by
             # stage 3) all reference round N-1, which had live answers. Without

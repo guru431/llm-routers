@@ -37,6 +37,32 @@ class WebSearchError(Exception):
     from training data)."""
 
 
+# Module-level client, lazily created on first use and reused so the TCP+TLS
+# keep-alive pool to api.exa.ai survives across searches. A council run with
+# web_search=True can fire many Exa calls (up to 7 members × up to 12 tool
+# iterations); a fresh AsyncClient per call re-handshakes every time. Must be
+# created inside a running event loop (httpx binds to the loop), hence lazy init.
+# Mirrors openai_client's _CLIENT pattern.
+_CLIENT: "httpx.AsyncClient | None" = None
+
+
+def _get_client() -> "httpx.AsyncClient":
+    global _CLIENT
+    if _CLIENT is None:
+        _CLIENT = httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=32, max_keepalive_connections=8),
+        )
+    return _CLIENT
+
+
+async def close_client() -> None:
+    """Close and reset the module-level AsyncClient (test/hot-reload teardown)."""
+    global _CLIENT
+    if _CLIENT is not None:
+        await _CLIENT.aclose()
+        _CLIENT = None
+
+
 async def web_search_exa(
     query: str,
     *,
@@ -83,8 +109,9 @@ async def web_search_exa(
 
     start = time.monotonic()
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(EXA_API_URL, headers=headers, json=payload)
+        resp = await _get_client().post(
+            EXA_API_URL, headers=headers, json=payload, timeout=timeout
+        )
     except httpx.HTTPError as e:
         detail = str(e) or type(e).__name__
         raise WebSearchError(f"network error: {detail}") from e

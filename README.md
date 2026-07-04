@@ -19,9 +19,18 @@ LLM-провайдерам из Claude Code и OpenAI-совместимых к�
 
 ## Shared lib политика
 
-`mcp-council` — единственный python-пакет, поэтому общая lib не выделяется.
-`sandbox.py` / `logger.py` / `openai_client.py` живут внутри `mcp-council/`.
-Если появится второй MCP-пакет — тогда выделим shared lib (YAGNI до тех пор).
+Python-пакетов теперь четыре (`mcp-council`, `claude-agent-server`,
+`codex-agent-server`, `bench`), но общая lib намеренно не выделяется:
+
+- `mcp-council` самодостаточен (`sandbox.py` / `logger.py` / `openai_client.py`
+  живут внутри пакета).
+- Оба agent-сервера — независимые standalone-пакеты, каждый запускается из своего
+  каталога как отдельный boot-таск. Несколько хелперов (`_load_dotenv`,
+  `_child_env_without_secrets`, `build_tools_system_prompt`, `parse_tool_calls`,
+  `extract_content`, `_send`/`_send_stream`) держатся **byte-identical** в обеих
+  копиях — правку вносить сразу в обе (об этом же напоминает `NOTE:`-комментарий
+  над ними). Выделять ради этого shared lib значило бы связать deploy двух
+  независимых серверов из-за ~200 строк — не оправдано.
 
 ## Ключи
 

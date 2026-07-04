@@ -52,9 +52,10 @@ logging.basicConfig(
 logger = logging.getLogger("claude-agent-server")
 
 
-# NOTE: _load_dotenv, build_tools_system_prompt, parse_tool_calls and
-# extract_content are kept byte-identical with codex-agent-server/server.py
-# (no shared module on purpose) — apply any fix to both copies.
+# NOTE: _load_dotenv, _child_env_without_secrets, build_tools_system_prompt,
+# parse_tool_calls and extract_content are kept byte-identical with
+# codex-agent-server/server.py (no shared module on purpose) — apply any fix
+# to both copies.
 def _load_dotenv() -> None:
     """Load KEY=VALUE pairs from a .env file next to this script into the
     environment, without overwriting variables already set. Lets the server
@@ -75,6 +76,30 @@ def _load_dotenv() -> None:
 
 
 _load_dotenv()
+
+
+# Names whose upper-cased form ends with one of these (or contains SECRET/
+# PASSWORD/TOKEN) are treated as secrets and stripped from any child-process env.
+# The child codex/claude CLI authenticates via its own ~/.codex / ~/.claude login,
+# never via these, so removing them is safe — and it closes the /proc/self/environ
+# and `echo $VAR` exfiltration vectors for provider keys AND this server's own
+# bearer tokens (a read-only prompt-injection must not be able to harvest the
+# workspace-write token and self-escalate).
+_SECRET_ENV_SUFFIXES = ("_TOKEN", "_KEY", "_SECRET", "_PASSWORD", "_APIKEY", "_CREDENTIALS")
+_SECRET_ENV_SUBSTRINGS = ("SECRET", "PASSWORD", "TOKEN")
+
+
+def _child_env_without_secrets(**overrides: str) -> dict:
+    """Copy os.environ with every secret-looking var removed, then apply
+    overrides. Pass to subprocess `env=` so a spawned CLI can't leak our keys."""
+    env = {
+        k: v for k, v in os.environ.items()
+        if not (k.upper().endswith(_SECRET_ENV_SUFFIXES)
+                or any(s in k.upper() for s in _SECRET_ENV_SUBSTRINGS))
+    }
+    env.update(overrides)
+    return env
+
 
 MODEL = os.getenv("CLAUDE_AGENT_MODEL", "claude-opus-4-8")
 MODELS = [
@@ -225,11 +250,12 @@ def run_claude(prompt: str, system_prompt: str | None = None,
     # Сигнал хукам Claude Code (~/.claude/settings.json: SessionStart/SessionEnd),
     # что это headless-вызов сервера: тяжёлая инъекция wiki-контекста (~162K токенов,
     # ~$3/вызов, упор в лимит Max → "claude exit code 1") должна быть пропущена.
-    child_env = {**os.environ, "CLAUDE_AGENT_SERVER": "1"}
-    # The bearer token authenticates clients TO this server; the child claude CLI
-    # has no use for it. Strip it from the child env so it isn't leaked into
-    # subprocess inspection / crash dumps / further-spawned tools.
-    child_env.pop("CLAUDE_AGENT_TOKEN", None)
+    # Scrub the bearer token AND every provider key/secret from the child env:
+    # the claude CLI authenticates via its own ~/.claude login, so it needs none
+    # of them, and leaving them in place leaks them into subprocess inspection /
+    # crash dumps / further-spawned tools. CLAUDE_AGENT_SERVER signals hooks that
+    # this is a headless server call.
+    child_env = _child_env_without_secrets(CLAUDE_AGENT_SERVER="1")
 
     # Start in its own process group/session so a timeout can kill the WHOLE
     # tree, not just the launcher. On Windows CLAUDE_BIN is a `claude.CMD` shim
@@ -415,9 +441,26 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_chat(self, body: dict):
         """OpenAI-compatible chat completions with tool calling support."""
+        # Validate body shape before touching it: a non-dict body or non-list
+        # messages/tools would otherwise raise AttributeError/TypeError before
+        # the try below → a bare worker crash with no HTTP response. Return 400
+        # instead. Mirrors codex-agent-server.
+        if not isinstance(body, dict):
+            self._send(400, {"error": {"message": "request body must be a JSON object", "type": "invalid_request_error"}})
+            return
         messages = body.get("messages", [])
+        if not isinstance(messages, list):
+            self._send(400, {"error": {"message": "messages must be a list", "type": "invalid_request_error"}})
+            return
         if not messages:
             self._send(400, {"error": {"message": "messages is required", "type": "invalid_request_error"}})
+            return
+        if not all(isinstance(m, dict) for m in messages):
+            self._send(400, {"error": {"message": "each message must be an object", "type": "invalid_request_error"}})
+            return
+        tools_raw = body.get("tools")
+        if tools_raw is not None and not isinstance(tools_raw, list):
+            self._send(400, {"error": {"message": "tools must be a list", "type": "invalid_request_error"}})
             return
 
         model = body.get("model")
@@ -560,13 +603,25 @@ class Handler(BaseHTTPRequestHandler):
             created = int(time.time())
             resp_model = model or MODEL
             finish_reason = "tool_calls" if tool_calls else "stop"
+            # Rough estimate (chars/4). Accurate only for ASCII English; for
+            # ru/CJK 1 char ≈ 2-3 tokens, so these undercount badly. claude CLI
+            # doesn't expose real token counts in -p output. Same usage object is
+            # emitted on both transports (non-stream body and the stream finish
+            # chunk) so streaming clients also get token counters.
+            usage = {
+                "prompt_tokens": len(prompt) // 4,
+                "completion_tokens": len(result) // 4,
+                "total_tokens": (len(prompt) + len(result)) // 4,
+                "estimate": True,
+                "cached": cached is not None,
+            }
 
             if stream:
                 # The CLI gives us the full answer at once, so we can't truly
                 # stream. We DO buffer the whole result, then emit it as SSE
                 # chunks so OpenAI-streaming clients (Open WebUI) don't break on
                 # a single JSON blob. Same id/created/model as the non-stream body.
-                self._send_stream(resp_id, created, resp_model, resp_message, finish_reason)
+                self._send_stream(resp_id, created, resp_model, resp_message, finish_reason, usage)
                 return
 
             self._send(200, {
@@ -579,22 +634,17 @@ class Handler(BaseHTTPRequestHandler):
                     "message": resp_message,
                     "finish_reason": finish_reason,
                 }],
-                # Rough estimate (chars/4). Accurate only for ASCII English;
-                # for ru/CJK 1 char ≈ 2-3 tokens, so these undercount badly.
-                # claude CLI doesn't expose real token counts in -p output.
-                "usage": {
-                    "prompt_tokens": len(prompt) // 4,
-                    "completion_tokens": len(result) // 4,
-                    "total_tokens": (len(prompt) + len(result)) // 4,
-                    "estimate": True,
-                    "cached": cached is not None,
-                },
+                "usage": usage,
             })
         except subprocess.TimeoutExpired:
             self._send(504, {"error": {"message": "claude timeout", "type": "timeout"}})
-        except Exception as exc:
+        except Exception:
+            # Full traceback (incl. claude CLI stderr: local paths, home dir /
+            # username, Max-quota internals) goes to the server log only; the
+            # client gets a generic message so a bound LAN peer can't harvest
+            # internals from the 500 body. Mirrors codex-agent-server.
             logger.exception("claude error")
-            self._send(500, {"error": {"message": str(exc), "type": "server_error"}})
+            self._send(500, {"error": {"message": "internal server error", "type": "server_error"}})
 
     def _read_body(self) -> dict | None:
         try:
@@ -632,13 +682,14 @@ class Handler(BaseHTTPRequestHandler):
             return
 
     def _send_stream(self, resp_id: str, created: int, model: str,
-                     resp_message: dict, finish_reason: str):
+                     resp_message: dict, finish_reason: str, usage: dict):
         """Emit the (already-complete) response as OpenAI SSE chunks.
 
         The claude CLI returns the whole answer at once, so this is pseudo-stream:
         a role chunk, one content chunk (if any text), an optional tool_calls
-        chunk, the finish chunk, then `[DONE]`. Each line is `data: {json}\\n\\n`,
-        object="chat.completion.chunk", sharing the non-stream id/created/model.
+        chunk, the finish chunk (carrying usage), then `[DONE]`. Each line is
+        `data: {json}\\n\\n`, object="chat.completion.chunk", sharing the
+        non-stream id/created/model.
         """
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -646,7 +697,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self.end_headers()
 
-        def emit(delta: dict, finish=None):
+        def emit(delta: dict, finish=None, usage=None):
             chunk = {
                 "id": resp_id,
                 "object": "chat.completion.chunk",
@@ -654,6 +705,8 @@ class Handler(BaseHTTPRequestHandler):
                 "model": model,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
             }
+            if usage is not None:
+                chunk["usage"] = usage
             line = "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
             self.wfile.write(line.encode("utf-8"))
 
@@ -673,8 +726,8 @@ class Handler(BaseHTTPRequestHandler):
             tool_calls = resp_message.get("tool_calls")
             if tool_calls:
                 emit({"tool_calls": tool_calls})
-            # 4) finish + 5) [DONE]
-            emit({}, finish=finish_reason)
+            # 4) finish (carries usage) + 5) [DONE]
+            emit({}, finish=finish_reason, usage=usage)
             self.wfile.write(b"data: [DONE]\n\n")
         except (ConnectionError, BrokenPipeError):
             return

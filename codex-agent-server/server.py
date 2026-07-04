@@ -60,9 +60,10 @@ logging.basicConfig(
 logger = logging.getLogger("codex-agent-server")
 
 
-# NOTE: _load_dotenv, build_tools_system_prompt, parse_tool_calls and
-# extract_content are kept byte-identical with claude-agent-server/server.py
-# (no shared module on purpose) — apply any fix to both copies.
+# NOTE: _load_dotenv, _child_env_without_secrets, build_tools_system_prompt,
+# parse_tool_calls and extract_content are kept byte-identical with
+# claude-agent-server/server.py (no shared module on purpose) — apply any fix
+# to both copies.
 def _load_dotenv() -> None:
     """Load KEY=VALUE pairs from a .env file next to this script into the
     environment, without overwriting variables already set. Lets the server
@@ -83,6 +84,30 @@ def _load_dotenv() -> None:
 
 
 _load_dotenv()
+
+
+# Names whose upper-cased form ends with one of these (or contains SECRET/
+# PASSWORD/TOKEN) are treated as secrets and stripped from any child-process env.
+# The child codex/claude CLI authenticates via its own ~/.codex / ~/.claude login,
+# never via these, so removing them is safe — and it closes the /proc/self/environ
+# and `echo $VAR` exfiltration vectors for provider keys AND this server's own
+# bearer tokens (a read-only prompt-injection must not be able to harvest the
+# workspace-write token and self-escalate).
+_SECRET_ENV_SUFFIXES = ("_TOKEN", "_KEY", "_SECRET", "_PASSWORD", "_APIKEY", "_CREDENTIALS")
+_SECRET_ENV_SUBSTRINGS = ("SECRET", "PASSWORD", "TOKEN")
+
+
+def _child_env_without_secrets(**overrides: str) -> dict:
+    """Copy os.environ with every secret-looking var removed, then apply
+    overrides. Pass to subprocess `env=` so a spawned CLI can't leak our keys."""
+    env = {
+        k: v for k, v in os.environ.items()
+        if not (k.upper().endswith(_SECRET_ENV_SUFFIXES)
+                or any(s in k.upper() for s in _SECRET_ENV_SUBSTRINGS))
+    }
+    env.update(overrides)
+    return env
+
 
 # Suppress console windows on Windows when calling codex CLI (.cmd shim)
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -393,7 +418,12 @@ def run_codex(prompt: str, *, model_base: str, sandbox: str,
     # Windows codex spawns a `node` child under the `.cmd` shim; killing only
     # the shim PID (what subprocess.run did) orphaned that node. CREATE_NEW_PROCESS_GROUP
     # lets taskkill /T reach the tree; start_new_session on POSIX enables killpg.
-    popen_kwargs = {}
+    # Strip our bearer tokens and provider keys from the child codex env: a
+    # read-only codex has full host read (incl. /proc/self/environ), so an
+    # inherited CODEX_AGENT_AGENT_TOKEN would let a prompt-injected read-only
+    # request harvest it and self-escalate to workspace-write. Mirrors
+    # claude-agent-server's child_env scrub.
+    popen_kwargs = {"env": _child_env_without_secrets()}
     if sys.platform == "win32":
         popen_kwargs["creationflags"] = CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
     else:
@@ -582,6 +612,9 @@ class Handler(BaseHTTPRequestHandler):
         if not messages:
             self._send(400, {"error": {"message": "messages is required", "type": "invalid_request_error"}})
             return
+        if not all(isinstance(m, dict) for m in messages):
+            self._send(400, {"error": {"message": "each message must be an object", "type": "invalid_request_error"}})
+            return
         tools = body.get("tools")
         if tools is not None and not isinstance(tools, list):
             self._send(400, {"error": {"message": "tools must be a list", "type": "invalid_request_error"}})
@@ -762,38 +795,55 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        # A client that disconnected (common after a long codex run) makes
+        # wfile.write raise ConnectionError/BrokenPipe. Swallow it so it doesn't
+        # bubble to _handle_chat's `except Exception`, which would log a false
+        # "codex error" and try to write a second 500 to the dead socket.
+        try:
+            self.wfile.write(body)
+        except (ConnectionError, BrokenPipeError):
+            return
 
     def _send_stream(self, completion_id, created, model, resp_message,
                      finish_reason, usage):
-        """Minimal OpenAI SSE wrap for stream=true. codex exec yields only the
-        final message, so we can't stream token-by-token: emit the whole
-        completion as a single chat.completion.chunk, then [DONE]."""
-        delta = {"role": "assistant"}
-        if resp_message.get("content") is not None:
-            delta["content"] = resp_message["content"]
-        if resp_message.get("tool_calls"):
-            delta["tool_calls"] = resp_message["tool_calls"]
-        chunk = {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": delta,
-                "finish_reason": finish_reason,
-            }],
-            "usage": usage,
-        }
+        """OpenAI SSE wrap for stream=true. codex exec yields only the final
+        message, so this is pseudo-stream — but emit it as the STANDARD
+        multi-chunk sequence (role → content → optional tool_calls → finish+usage
+        → [DONE]) rather than one chunk carrying content AND finish_reason at
+        once, which strict SSE parsers may drop. Mirrors claude-agent-server."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         self.end_headers()
-        payload = json.dumps(chunk, ensure_ascii=False)
-        self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
-        self.wfile.write(b"data: [DONE]\n\n")
+
+        def emit(delta: dict, finish=None, usage=None):
+            chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            }
+            if usage is not None:
+                chunk["usage"] = usage
+            line = "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
+            self.wfile.write(line.encode("utf-8"))
+
+        # Once 200 + headers are sent the response has begun; a mid-stream client
+        # disconnect makes wfile.write raise — swallow and return.
+        try:
+            emit({"role": "assistant"})
+            content = resp_message.get("content")
+            if content is not None:
+                emit({"content": content})
+            tool_calls = resp_message.get("tool_calls")
+            if tool_calls:
+                emit({"tool_calls": tool_calls})
+            emit({}, finish=finish_reason, usage=usage)
+            self.wfile.write(b"data: [DONE]\n\n")
+        except (ConnectionError, BrokenPipeError):
+            return
 
 
 class SingleInstanceServer(ThreadingHTTPServer):

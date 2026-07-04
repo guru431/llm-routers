@@ -52,6 +52,14 @@ def fmt_s(v):
     return f"{v:.2f}"
 
 
+def fmt_s_unit(v):
+    """Like fmt_s but appends the 's' unit only for real values, so a missing
+    metric (e.g. p90 with <5 samples) renders as '—' rather than '—s'."""
+    if v is None:
+        return "—"
+    return f"{v:.2f}s"
+
+
 def heuristic(task_id: str, text: str) -> str:
     if not text:
         return "—"
@@ -215,11 +223,6 @@ def main():
     )
     lines.append("")
 
-    # === TL;DR ===
-    active_with_q = [r for r in rows if not r.get("skip") and r.get("quality_avg") is not None]
-    by_quality = sorted(active_with_q, key=lambda r: -r["quality_avg"])
-    by_ttft = sorted(active_with_q, key=lambda r: r["ttft_p50"] if r["ttft_p50"] is not None else 9999)
-
     # === Manual TL;DR ===
     # Hand-written block, preserved across re-runs via the marker pair below
     # (see read-old-file logic at the end of main()). The default text is a
@@ -284,9 +287,9 @@ def main():
             ok_str += f" (+{r['empty_text']} empty)"
         lines.append(
             f"| `{r['id']}` | {r['provider']} | "
-            f"{fmt_s(r['ttft_p50'])}s | {fmt_s(r['ttft_p90'])}s | "
-            f"{fmt_s(r.get('ttft_r_p50'))}s | "
-            f"{fmt_s(r['total_p50'])}s | {fmt_s(r['total_p90'])}s | "
+            f"{fmt_s_unit(r['ttft_p50'])} | {fmt_s_unit(r['ttft_p90'])} | "
+            f"{fmt_s_unit(r.get('ttft_r_p50'))} | "
+            f"{fmt_s_unit(r['total_p50'])} | {fmt_s_unit(r['total_p90'])} | "
             f"{q} | {ok_str} |"
         )
     lines.append("")
@@ -345,8 +348,8 @@ def main():
             else:
                 q = str(x["score"]) if x["score"] is not None else "—"
                 lines.append(
-                    f"| `{x['mid']}` | {fmt_s(x['ttft'])}s | {fmt_s(x['ttft_r'])}s | "
-                    f"{fmt_s(x['total'])}s | {q} | {x['heur']} |"
+                    f"| `{x['mid']}` | {fmt_s_unit(x['ttft'])} | {fmt_s_unit(x['ttft_r'])} | "
+                    f"{fmt_s_unit(x['total'])} | {q} | {x['heur']} |"
                 )
         lines.append("")
 
@@ -373,12 +376,16 @@ def main():
             mark = ("*" if r["quality_n"] < r["n"] else "") + ("†" if r.get("self_judged") else "")
             lines.append(
                 f"- `{r['id']}` — quality {r['quality_avg']:.2f}{mark} "
-                f"(eff {r['quality_eff']:.2f}), TTFT p50 {fmt_s(r['ttft_p50'])}s"
+                f"(eff {r['quality_eff']:.2f}), TTFT p50 {fmt_s_unit(r['ttft_p50'])}"
             )
         lines.append("")
         lines.append("**Топ-5 по balance (TTFT/quality):**")
         for r in balanced:
-            lines.append(f"- `{r['id']}` — TTFT/Q = {r['ttft_p50']/r['quality_avg']:.2f}, TTFT {r['ttft_p50']:.2f}s, Q {r['quality_avg']:.2f}")
+            # Same max(0.5, …) guard as the sort key above — a model whose judge
+            # avg is exactly 0.0 (all answers garbage/refused) passed the
+            # `quality_avg is not None` filter and would ZeroDivisionError here.
+            ratio = r["ttft_p50"] / max(0.5, r["quality_avg"])
+            lines.append(f"- `{r['id']}` — TTFT/Q = {ratio:.2f}, TTFT {r['ttft_p50']:.2f}s, Q {r['quality_avg']:.2f}")
     lines.append("")
 
     # === Errors block ===

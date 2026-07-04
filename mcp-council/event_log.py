@@ -45,6 +45,16 @@ from typing import Any
 _writers: dict[str, "EventWriter"] = {}
 _lock = threading.Lock()
 
+# Default logs base (mcp-council/logs). delete_log / prune_logs use it so callers
+# that don't hold server.LOGS_DIR (e.g. state.py's job GC) can still reap files.
+_DEFAULT_BASE_DIR = Path(__file__).parent / "logs"
+
+# Cap on a single job's event log. A long multi-round web_search run emits many
+# tool_call events; without a ceiling one .jsonl could grow very large and stall
+# tail -F consumers. Past the cap we write one truncation notice and go silent —
+# this is best-effort observability, not an audit trail.
+MAX_EVENT_LOG_BYTES = 8 * 1024 * 1024  # 8 MB
+
 
 class EventWriter:
     """Append-only JSONL writer for a single job's event stream.
@@ -57,19 +67,35 @@ class EventWriter:
     def __init__(self, path: Path, *, fh=None) -> None:
         self._path = path
         self._fh = fh
+        self._bytes_written = 0
+        self._truncated = False
 
     def write(self, event_type: str, payload: dict[str, Any]) -> None:
         if self._fh is None:
             return
+        # Once the size cap is hit, emit a single truncation marker, then stay
+        # silent for the rest of the run so the file can't grow without bound.
+        if self._bytes_written >= MAX_EVENT_LOG_BYTES:
+            if not self._truncated:
+                self._truncated = True
+                notice = json.dumps(
+                    {"ts": time.time(), "event": "log_truncated",
+                     "payload": {"max_bytes": MAX_EVENT_LOG_BYTES}},
+                    ensure_ascii=False,
+                ) + "\n"
+                self._fh.write(notice)
+                self._fh.flush()
+            return
         line = json.dumps(
             {"ts": time.time(), "event": event_type, "payload": payload},
             ensure_ascii=False,
-        )
+        ) + "\n"
         # `print(..., file=self._fh)` would also work but `write` is clearer.
-        self._fh.write(line + "\n")
+        self._fh.write(line)
         # Line-buffered mode flushes on the newline; the explicit flush is
         # belt-and-suspenders for cases where Python decides to consolidate.
         self._fh.flush()
+        self._bytes_written += len(line.encode("utf-8"))
 
     def close(self) -> None:
         if self._fh is None:
@@ -118,6 +144,38 @@ def close_writer(job_id: str) -> None:
         w = _writers.pop(job_id, None)
     if w is not None:
         w.close()
+
+
+def delete_log(job_id: str, base_dir: "Path | None" = None) -> None:
+    """Close (if open) and unlink a job's event-log file. Called when the job is
+    GC'd so logs/events/ doesn't accumulate forever (state.py only reaped
+    logs/jobs/). Best-effort — a missing file / perms error is ignored."""
+    close_writer(job_id)
+    base = base_dir or _DEFAULT_BASE_DIR
+    try:
+        (base / "events" / f"{job_id}.jsonl").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def prune_logs(base_dir: "Path | None" = None, *, max_age_seconds: float) -> int:
+    """Delete event-log files whose mtime is older than max_age_seconds. Returns
+    the count removed. Startup reaper: a job whose in-memory state was already
+    lost on a restart leaves its .jsonl behind, so sweep stale ones by age."""
+    base = base_dir or _DEFAULT_BASE_DIR
+    events_dir = base / "events"
+    if not events_dir.exists():
+        return 0
+    now = time.time()
+    removed = 0
+    for f in events_dir.glob("*.jsonl"):
+        try:
+            if now - f.stat().st_mtime > max_age_seconds:
+                f.unlink(missing_ok=True)
+                removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def get_writer(job_id: str) -> EventWriter | None:

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
+import web_search
 from web_search import (
     WEB_SEARCH_TOOL_SPEC,
     WebSearchError,
@@ -13,6 +14,16 @@ from web_search import (
     format_results_for_llm,
     web_search_exa,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_module_client():
+    # web_search now reuses a module-level AsyncClient bound to the event loop it
+    # was created in; drop it around each test so a client from a prior test's
+    # (now-closed) loop isn't reused. Mirrors test_openai_client.
+    web_search._CLIENT = None
+    yield
+    web_search._CLIENT = None
 
 
 # Apply asyncio mark only to coroutine tests below; sync ones don't need it.
@@ -37,7 +48,7 @@ async def test_web_search_missing_key_raises(monkeypatch):
 
 
 async def test_web_search_returns_parsed_results():
-    async def fake_post(self, url, headers=None, json=None):
+    async def fake_post(self, url, headers=None, json=None, timeout=None):
         return _make_exa_response([
             {
                 "title": "test title",
@@ -61,7 +72,7 @@ async def test_web_search_returns_parsed_results():
 
 
 async def test_web_search_http_error_raises():
-    async def fake_post(self, url, headers=None, json=None):
+    async def fake_post(self, url, headers=None, json=None, timeout=None):
         return httpx.Response(
             429, text="rate limited",
             request=httpx.Request("POST", "https://api.exa.ai/search"),
@@ -73,7 +84,7 @@ async def test_web_search_http_error_raises():
 
 
 async def test_web_search_network_error_raises():
-    async def fake_post(self, url, headers=None, json=None):
+    async def fake_post(self, url, headers=None, json=None, timeout=None):
         raise httpx.ConnectError("conn refused")
 
     with patch("httpx.AsyncClient.post", new=fake_post):

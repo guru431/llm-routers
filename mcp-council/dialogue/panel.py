@@ -45,10 +45,23 @@ REPROMPT_RULE = (
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```\s*$", re.MULTILINE)
 
 
-def devils_advocate_for_round(participants: list[dict], round_n: int) -> str:
+def devils_advocate_for_round(
+    participants: list[dict], round_n: int, ok_ids: "set[str] | None" = None
+) -> str:
     """Return the participant id assigned as devil's advocate for round_n
-    (1-indexed). Rotates round-robin."""
-    return participants[(round_n - 1) % len(participants)]["id"]
+    (1-indexed). Rotates round-robin, but when `ok_ids` is given (the ids that
+    answered ok in the previous round) the rotation SKIPS participants that
+    failed — a permanently-dead provider landing on the DA slot would otherwise
+    silence the round's only mandated dissenter. Falls back to the plain rotation
+    pick when none of the participants are known-ok."""
+    n = len(participants)
+    start = (round_n - 1) % n
+    if ok_ids:
+        for offset in range(n):
+            cand = participants[(start + offset) % n]
+            if cand["id"] in ok_ids:
+                return cand["id"]
+    return participants[start]["id"]
 
 
 async def _call_monitor(cfg: dict, prompt: str, max_tokens: int, web_search: bool) -> str:
@@ -93,6 +106,7 @@ async def _maybe_reprompt(
     state: DialogueState,
     round_n: int,
     participant_cfgs: list[dict],
+    role_descriptors: dict[str, str],
     score: int,
     agreers: list[str],
     threshold: int,
@@ -114,7 +128,13 @@ async def _maybe_reprompt(
         rule = REPROMPT_RULE.format(others=others) if others else REPROMPT_RULE.format(others="the other participants")
         return render_response_prompt(
             topic=topic,
-            role_descriptor=f"You are participant {cfg['id']} in a panel discussion.",
+            # Keep the participant's assigned role ('security auditor', etc.) on
+            # the diversity re-prompt: falling back to a generic descriptor here
+            # dropped exactly the role-play framing the correction is meant to
+            # steer back toward.
+            role_descriptor=role_descriptors.get(
+                cfg["id"], f"You are participant {cfg['id']} in a panel discussion."
+            ),
             history=state.history,
             round_n=round_n,
             files_section=files_section,
@@ -190,8 +210,19 @@ async def run_panel(
 
     start = state.current_round + 1
     for round_n in range(start, state.total_rounds + 1):
+        # Prefer a participant that actually answered last round as devil's
+        # advocate — a dead provider on the rotation slot would otherwise emit
+        # `[error:...]` and leave the round with no mandated dissenter. Round 1
+        # has no prior round, so ok_ids stays None → plain rotation.
+        prev_ok = None
+        if round_n > 1:
+            prev_ok = {
+                h["id"] for h in state.history
+                if h["round"] == round_n - 1 and h["phase"] == "response"
+                and h.get("status") == "ok"
+            }
         da_id = (
-            devils_advocate_for_round(state.participants, round_n)
+            devils_advocate_for_round(state.participants, round_n, prev_ok)
             if devils_advocate_rotation else None
         )
         rules: dict[str, str] | None = None
@@ -230,6 +261,7 @@ async def run_panel(
                 state=state,
                 round_n=round_n,
                 participant_cfgs=participant_cfgs,
+                role_descriptors=role_descriptors,
                 score=score,
                 agreers=agreers,
                 threshold=diversity_threshold,
