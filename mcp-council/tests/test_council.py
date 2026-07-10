@@ -288,7 +288,10 @@ def test_compute_usage_aggregates_calls_tokens_retries():
     assert u["tokens_out"] == 50 + 5 + 8 + 100
     assert u["web_search_calls"] == 2
     assert u["retries"] == 1
-    assert u["estimated_cost_usd"] is None
+    # No priced model in the records → reference PAYG is None; the empty
+    # tool_calls_log entries carry no cost_dollars → web search cost is 0.0.
+    assert u["reference_payg_cost_usd"] is None
+    assert u["web_search_cost_usd"] == 0.0
 
 
 def test_compute_usage_no_double_count_carried_failed_member():
@@ -372,6 +375,72 @@ def test_build_summary_winner_failed_and_disagreement():
     # m3 scored 2 and 7 across rankers → spread 5 (≥3) is a disagreement.
     assert any(d["id"] == "m3" and d["spread"] == 5 for d in s["top_disagreements"])
     assert s["confidence"] in ("low", "medium", "high")
+
+
+def test_compute_usage_sums_web_search_cost():
+    """web_search_cost_usd sums the actual per-query Exa cost from the tool log."""
+    rounds_detail = [{
+        "stage1": [
+            {"attempts": 1, "tokens_in": 1, "tokens_out": 1, "tool_calls_log": [
+                {"name": "web_search", "ok": True, "cost_dollars": 0.005, "num_results": 5},
+                {"name": "web_search", "ok": True, "cost_dollars": 0.007, "num_results": 3},
+            ]},
+        ],
+        "stage2": [],
+        "aggregate": [],
+    }]
+    u = _compute_usage(rounds_detail, None)
+    assert u["web_search_calls"] == 2
+    assert u["web_search_cost_usd"] == round(0.005 + 0.007, 6)
+
+
+def test_build_summary_high_confidence_requires_quorum():
+    """A decisive winner ranked by ≥2 peers across ≥2 provider domains earns
+    high confidence and an 'adopt' verdict."""
+    stage1 = [
+        {"id": "glm", "model": "glm-5.2", "status": "ok"},      # opencode-go
+        {"id": "gemini", "model": "gemini", "status": "ok"},    # helicone
+        {"id": "codex", "model": "gpt-5.5", "status": "ok"},    # codex-agent
+    ]
+    stage2 = [
+        {"ranker_id": "gemini", "status": "ok",
+         "rankings": [{"ranked_id": "glm", "score": 9}, {"ranked_id": "codex", "score": 5}]},
+        {"ranker_id": "codex", "status": "ok",
+         "rankings": [{"ranked_id": "glm", "score": 9}, {"ranked_id": "gemini", "score": 5}]},
+        {"ranker_id": "glm", "status": "ok",
+         "rankings": [{"ranked_id": "gemini", "score": 5}, {"ranked_id": "codex", "score": 5}]},
+    ]
+    aggregate = _aggregate(stage2)
+    s = _build_summary(stage1, stage2, aggregate, None)
+    assert s["winner_id"] == "glm"
+    assert s["independent_votes"] == 2
+    assert s["provider_domains"] == 3
+    assert s["single_provider"] is False
+    assert s["quorum_ok"] is True
+    assert s["confidence"] == "high"
+    assert "adopt" in s["recommended_next_action"].lower()
+
+
+def test_build_summary_single_provider_caps_confidence_and_blocks_adopt():
+    """A 2-model, single-provider council (F2's `cheap` preset case) never earns
+    high confidence or an automatic adopt, however wide the score margin."""
+    stage1 = [
+        {"id": "glm", "model": "glm-5.2", "status": "ok"},       # opencode-go
+        {"id": "qwen", "model": "qwen3.6-plus", "status": "ok"}, # opencode-go
+    ]
+    stage2 = [
+        {"ranker_id": "glm", "status": "ok", "rankings": [{"ranked_id": "qwen", "score": 4}]},
+        {"ranker_id": "qwen", "status": "ok", "rankings": [{"ranked_id": "glm", "score": 9}]},
+    ]
+    aggregate = _aggregate(stage2)
+    s = _build_summary(stage1, stage2, aggregate, None)
+    assert s["winner_id"] == "glm"
+    assert s["provider_domains"] == 1
+    assert s["single_provider"] is True
+    assert s["independent_votes"] == 1
+    assert s["quorum_ok"] is False
+    assert s["confidence"] != "high"
+    assert "corroborat" in s["recommended_next_action"].lower()
 
 
 async def test_run_council_returns_usage_and_summary():

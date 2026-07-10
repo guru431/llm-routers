@@ -20,7 +20,7 @@ MCP-сервер: Karpathy 3-stage council из 7 LLM с опционально�
 | gemini | gemini-3.1-pro-preview | Helicone AI Gateway | `HELICONE_GATEWAY_KEY` |
 | codex | gpt-5.5 | codex-agent-server :8766 (read-only) | `CODEX_AGENT_TOKEN` |
 
-`deepseek-pro` теперь идёт через OCG-прокси (DeepSeek direct PAYG исчерпан с 2026-06-07): при OCG outage живым голосом остаётся только Gemini. См. также `_pick_chairman` — DeepSeek используется как fallback chairman.
+`deepseek-pro` теперь идёт через OCG-прокси (DeepSeek direct PAYG исчерпан с 2026-06-07). **Provider-домены** (независимые точки отказа): 5 моделей на OCG (`glm`/`kimi`/`deepseek-pro`/`qwen`/`minimax`) делят один ключ и падают вместе → при OCG outage живыми голосами остаются `gemini` (Helicone) и `codex` (локальный codex-agent-server), т.е. **два независимых домена, а не только Gemini**. Именно поэтому council считает distinct provider-домены, а не число имён: `summary.provider_domains`/`single_provider`/`quorum_ok` гейтят «adopt»-вердикт (см. `_build_summary`). См. также `_pick_chairman` — DeepSeek используется как fallback chairman.
 
 ## Tools
 

@@ -144,6 +144,41 @@ def _member_label(i: int) -> str:
     return label
 
 
+def _collect_web_searches(result: dict) -> list[tuple[str, str, "int | None", bool]]:
+    """Flatten every web_search the council actually issued into
+    (model, query, num_results, ok) rows for a transparency section.
+
+    Queries live in each member's `tool_calls_log`; without surfacing them the
+    only record is the internal JSON dump. This is deliberately NOT a full
+    claim→source citation ledger (the tool log stores the query and result count,
+    not which final claim each source backs) — it just lets the reader see WHAT
+    was searched. Members carried across rounds by identity are deduped by id()."""
+    rows: list[tuple[str, str, "int | None", bool]] = []
+    rounds = result.get("rounds_detail") or [{"stage1": result.get("stage1") or []}]
+    seen: set[int] = set()
+
+    def _from_records(records: list) -> None:
+        for rec in records:
+            if not isinstance(rec, dict) or id(rec) in seen:
+                continue
+            seen.add(id(rec))
+            model = rec.get("model") or rec.get("chairman_model") or "?"
+            for entry in rec.get("tool_calls_log") or []:
+                if not isinstance(entry, dict) or entry.get("name") != "web_search":
+                    continue
+                q = (entry.get("query") or "").strip()
+                if not q:
+                    continue
+                rows.append((model, q, entry.get("num_results"), bool(entry.get("ok"))))
+
+    for rd in rounds:
+        _from_records(rd.get("stage1") or [])
+    stage3 = result.get("stage3")
+    if isinstance(stage3, dict):
+        _from_records([stage3])
+    return rows
+
+
 def format_markdown(question: str, result: dict) -> str:
     """Render stage1+stage2+aggregate (and optional stage 3 synthesis) into a
     markdown brief for the chairman (Claude in-session, or whoever consumes it)."""
@@ -275,6 +310,24 @@ def format_markdown(question: str, result: dict) -> str:
         lines.append("- all members completed both stages successfully")
     lines.append("")
 
+    web_rows = _collect_web_searches(result)
+    if web_rows:
+        lines.append("## Web searches performed")
+        lines.append("")
+        lines.append(
+            "_What the council searched via Exa (transparency). This lists the "
+            "queries, not a per-claim source ledger — verify disputed facts "
+            "against these before relaying._"
+        )
+        lines.append("")
+        for model, query, num, ok in web_rows:
+            status = (
+                f"{num} results" if ok and num is not None
+                else ("ok" if ok else "failed")
+            )
+            lines.append(f'- {model}: "{query}" → {status}')
+        lines.append("")
+
     summary = result.get("summary")
     usage = result.get("usage")
     if summary or usage:
@@ -284,7 +337,17 @@ def format_markdown(question: str, result: dict) -> str:
             win = summary.get("winner_model") or "—"
             mean = summary.get("winner_mean_score")
             mean_str = f" (mean {mean})" if mean is not None else ""
-            lines.append(f"- Winner: **{win}**{mean_str} · confidence: {summary.get('confidence')}")
+            corrob = ""
+            iv = summary.get("independent_votes")
+            pd = summary.get("provider_domains")
+            if iv is not None and pd is not None:
+                corrob = f" · corroboration: {iv} vote(s)/{pd} domain(s)"
+                if summary.get("single_provider"):
+                    corrob += " ⚠ single-provider"
+            lines.append(
+                f"- Winner: **{win}**{mean_str} · confidence: "
+                f"{summary.get('confidence')}{corrob}"
+            )
             failed = summary.get("failed_models") or []
             if failed:
                 lines.append(
@@ -302,11 +365,19 @@ def format_markdown(question: str, result: dict) -> str:
                 )
             lines.append(f"- Next: {summary.get('recommended_next_action')}")
         if usage:
+            cost_bits: list[str] = []
+            wsc = usage.get("web_search_cost_usd")
+            if wsc:
+                cost_bits.append(f"${wsc:.4f} Exa")
+            ref = usage.get("reference_payg_cost_usd")
+            if ref is not None:
+                cost_bits.append(f"~${ref:.4f} ref-PAYG (not billed)")
+            cost_str = (" · " + ", ".join(cost_bits)) if cost_bits else ""
             lines.append(
                 f"- Usage: {usage.get('llm_calls')} LLM calls, "
                 f"{usage.get('tokens_in')}→{usage.get('tokens_out')} tokens, "
                 f"{usage.get('web_search_calls')} web searches, "
-                f"{usage.get('retries')} retries"
+                f"{usage.get('retries')} retries{cost_str}"
             )
         lines.append("")
 
@@ -773,10 +844,18 @@ async def council_ask_async(
         )
     )
     job_state.attach_task(state, task)
+    # Predictable fan-out ceiling so the caller sees the resource cost before the
+    # 2-8 min run commits it. Per round = len(members) stage-1 + len(members)
+    # stage-2 calls; ×rounds; +1 for synthesis. Assumes no member drops out (a
+    # failure only lowers it), and web_search adds up to MAX_TOOL_ITERATIONS
+    # extra stage-1 turns per member on top.
+    n = len(members)
+    expected_model_calls = 2 * n * rounds + (1 if synthesis else 0)
     return {
         "job_id": state.job_id,
         "phase": state.phase,
         "expected_members": [m["id"] for m in members],
+        "expected_model_calls": expected_model_calls,
         "synthesis_requested": synthesis,
         "rounds_requested": rounds,
         "web_search_enabled": web_search,
@@ -1175,8 +1254,15 @@ async def model_debate(
         raise RuntimeError(
             f"model_debate requires at least {DEFAULT_DEBATE_MIN_PARTICIPANTS} distinct participants, got {ids}"
         )
+    mod_id = moderator or DEFAULT_MODERATOR
+    if mod_id in ids:
+        raise RuntimeError(
+            f"model_debate moderator '{mod_id}' must be distinct from participants "
+            f"{ids}: it splits the positions and writes the final summary, so a "
+            "participant moderating its own debate breaks role separation."
+        )
     part_cfgs = [_resolve_engine_cfg(i) for i in ids]
-    mod_cfg = _resolve_engine_cfg(moderator or DEFAULT_MODERATOR)
+    mod_cfg = _resolve_engine_cfg(mod_id)
     max_tokens = _clamp_tokens(max_response_tokens)
     files_section = await _build_files_section_or_none(context_paths)
 
@@ -1236,8 +1322,15 @@ async def model_panel(
         raise RuntimeError(
             f"roles must match participants length; got {len(roles)} roles for {len(ids)} participants"
         )
+    mon_id = monitor_model or DEFAULT_MODERATOR
+    if mon_id in ids:
+        raise RuntimeError(
+            f"model_panel monitor '{mon_id}' must be distinct from participants "
+            f"{ids}: it scores the panel's diversity and re-prompts agreers, so a "
+            "participant grading its own agreement breaks anti-convergence."
+        )
     part_cfgs = [_resolve_engine_cfg(i) for i in ids]
-    mon_cfg = _resolve_engine_cfg(monitor_model or DEFAULT_MODERATOR)
+    mon_cfg = _resolve_engine_cfg(mon_id)
     max_tokens = _clamp_tokens(max_response_tokens)
     files_section = await _build_files_section_or_none(context_paths)
 

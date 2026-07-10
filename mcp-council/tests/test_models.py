@@ -8,6 +8,7 @@ from models import (
     DisabledModelError,
     UnknownModelError,
     UnknownPresetError,
+    provider_domain,
     resolve_member,
     resolve_members,
     resolve_preset,
@@ -88,3 +89,21 @@ def test_resolve_preset_returns_copy():
     # Mutating the returned list must not leak into PRESETS or future resolves.
     assert "MUTATED" not in resolve_preset("cheap")
     assert "MUTATED" not in PRESETS["cheap"]
+
+
+def test_provider_domain_groups_ocg_and_isolates_independent_backends():
+    # The 5 OCG members share one failure/credential domain; gemini (Helicone)
+    # and codex (local codex-agent-server) are independent.
+    assert provider_domain("glm") == provider_domain("qwen") == "opencode-go"
+    assert provider_domain("deepseek-pro") == "opencode-go"
+    assert provider_domain("gemini") == "helicone"
+    assert provider_domain("codex") == "codex-agent"
+    assert len({provider_domain("glm"), provider_domain("gemini"),
+                provider_domain("codex")}) == 3
+    # Unknown ids (test stubs) map to themselves so each is its own domain.
+    assert provider_domain("m1") == "m1"
+
+
+def test_every_catalog_member_has_a_provider_domain():
+    for mid, cfg in CATALOG.items():
+        assert cfg.get("provider"), f"{mid} missing provider domain"

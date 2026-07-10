@@ -28,7 +28,7 @@
 
 - **Удалённые пакеты:** `mcp-deepseek` и `mcp-minimax` удалены. Tool refs `mcp__deepseek-helper__*` и `mcp__minimax-helper__*` больше не существуют — использовать `mcp__council__model_ask` с нужным `model_id` из `models.CATALOG`.
 - **`minimax-direct` отключён** в `CATALOG` (billing off) — не передавать как `model_id` в `model_ask`, выпадет ошибка.
-- **`claude-agent-server`: tool calling не работает** — `claude -p` воспринимает custom tools как prompt injection. Только chat completions.
+- **`claude-agent-server`: tool calling — три состояния** (не «просто не работает»): native Anthropic tool use — нет; эмулируемый через prompt-injection — есть, best-effort (надёжность ≈7/12 на `test_server.py`); для критичных workflow — только text/chat completions. Детали и измеренная надёжность — `claude-agent-server/README.md`.
 - **`codex-agent-server` на Windows:** `codex` резолвится через `shutil.which()` → `codex.CMD`. CreateProcess не дописывает PATHEXT, поэтому `subprocess.run(["codex", ...])` падает с FileNotFoundError — нельзя звать по короткому имени. Агентный `workspace-write` реально пишет файлы: `workdir` обязан быть внутри `CODEX_AGENT_WORKDIR_ROOT` (иначе 400). Глобальные MCP Codex гасятся `-c mcp_servers={}` на каждом вызове.
 - **`mcp-council/dialogue/`: три не-очевидных грабли:**
   - `task.cancel()` на не-стартовавшей корутине не входит в её `try/except` — нужен `await asyncio.sleep(0)` перед cancel.

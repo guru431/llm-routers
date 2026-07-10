@@ -147,6 +147,26 @@ def test_format_markdown_no_analysis_section_when_absent():
     assert "## Cross-cutting analysis" not in md
 
 
+def test_format_markdown_web_searches_section():
+    """When members issued web_search calls, their queries surface in a
+    transparency section (F5)."""
+    res = _stub_result()
+    res["stage1"][0]["tool_calls_log"] = [
+        {"name": "web_search", "ok": True, "query": "glm 5.2 release date", "num_results": 5},
+        {"name": "web_search", "ok": False, "query": "broken query"},
+    ]
+    md = server.format_markdown("q", res)
+    assert "## Web searches performed" in md
+    assert "glm 5.2 release date" in md
+    assert "5 results" in md
+    assert "failed" in md
+
+
+def test_format_markdown_no_web_searches_section_when_none():
+    md = server.format_markdown("q", _stub_result())
+    assert "## Web searches performed" not in md
+
+
 def test_do_council_ask_sandbox_error_logged(monkeypatch, tmp_path):
     """If sandbox raises, we get RuntimeError and log_call is called once."""
     logged: list[dict] = []

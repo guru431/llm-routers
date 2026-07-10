@@ -17,7 +17,7 @@ import time
 from typing import Any, Awaitable, Callable
 
 from healthcheck import _classify_error
-from models import CATALOG, resolve_members
+from models import CATALOG, provider_domain, resolve_members
 from openai_client import call_openai_compat
 from prompts import (
     STAGE1_ROUND_N_SYSTEM,
@@ -741,9 +741,14 @@ def _compute_usage(
     `retries` is the number of HTTP retries on the SUCCESS path; calls that
     exhausted their retries and failed appear in summary.failed_models instead.
     `web_search_cache_hits` = duplicate queries served from the per-run cache.
-    `estimated_cost_usd` = Σ tokens × per-model price (models.CATALOG price_in/
-    price_out, USD per 1M). None only if NO record had a priced model (all
-    members on flat-rate subscriptions with no per-token price).
+    `web_search_cost_usd` = Σ actual per-query Exa cost reported in the tool
+    logs (0.0 when no search ran or Exa reported no cost).
+    `reference_payg_cost_usd` = Σ tokens × per-model REFERENCE PAYG price
+    (models.CATALOG price_in/out). This is NOT billed spend: every default
+    member bills flat-rate via subscription, so the real incremental cost of a
+    run is ≈ web_search_cost_usd. The field is a "what this would cost at
+    per-token PAYG" yardstick and is None when no record had a priced model —
+    deliberately named so automation never treats it as money spent.
 
     For web_search members the per-turn result only carries its last turn's
     tokens; the loop_* aggregates (summed across every tool-loop iteration) are
@@ -751,13 +756,14 @@ def _compute_usage(
     """
     calls = tin = tout = retries = web = 0
     cost = 0.0
+    web_cost = 0.0
     any_priced = False
 
     def _model_id(rec: dict) -> str | None:
         return rec.get("id") or rec.get("ranker_id") or rec.get("chairman_id")
 
     def _acc(rec: dict) -> None:
-        nonlocal calls, tin, tout, retries, web, cost, any_priced
+        nonlocal calls, tin, tout, retries, web, cost, web_cost, any_priced
         # Prefer the tool-loop aggregates for web_search members (calls/tokens/
         # attempts summed across every iteration); fall back to the single-call
         # figures for plain (non-web) members.
@@ -777,7 +783,12 @@ def _compute_usage(
                 retries += max(0, attempts - 1)
         tin += rec_in
         tout += rec_out
-        web += len(rec.get("tool_calls_log") or [])
+        tool_log = rec.get("tool_calls_log") or []
+        web += len(tool_log)
+        for entry in tool_log:
+            c = entry.get("cost_dollars") if isinstance(entry, dict) else None
+            if isinstance(c, (int, float)):
+                web_cost += c
 
         cfg = CATALOG.get(_model_id(rec) or "")
         if cfg:
@@ -814,8 +825,9 @@ def _compute_usage(
         "tokens_out": tout,
         "web_search_calls": web,
         "web_search_cache_hits": search_cache.hits if search_cache is not None else 0,
+        "web_search_cost_usd": round(web_cost, 6),
         "retries": retries,
-        "estimated_cost_usd": round(cost, 6) if any_priced else None,
+        "reference_payg_cost_usd": round(cost, 6) if any_priced else None,
     }
 
 
@@ -873,6 +885,19 @@ def _build_summary(
             winner_id = survivors[0]["id"]
             winner_model = survivors[0]["model"]
 
+    # Independent-source quorum. A council of N model NAMES is not N independent
+    # checks: members behind one gateway+credential (the 5 OCG models share
+    # OPENCODE_GO_KEY) fail together and tend to agree for the same reasons. So a
+    # verdict only counts as corroborated when the winner was ranked by ≥2 peers
+    # AND the survivors span ≥2 independent provider domains. Below quorum the
+    # winner is at most one opinion — we never let it read as "high" confidence
+    # or an automatic "adopt" (guards F2's 2-model preset and F1's OCG-outage
+    # case where 5 "votes" collapse to a single failure domain).
+    survivor_domains = {provider_domain(s["id"]) for s in stage1 if s["status"] == "ok"}
+    provider_domains = len(survivor_domains)
+    independent_votes = aggregate[0][2] if aggregate else 0
+    quorum_ok = independent_votes >= 2 and provider_domains >= 2
+
     # Confidence from the margin between the top two aggregate means. A single
     # ranked member (len<2) has no runner-up to compare against — the previous
     # `margin = top` fallback let one uncontested score trivially read as high
@@ -889,6 +914,10 @@ def _build_summary(
             confidence = "medium"
         else:
             confidence = "low"
+    # A margin can look decisive on too few / single-domain votes — cap "high"
+    # at "medium" unless the winner is independently corroborated.
+    if confidence == "high" and not quorum_ok:
+        confidence = "medium"
 
     # Disagreements: per-member score spread across rankers (1-10 scale).
     scores_by_id: dict[str, list[int]] = {}
@@ -914,6 +943,13 @@ def _build_summary(
     # "half or more of the members had a failure" — integer math (no float /2).
     if failed_models and len(failed_models) * 2 >= len(stage1):
         next_action = "Several models failed — run model_healthcheck and retry."
+    elif not quorum_ok:
+        next_action = (
+            f"Not independently corroborated — winner rests on {independent_votes} "
+            f"peer vote(s) across {provider_domains} provider domain(s). Treat as a "
+            "single opinion; add an independent source (another provider, or human "
+            "review) before adopting."
+        )
     elif confidence == "low" or top_disagreements:
         next_action = (
             "Low agreement — consider synthesis=True or another round (rounds=2)."
@@ -926,6 +962,15 @@ def _build_summary(
         "winner_model": winner_model,
         "winner_mean_score": winner_mean,
         "confidence": confidence,
+        # Corroboration signals: independent_votes = peers who ranked the winner;
+        # provider_domains = distinct provider/credential domains among survivors.
+        # single_provider flags a council that can't self-corroborate. quorum_ok
+        # is the gate behind the "adopt"/"high" verdict — downstream automation
+        # can branch on it without re-deriving the rule.
+        "independent_votes": independent_votes,
+        "provider_domains": provider_domains,
+        "single_provider": provider_domains < 2,
+        "quorum_ok": quorum_ok,
         "survivors": ok_stage1,
         "failed_models": failed_models,
         "top_disagreements": top_disagreements,

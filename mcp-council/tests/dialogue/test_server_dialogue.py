@@ -95,6 +95,23 @@ async def test_model_socratic_validates_distinct():
     assert "distinct" in str(exc.value).lower() or "same" in str(exc.value).lower()
 
 
+async def test_model_debate_rejects_moderator_in_participants():
+    with pytest.raises(RuntimeError) as exc:
+        await server.model_debate(
+            question="q", participants=["glm", "kimi"], moderator="glm", rounds=2,
+        )
+    assert "moderator" in str(exc.value).lower() and "distinct" in str(exc.value).lower()
+
+
+async def test_model_panel_rejects_monitor_in_participants():
+    with pytest.raises(RuntimeError) as exc:
+        await server.model_panel(
+            question="q", participants=["glm", "kimi", "deepseek-pro", "qwen"],
+            monitor_model="qwen", rounds=2,
+        )
+    assert "monitor" in str(exc.value).lower() and "distinct" in str(exc.value).lower()
+
+
 async def test_rounds_out_of_range_rejected():
     with pytest.raises(RuntimeError) as exc:
         await server.model_debate(question="q", rounds=21)
