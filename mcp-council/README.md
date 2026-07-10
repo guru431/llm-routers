@@ -110,7 +110,15 @@ Async-job исполнение council живёт в `state.py`; промпты 
 
 ## Sandbox
 
-Список заблокированных путей — в `sandbox.py` (тот же blacklist, что в `mcp-deepseek/sandbox.py`; дубликат by design).
+`sandbox.py` — deny-list заблокированных путей (`.env`, ключи, secrets, settings.json), лимит 50 файлов / 500 KB.
+
+Контекстные файлы (`context_paths` / `example_paths`) — **fail-closed**: deny-list ловит секретные имена/содержимое, но не является границей доверия для приватного файла с нейтральным именем. Поэтому:
+
+- без `COUNCIL_CONTEXT_ROOTS` — `context_paths` **запрещены** (по умолчанию);
+- `COUNCIL_CONTEXT_ROOTS=<dir(s)>` (os.pathsep-разделитель) — файловый контекст разрешён, но каждый файл обязан резолвиться **внутри** одного из корней;
+- `COUNCIL_CONTEXT_FAIL_OPEN=1` — вернуть старый deny-list-only режим (любой не-blacklisted файл проходит).
+
+Эффективная поза видна в `model_healthcheck` (`context_roots_configured`, `context_fail_open`) и в startup-логе (stderr).
 
 ## Logging
 

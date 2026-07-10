@@ -48,11 +48,11 @@
     {"id": "groq-kimi-k2",        "provider": "groq",       "endpoint": "https://api.groq.com/openai/v1", "model": "moonshotai/kimi-k2-instruct", "auth_env": "GROQ_KEY"},
     {"id": "groq-qwen-32b",       "provider": "groq",       "endpoint": "https://api.groq.com/openai/v1", "model": "qwen/qwen3-32b",            "auth_env": "GROQ_KEY"},
 
-    {"id": "minimax-m2.7-direct",          "provider": "minimax", "endpoint": "https://api.minimax.io/v1", "model": "MiniMax-M2.7",           "auth_env": "MINIMAX_API_KEY"},
-    {"id": "minimax-m2.7-highspeed-direct","provider": "minimax", "endpoint": "https://api.minimax.io/v1", "model": "MiniMax-M2.7-highspeed", "auth_env": "MINIMAX_API_KEY"},
-    {"id": "minimax-m2.5-direct",          "provider": "minimax", "endpoint": "https://api.minimax.io/v1", "model": "MiniMax-M2.5",           "auth_env": "MINIMAX_API_KEY"},
-    {"id": "minimax-m2.5-highspeed-direct","provider": "minimax", "endpoint": "https://api.minimax.io/v1", "model": "MiniMax-M2.5-highspeed", "auth_env": "MINIMAX_API_KEY"},
-    {"id": "minimax-m2.1-direct",          "provider": "minimax", "endpoint": "https://api.minimax.io/v1", "model": "MiniMax-M2.1",           "auth_env": "MINIMAX_API_KEY"},
+    {"id": "minimax-m2.7-direct",          "provider": "minimax", "endpoint": "https://api.minimax.io/v1", "model": "MiniMax-M2.7",           "auth_env": "MINIMAX_API_KEY", "skip_reason": "MiniMax billing off 2026-05-21 (see mcp-council/models.py minimax-direct enabled:False)"},
+    {"id": "minimax-m2.7-highspeed-direct","provider": "minimax", "endpoint": "https://api.minimax.io/v1", "model": "MiniMax-M2.7-highspeed", "auth_env": "MINIMAX_API_KEY", "skip_reason": "MiniMax billing off 2026-05-21 (see mcp-council/models.py minimax-direct enabled:False)"},
+    {"id": "minimax-m2.5-direct",          "provider": "minimax", "endpoint": "https://api.minimax.io/v1", "model": "MiniMax-M2.5",           "auth_env": "MINIMAX_API_KEY", "skip_reason": "MiniMax billing off 2026-05-21 (see mcp-council/models.py minimax-direct enabled:False)"},
+    {"id": "minimax-m2.5-highspeed-direct","provider": "minimax", "endpoint": "https://api.minimax.io/v1", "model": "MiniMax-M2.5-highspeed", "auth_env": "MINIMAX_API_KEY", "skip_reason": "MiniMax billing off 2026-05-21 (see mcp-council/models.py minimax-direct enabled:False)"},
+    {"id": "minimax-m2.1-direct",          "provider": "minimax", "endpoint": "https://api.minimax.io/v1", "model": "MiniMax-M2.1",           "auth_env": "MINIMAX_API_KEY", "skip_reason": "MiniMax billing off 2026-05-21 (see mcp-council/models.py minimax-direct enabled:False)"},
 
     {"id": "ollama-gemma4-12b",   "provider": "ollama",     "endpoint": "http://localhost:11434", "model": "gemma4:12b",          "auth_env": null, "api": "ollama"},
     {"id": "ollama-qwen3.5-9b",   "provider": "ollama",     "endpoint": "http://localhost:11434", "model": "qwen3.5:9b",          "auth_env": null, "api": "ollama"},

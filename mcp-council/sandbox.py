@@ -84,12 +84,25 @@ class SandboxError(Exception):
     """Любая нарушение sandbox-правил (blacklist, size, count, missing file)."""
 
 
-# Optional allow-list root(s). The deny-list above is best-effort: a prompt-
-# injected context_path can still exfiltrate any non-blacklisted private file.
-# Set COUNCIL_CONTEXT_ROOTS (os.pathsep-separated, e.g. the repo/workspace dir)
-# to require every context file to resolve INSIDE one of those roots. Unset =
-# deny-list-only (backward compatible).
+# Allow-list root(s). The deny-list above is best-effort: a prompt-injected
+# context_path can still exfiltrate any non-blacklisted private file (a neutral-
+# named private working doc passes every name/content check). So context files
+# are FAIL-CLOSED: set COUNCIL_CONTEXT_ROOTS (os.pathsep-separated, e.g. the
+# repo/workspace dir) to require every context file to resolve INSIDE one of
+# those roots. With no roots set, context_paths are REJECTED — set
+# COUNCIL_CONTEXT_FAIL_OPEN=1 to restore the old deny-list-only behavior.
 _CONTEXT_ROOTS_ENV = "COUNCIL_CONTEXT_ROOTS"
+_CONTEXT_FAIL_OPEN_ENV = "COUNCIL_CONTEXT_FAIL_OPEN"
+
+
+def fail_open() -> bool:
+    """True if the operator opted out of fail-closed context handling.
+
+    When no COUNCIL_CONTEXT_ROOTS is configured, context files are rejected by
+    default (fail-closed). Setting COUNCIL_CONTEXT_FAIL_OPEN=1 restores the old
+    deny-list-only mode (any non-blacklisted file passes) — an explicit, logged
+    choice rather than an implicit hole."""
+    return os.environ.get(_CONTEXT_FAIL_OPEN_ENV, "").strip().lower() in ("1", "true", "yes")
 
 
 def context_roots_configured() -> bool:
@@ -163,6 +176,15 @@ def resolve_and_validate(paths: list[str]) -> list[Path]:
             f"file count limit exceeded: {len(paths)} > {MAX_FILE_COUNT}"
         )
     roots = _allowed_roots()
+    # Fail-closed: with no allowed roots and no explicit opt-out, refuse to read
+    # any context file — the deny-list can't be a trust boundary for neutral-named
+    # private docs. Guard on `paths` so an empty request stays a no-op.
+    if paths and not roots and not fail_open():
+        raise SandboxError(
+            f"context files disabled: set {_CONTEXT_ROOTS_ENV} to an allowed "
+            f"workspace root (fail-closed default), or {_CONTEXT_FAIL_OPEN_ENV}=1 "
+            f"to restore deny-list-only behavior"
+        )
     resolved: list[Path] = []
     for p in paths:
         if is_blocked(p):

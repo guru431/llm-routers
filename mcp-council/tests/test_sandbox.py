@@ -7,11 +7,26 @@ from sandbox import (
     resolve_and_validate,
     context_roots_configured,
     _CONTEXT_ROOTS_ENV,
+    _CONTEXT_FAIL_OPEN_ENV,
 )
 
 
-def test_no_roots_env_allows_any_nonblacklisted_file(tmp_path, monkeypatch):
+def test_no_roots_env_rejects_fail_closed(tmp_path, monkeypatch):
+    # Fail-closed default: with no allowed roots and no opt-out, context files
+    # are refused rather than shipped to a third-party LLM.
     monkeypatch.delenv(_CONTEXT_ROOTS_ENV, raising=False)
+    monkeypatch.delenv(_CONTEXT_FAIL_OPEN_ENV, raising=False)
+    f = tmp_path / "note.txt"
+    f.write_text("hello")
+    with pytest.raises(SandboxError, match=_CONTEXT_ROOTS_ENV):
+        resolve_and_validate([str(f)])
+    # An empty request is still a no-op (no files to guard).
+    assert resolve_and_validate([]) == []
+
+
+def test_fail_open_env_restores_deny_list_only(tmp_path, monkeypatch):
+    monkeypatch.delenv(_CONTEXT_ROOTS_ENV, raising=False)
+    monkeypatch.setenv(_CONTEXT_FAIL_OPEN_ENV, "1")
     f = tmp_path / "note.txt"
     f.write_text("hello")
     assert resolve_and_validate([str(f)]) == [f.resolve()]

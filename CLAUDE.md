@@ -52,7 +52,7 @@
 ## Принципы
 
 - **Stateless** — каждый MCP-вызов независим. Исключение: process-global circuit breaker (`circuit_breaker.py`) — после `FAILURE_THRESHOLD` подряд infra-ошибок (5xx/timeout/network) хост помечается degraded на `COOLDOWN_SECONDS`, и вызовы к нему short-circuit'ятся (не жгут retry-бюджет всего fan-out). 402/401/400 breaker не открывают.
-- **Sandbox** — `sandbox.py` блокирует `.env`, ключи, secrets, settings.json. Лимит 50 файлов / 500 KB суммарно. Опц. allow-list `COUNCIL_CONTEXT_ROOTS` (если не задан — сервер пишет warning в stderr на старте; виден в `model_healthcheck`).
+- **Sandbox** — `sandbox.py` блокирует `.env`, ключи, secrets, settings.json. Лимит 50 файлов / 500 KB суммарно. Контекстные файлы **fail-closed**: без `COUNCIL_CONTEXT_ROOTS` `context_paths` запрещены (deny-list не является границей доверия для нейтрально-именованных приватных файлов). Задать `COUNCIL_CONTEXT_ROOTS`=<workspace dir(s)> (os.pathsep-разделитель) чтобы включить файловый контекст с проверкой «внутри корня»; `COUNCIL_CONTEXT_FAIL_OPEN=1` — вернуть старый deny-list-only режим. Эффективная поза видна в `model_healthcheck` (`context_roots_configured`, `context_fail_open`) и в startup-логе (stderr).
 - **Single source of truth** — `models.py::CATALOG` хранит всех моделей, дубликатов `sandbox.py`/`logger.py` больше нет. Пресеты совета — `models.py::PRESETS`.
 
 ## Ключи

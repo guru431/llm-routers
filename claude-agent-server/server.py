@@ -158,6 +158,19 @@ except ValueError:
     MAX_CONCURRENCY = 4
 _CLAUDE_SEM = threading.BoundedSemaphore(MAX_CONCURRENCY)
 
+# The system prompt (all system messages + injected tool descriptions) is passed
+# as a single `--system-prompt=<value>` argv. CLAUDE_BIN resolves to the npm
+# `claude.CMD` shim, so subprocess routes it through cmd.exe, whose command-line
+# ceiling is ~8191 chars (the raw CreateProcessW limit is 32767). A large system
+# prompt + many tools would silently overflow → truncated flag or spawn failure
+# surfacing as a generic 500. Reject with a clear 400 instead. Default 7000 is
+# conservative for cmd.exe minus the rest of argv; raise via env if you confirm a
+# higher real limit (e.g. POSIX shells).
+try:
+    SYSTEM_PROMPT_ARGV_LIMIT = max(1024, int(os.getenv("CLAUDE_AGENT_MAX_SYSTEM_PROMPT", "7000")))
+except ValueError:
+    SYSTEM_PROMPT_ARGV_LIMIT = 7000
+
 
 # ============================================================
 # Tool calling via prompt injection
@@ -414,7 +427,7 @@ class Handler(BaseHTTPRequestHandler):
                 } for m in MODELS],
             })
         else:
-            self._send(404, {"error": "Not found"})
+            self._send(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
 
     def do_POST(self):
         if self.path == "/v1/chat/completions":
@@ -425,19 +438,19 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._handle_chat(body)
         else:
-            self._send(404, {"error": "Not found"})
+            self._send(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
 
     def do_DELETE(self):
         if self.path == "/cache":
             if not self._check_auth():
                 return
             if CACHE is None:
-                self._send(404, {"error": "cache disabled"})
+                self._send(404, {"error": {"message": "cache disabled", "type": "invalid_request_error"}})
                 return
             CACHE.clear()
             self._send(200, {"status": "cleared", "stats": CACHE.stats()})
         else:
-            self._send(404, {"error": "Not found"})
+            self._send(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
 
     def _handle_chat(self, body: dict):
         """OpenAI-compatible chat completions with tool calling support."""
@@ -527,6 +540,18 @@ class Handler(BaseHTTPRequestHandler):
             system_parts.append(build_tools_system_prompt(tools))
 
         system_prompt = "\n\n".join(system_parts) if system_parts else None
+
+        # Guard the CLI argv length (see SYSTEM_PROMPT_ARGV_LIMIT): a system
+        # prompt too large for `--system-prompt=` on Windows would otherwise fail
+        # opaquely as a 500. A 400 is honest and actionable.
+        if system_prompt and len(system_prompt) > SYSTEM_PROMPT_ARGV_LIMIT:
+            self._send(400, {"error": {
+                "message": (
+                    f"system prompt too large for CLI argv "
+                    f"({len(system_prompt)} > {SYSTEM_PROMPT_ARGV_LIMIT} chars); "
+                    f"reduce system messages or number/size of tools"),
+                "type": "invalid_request_error"}})
+            return
 
         # Build conversation prompt
         if len(conversation) == 1:
@@ -650,10 +675,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", 0))
         except (TypeError, ValueError):
-            self._send(400, {"error": "Invalid Content-Length"})
+            self._send(400, {"error": {"message": "invalid Content-Length", "type": "invalid_request_error"}})
             return None
         if length < 0:
-            self._send(400, {"error": "Invalid Content-Length"})
+            self._send(400, {"error": {"message": "invalid Content-Length", "type": "invalid_request_error"}})
             return None
         if length > MAX_BODY_SIZE:
             self._send(413, {"error": {
@@ -663,7 +688,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             return json.loads(self.rfile.read(length))
         except Exception:
-            self._send(400, {"error": "Invalid JSON"})
+            self._send(400, {"error": {"message": "invalid JSON body", "type": "invalid_request_error"}})
             return None
 
     def _send(self, code: int, data: dict):
@@ -694,7 +719,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        self.send_header("Connection", "close")
         self.end_headers()
 
         def emit(delta: dict, finish=None, usage=None):
@@ -713,8 +738,8 @@ class Handler(BaseHTTPRequestHandler):
         # Once the 200 + headers are sent, the response has begun. A mid-stream
         # client disconnect makes wfile.write raise ConnectionError/BrokenPipe;
         # swallow it here and return rather than let it bubble to _handle_chat's
-        # `except Exception`, which would log a false "claude error" and try to
-        # write a second 500 status to the already-dead socket.
+        # `except Exception`, which would log a false error and try to write a
+        # second 500 status to the already-dead socket.
         try:
             # 1) role
             emit({"role": "assistant"})
@@ -722,10 +747,23 @@ class Handler(BaseHTTPRequestHandler):
             content = resp_message.get("content")
             if content:
                 emit({"content": content})
-            # 3) tool_calls (if present) — surfaced in their own delta
+            # 3) tool_calls — one indexed delta per call, OpenAI-stream shaped so
+            # strict SDKs that accumulate by `index` reassemble them (a single
+            # non-indexed blob got dropped). We hold the whole call, so each
+            # delta carries the full arguments — no need to fragment.
             tool_calls = resp_message.get("tool_calls")
             if tool_calls:
-                emit({"tool_calls": tool_calls})
+                for i, tc in enumerate(tool_calls):
+                    fn = tc.get("function", {})
+                    emit({"tool_calls": [{
+                        "index": i,
+                        "id": tc.get("id"),
+                        "type": tc.get("type", "function"),
+                        "function": {
+                            "name": fn.get("name", ""),
+                            "arguments": fn.get("arguments", ""),
+                        },
+                    }]})
             # 4) finish (carries usage) + 5) [DONE]
             emit({}, finish=finish_reason, usage=usage)
             self.wfile.write(b"data: [DONE]\n\n")

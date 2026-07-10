@@ -36,3 +36,7 @@ IDEAS.md
 
 # Agent-server runtime debug logs (may contain private IPs / prompt text)
 */_srv_*.txt
+
+# Bench raw runtime artifacts (provider error bodies incl. account ids, reasoning
+# traces, prompt echoes) — never publish. Aggregate numbers live in the report md.
+bench/results/

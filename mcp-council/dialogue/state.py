@@ -88,6 +88,12 @@ class DialogueState:
     devils_advocate_rotation: bool = True
 
     _task: asyncio.Task | None = field(default=None, repr=False)
+    # Serializes dialogue_continue on THIS session: two concurrent continues used
+    # to both pass the terminal-phase gate and each spawn a runner (double LLM
+    # spend, doubled total_rounds, corrupted history). Lazily binds to the loop on
+    # first acquire, so constructing it in create_session / _state_from_dump before
+    # the loop serves is safe.
+    _continue_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 
 _sessions: dict[str, DialogueState] = {}

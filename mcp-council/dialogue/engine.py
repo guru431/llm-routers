@@ -341,6 +341,13 @@ def write_dump(state: DialogueState, *, base_dir: Path) -> Path:
     """
     base_dir.mkdir(parents=True, exist_ok=True)
     dump_path = base_dir / f"{state.session_id}.json"
+    # Record the snapshot's OWN path into the snapshot before serializing it, so
+    # a session recovered by load_persisted_dialogues() exposes a valid dump_path
+    # instead of None. The mode-runners assign state.dump_path from write_dump's
+    # return value only AFTER the write, so without this the persisted JSON froze
+    # the PREVIOUS dump_path (None on the first/only dump) — a recovered "done"
+    # session then reported dump_path=None.
+    state.dump_path = str(dump_path)
     payload = {
         "session_id": state.session_id,
         "mode": state.mode,

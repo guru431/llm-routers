@@ -37,12 +37,30 @@ if [ -n "$binstat" ]; then
   fi
 fi
 
-# Collect staged diff once (exclude the hook itself to avoid self-matching)
+# 1c) Reject newly-added runtime/bench artifacts. These are gitignored, but a
+# `git add -f` could still stage them — they carry provider error bodies, account
+# ids, reasoning traces and prompt echoes. Anchored to the exact dirs to avoid
+# catching an unrelated doc that happens to end in .jsonl.
+if [ -n "$added" ]; then
+  arts=$(printf '%s\n' "$added" \
+    | grep -iE '(^|/)(bench/results/.*\.(jsonl|log)$|logs/|_srv_[^/]*\.txt$)' || true)
+  if [ -n "$arts" ]; then
+    echo "BLOCKED: runtime/bench artifact staged (gitignored; use --no-verify only if truly intended):"
+    printf '  %s\n' $arts
+    fail=1
+  fi
+fi
+
+# Collect staged diff once (exclude the hook itself to avoid self-matching).
+# Scan only ADDED lines (leading '+', minus the '+++' file header): a commit that
+# REMOVES a leaked value (e.g. untracking bench/results) must not be blocked by
+# the secret it is deleting — only newly INTRODUCED secrets matter.
 diff_content=$(git diff --cached --unified=0 -- . ':(exclude).githooks/' 2>/dev/null || git diff --cached --unified=0)
+added_content=$(printf '%s\n' "$diff_content" | grep '^+' | grep -v '^+++' || true)
 
 # 2) High-confidence secret/token formats (generic, very low false-positive)
-generic='-----BEGIN [A-Z ]*PRIVATE KEY-----|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|gho_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|sk-ant-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{16,}|gsk_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{35}|ccr-[A-Za-z0-9]{8,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+|[0-9]{8,10}:[A-Za-z0-9_-]{35}'
-hits=$(printf '%s\n' "$diff_content" | grep -nE -e "$generic" || true)
+generic='-----BEGIN [A-Z ]*PRIVATE KEY-----|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|gho_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|sk-ant-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{16,}|gsk_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{35}|ccr-[A-Za-z0-9]{8,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+|[0-9]{8,10}:[A-Za-z0-9_-]{35}|user_[A-Za-z0-9]{20,}'
+hits=$(printf '%s\n' "$added_content" | grep -nE -e "$generic" || true)
 if [ -n "$hits" ]; then
   echo "BLOCKED: possible secret/token format in staged changes:"
   printf '%s\n' "$hits" | sed 's/^/  /'
@@ -55,7 +73,7 @@ if [ -f "$sp" ]; then
   pat=$(mktemp 2>/dev/null || echo "$repo_root/.sanitize-patterns.tmp")
   grep -vE '^[[:space:]]*$' "$sp" > "$pat" 2>/dev/null || true
   if [ -s "$pat" ]; then
-    hits=$(printf '%s\n' "$diff_content" | grep -inEf "$pat" || true)
+    hits=$(printf '%s\n' "$added_content" | grep -inEf "$pat" || true)
     if [ -n "$hits" ]; then
       echo "BLOCKED: personal data (matched .sanitize-patterns) in staged changes:"
       printf '%s\n' "$hits" | sed 's/^/  /'

@@ -885,6 +885,7 @@ async def model_healthcheck(models: list[str] | None = None) -> dict:
         "ok": ok,
         "failed": len(rows) - ok,
         "context_roots_configured": sandbox.context_roots_configured(),
+        "context_fail_open": sandbox.fail_open(),
         "circuit_breakers": circuit_breaker.snapshot(),
         "models": rows,
     }
@@ -1079,6 +1080,16 @@ async def _dialogue_runner_guard(state, runner_coro_factory) -> None:
         # guard's terminal-phase check.
         if state.phase not in dialogue_state.TERMINAL_PHASES:
             dialogue_state.mark_phase(state, "cancelled")
+            # Persist the cancel immediately (mirrors the error path below).
+            # Without this, a mid-run session that already dumped ≥1 round leaves
+            # a stale non-terminal dump on disk; a restart would resurrect it as
+            # 'interrupted' (resumable) instead of the intended 'cancelled'.
+            try:
+                state.dump_path = str(
+                    await asyncio.to_thread(write_dump, state, base_dir=DIALOGUE_DUMP_DIR)
+                )
+            except Exception:
+                pass
         raise
     except Exception as e:
         state.error = f"{type(e).__name__}: {e}"
@@ -1337,11 +1348,13 @@ async def dialogue_result(session_id: str) -> dict:
     If the session is not yet done, returns {ready: False, phase, hint}. If the
     session is done, returns {ready: True, phase, result_markdown, dump_path}.
     Errored/cancelled sessions return ready=True with the partial markdown and
-    the error message."""
+    the error message. A recovered 'interrupted' session (server restarted
+    mid-run) is also terminal: it returns ready=True with the partial transcript
+    rebuilt from history and the 'restarted mid-run' error."""
     state = await dialogue_state.get_session(session_id)
     if state is None:
         return {"error": f"unknown session_id: {session_id}"}
-    if state.phase not in {"done", "error", "cancelled"}:
+    if state.phase not in dialogue_state.TERMINAL_PHASES:
         return {
             "ready": False,
             "phase": state.phase,
@@ -1432,28 +1445,48 @@ async def dialogue_continue(
     # before any mutation so a failure can't leave a half-mutated session.
     await dialogue_state.reserve_active_slot()
 
-    # All pre-flight passed — now mutate.
-    # Strip terminal artifacts before resuming: a phase=='summary' entry has no
-    # branch in format_history_section, so it would render as a plain participant
-    # reply in the next round's history and leak the verdict to every model,
-    # biasing the continuation toward the stated conclusion (breaks
-    # anti-convergence). The renderer recreates the summary from summary_entries.
-    state.history = [h for h in state.history if h["phase"] != "summary"]
-    mod_id = (state.moderator or {}).get("id", "moderator")
-    state.history.append({
-        "round": state.current_round,
-        "phase": "directive",
-        "id": mod_id,
-        "text": DIRECTIVE_INJECTION_TEMPLATE.format(directive=directive),
-        "latency_ms": 0,
-        "status": "ok",
-    })
-    state.total_rounds = new_total
-    state.error = None
-    # Reset so dialogue_status' elapsed_ms tracks the continuation, not a value
-    # frozen at the first run's duration.
-    state.finished_at = None
-    dialogue_state.mark_phase(state, "starting")
+    # All pre-flight passed — now mutate, under the per-session lock so two
+    # concurrent dialogue_continue calls can't both claim the same session and
+    # spawn two runners. The early phase check above is a cheap pre-filter; this
+    # re-check under the lock is the authoritative gate — the loser wakes to find
+    # phase=='starting' and refuses. Lock is released before create_task, but by
+    # then phase=='starting' already blocks any other continue.
+    async with state._continue_lock:
+        if state.phase not in ("done", "interrupted"):
+            raise RuntimeError(
+                f"dialogue_continue: session already resuming or active "
+                f"(phase '{state.phase}')"
+            )
+        # Strip terminal artifacts before resuming: a phase=='summary' entry has
+        # no branch in format_history_section, so it would render as a plain
+        # participant reply in the next round's history and leak the verdict to
+        # every model, biasing the continuation toward the stated conclusion
+        # (breaks anti-convergence). The renderer recreates the summary from
+        # summary_entries.
+        state.history = [h for h in state.history if h["phase"] != "summary"]
+        mod_id = (state.moderator or {}).get("id", "moderator")
+        state.history.append({
+            "round": state.current_round,
+            "phase": "directive",
+            "id": mod_id,
+            "text": DIRECTIVE_INJECTION_TEMPLATE.format(directive=directive),
+            "latency_ms": 0,
+            "status": "ok",
+        })
+        state.total_rounds = new_total
+        state.error = None
+        # Reset so dialogue_status' elapsed_ms tracks the continuation, not a value
+        # frozen at the first run's duration.
+        state.finished_at = None
+        dialogue_state.mark_phase(state, "starting")
+        # Persist the continuation now (directive + bumped total_rounds + the
+        # 'starting' phase) so a crash before the first continued round dumps
+        # doesn't revert to the pre-continuation dump and silently drop the
+        # directive. Records the correct self-referential dump_path (F#17).
+        try:
+            await asyncio.to_thread(write_dump, state, base_dir=DIALOGUE_DUMP_DIR)
+        except Exception:
+            pass
 
     if state.mode == "debate":
         async def runner(s):
@@ -1496,14 +1529,25 @@ async def dialogue_continue(
 
 
 def _warn_if_context_roots_unset() -> None:
-    """Emit a startup guardrail warning to stderr when COUNCIL_CONTEXT_ROOTS is
-    unset. Stdout is the MCP transport — diagnostics must go to stderr."""
-    if not sandbox.context_roots_configured():
+    """Emit a startup guardrail note to stderr describing the effective context
+    posture. Stdout is the MCP transport — diagnostics must go to stderr."""
+    if sandbox.context_roots_configured():
+        return
+    if sandbox.fail_open():
         print(
-            "[mcp-council] WARNING: COUNCIL_CONTEXT_ROOTS is not set — context_paths "
-            "run deny-list-only. A prompt-injected path can exfiltrate any "
-            "non-blacklisted file to a third-party LLM. Set it to your "
-            "repo/workspace dir(s) to require every context file to resolve inside.",
+            "[mcp-council] WARNING: COUNCIL_CONTEXT_ROOTS is not set and "
+            "COUNCIL_CONTEXT_FAIL_OPEN=1 — context_paths run deny-list-only. A "
+            "prompt-injected path can exfiltrate any non-blacklisted file to a "
+            "third-party LLM. Set COUNCIL_CONTEXT_ROOTS to your repo/workspace "
+            "dir(s) to require every context file to resolve inside.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "[mcp-council] NOTE: COUNCIL_CONTEXT_ROOTS is not set — context_paths "
+            "are DISABLED (fail-closed). Set COUNCIL_CONTEXT_ROOTS to your "
+            "repo/workspace dir(s) to enable file context, or "
+            "COUNCIL_CONTEXT_FAIL_OPEN=1 for the old deny-list-only mode.",
             file=sys.stderr,
         )
 

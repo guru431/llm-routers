@@ -310,6 +310,8 @@ def test_model_ask_happy_path(monkeypatch):
 def test_model_ask_with_context_and_examples(monkeypatch, tmp_path):
     """context_paths and example_paths form CONTEXT FILES / STYLE EXAMPLES sections."""
     monkeypatch.setenv("DEEPSEEK_KEY", "fake")
+    # Files live under tmp_path; allow that root (sandbox is fail-closed).
+    monkeypatch.setenv("COUNCIL_CONTEXT_ROOTS", str(tmp_path))
     ctx_file = tmp_path / "ctx.txt"
     ctx_file.write_text("CTX-DATA")
     ex_file = tmp_path / "ex.txt"

@@ -584,7 +584,7 @@ class Handler(BaseHTTPRequestHandler):
                 } for m in EXPOSED_MODELS],
             })
         else:
-            self._send(404, {"error": "Not found"})
+            self._send(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
 
     def do_POST(self):
         if self.path == "/v1/chat/completions":
@@ -595,7 +595,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._handle_chat(body)
         else:
-            self._send(404, {"error": "Not found"})
+            self._send(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
 
     def _handle_chat(self, body: dict):
         """OpenAI-compatible chat completions with sandbox/workdir routing."""
@@ -672,6 +672,24 @@ class Handler(BaseHTTPRequestHandler):
                     header += f" id={tool_call_id}"
                 header += f"]: {content}"
                 conversation.append(("tool", header))
+            elif role == "assistant" and msg.get("tool_calls"):
+                # A pure tool-call assistant turn has empty content but carries
+                # tool_calls. Render them (with their id) into the text so the
+                # id referenced by the following tool result actually appears in
+                # the prompt — otherwise multi-turn tool loops become incoherent
+                # (result id points at a call absent from the conversation).
+                # Kept in sync with claude-agent-server's identical branch.
+                call_lines = []
+                for tc in msg["tool_calls"]:
+                    fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                    call_lines.append(
+                        f"[Called tool {fn.get('name', '')} id={tc.get('id', '')} "
+                        f"with {fn.get('arguments', '')}]"
+                    )
+                merged = "\n".join(call_lines)
+                if content:
+                    merged = content + "\n" + merged
+                conversation.append((role, merged))
             else:
                 conversation.append((role, content))
 
@@ -733,6 +751,12 @@ class Handler(BaseHTTPRequestHandler):
                 "completion_tokens": len(result) // 4,
                 "total_tokens": (len(prompt) + len(result)) // 4,
                 "estimate": True,
+                # Effective sandbox actually used. May differ from the requested
+                # `-agent` model: `tools` in the request force read-only, so a
+                # `gpt-5.5-agent` + tools call runs read-only despite resp_model
+                # echoing the agent id. Surfaced here (carried into the stream
+                # finish chunk too) so routers/logs see the real execution mode.
+                "sandbox": sandbox,
             }
 
             if stream:
@@ -766,10 +790,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", 0))
         except (TypeError, ValueError):
-            self._send(400, {"error": "Invalid Content-Length"})
+            self._send(400, {"error": {"message": "invalid Content-Length", "type": "invalid_request_error"}})
             return None
         if length < 0:
-            self._send(400, {"error": "Invalid Content-Length"})
+            self._send(400, {"error": {"message": "invalid Content-Length", "type": "invalid_request_error"}})
             return None
         if length > MAX_BODY_SIZE:
             self._send(413, {"error": {
@@ -784,7 +808,7 @@ class Handler(BaseHTTPRequestHandler):
             # to the dead socket. Best-effort — don't let it raise out of the
             # handler as worker-thread noise.
             try:
-                self._send(400, {"error": "Invalid JSON"})
+                self._send(400, {"error": {"message": "invalid JSON body", "type": "invalid_request_error"}})
             except OSError:
                 pass
             return None
@@ -804,13 +828,15 @@ class Handler(BaseHTTPRequestHandler):
         except (ConnectionError, BrokenPipeError):
             return
 
-    def _send_stream(self, completion_id, created, model, resp_message,
-                     finish_reason, usage):
-        """OpenAI SSE wrap for stream=true. codex exec yields only the final
-        message, so this is pseudo-stream — but emit it as the STANDARD
-        multi-chunk sequence (role → content → optional tool_calls → finish+usage
-        → [DONE]) rather than one chunk carrying content AND finish_reason at
-        once, which strict SSE parsers may drop. Mirrors claude-agent-server."""
+    def _send_stream(self, resp_id: str, created: int, model: str,
+                     resp_message: dict, finish_reason: str, usage: dict):
+        """Emit the (already-complete) response as OpenAI SSE chunks.
+
+        The CLI returns the whole answer at once, so this is pseudo-stream:
+        a role chunk, one content chunk (if any text), an indexed tool_calls
+        chunk per call, the finish chunk (carrying usage), then `[DONE]`. Kept
+        byte-identical with claude-agent-server (docstrings excepted).
+        """
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -819,7 +845,7 @@ class Handler(BaseHTTPRequestHandler):
 
         def emit(delta: dict, finish=None, usage=None):
             chunk = {
-                "id": completion_id,
+                "id": resp_id,
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": model,
@@ -830,16 +856,36 @@ class Handler(BaseHTTPRequestHandler):
             line = "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
             self.wfile.write(line.encode("utf-8"))
 
-        # Once 200 + headers are sent the response has begun; a mid-stream client
-        # disconnect makes wfile.write raise — swallow and return.
+        # Once the 200 + headers are sent, the response has begun. A mid-stream
+        # client disconnect makes wfile.write raise ConnectionError/BrokenPipe;
+        # swallow it here and return rather than let it bubble to _handle_chat's
+        # `except Exception`, which would log a false error and try to write a
+        # second 500 status to the already-dead socket.
         try:
+            # 1) role
             emit({"role": "assistant"})
+            # 2) content (if any text was produced)
             content = resp_message.get("content")
-            if content is not None:
+            if content:
                 emit({"content": content})
+            # 3) tool_calls — one indexed delta per call, OpenAI-stream shaped so
+            # strict SDKs that accumulate by `index` reassemble them (a single
+            # non-indexed blob got dropped). We hold the whole call, so each
+            # delta carries the full arguments — no need to fragment.
             tool_calls = resp_message.get("tool_calls")
             if tool_calls:
-                emit({"tool_calls": tool_calls})
+                for i, tc in enumerate(tool_calls):
+                    fn = tc.get("function", {})
+                    emit({"tool_calls": [{
+                        "index": i,
+                        "id": tc.get("id"),
+                        "type": tc.get("type", "function"),
+                        "function": {
+                            "name": fn.get("name", ""),
+                            "arguments": fn.get("arguments", ""),
+                        },
+                    }]})
+            # 4) finish (carries usage) + 5) [DONE]
             emit({}, finish=finish_reason, usage=usage)
             self.wfile.write(b"data: [DONE]\n\n")
         except (ConnectionError, BrokenPipeError):

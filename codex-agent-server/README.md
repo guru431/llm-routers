@@ -180,6 +180,23 @@ print(resp.choices[0].message.content)
 
 В read-only режиме tool calling эмулируется через prompt-injection (как в `claude-agent-server`): описания функций инжектируются в system-промпт, модель возвращает `<tool_call>{...}</tool_call>`, парсер конвертирует в `tool_calls`. Точность ниже native tool use. В агентном режиме Codex использует **свои** нативные инструменты — клиентские `tools` туда не передаются.
 
+## Совместимость OpenAI API
+
+Drop-in для клиентов OpenAI, но `codex exec` не отдаёт часть knob'ов:
+
+| Поле | Поведение |
+|---|---|
+| `messages` | учитывается (роли system/user/assistant/tool; `assistant.tool_calls` разворачиваются в промпт) |
+| `model` | учитывается (whitelist + суффикс `-agent`; неизвестная → `400`) |
+| `sandbox`, `workdir`/`cwd` | учитываются (см. [Режимы](#режимы-и-переключение)) |
+| `stream` | учитывается — псевдо-стрим; `tool_calls` идут индексированными delta по OpenAI-спеке |
+| `tools` | эмулируется через prompt-injection; **форсит read-only** |
+| `timeout`, `reasoning` | учитываются |
+| `tool_choice` | **игнорируется** — CLI не форсит/запрещает конкретный вызов; модель решает сама |
+| `temperature`, `top_p`, `max_tokens`, `n`, `stop`, `response_format` | **игнорируются** — у `codex exec` нет соответствующих ключей |
+
+`usage` — приблизительная оценка токенов (`len // 4`, помечена `estimate`), плюс поле **`usage.sandbox`** — фактический режим исполнения. Он может отличаться от запрошенной модели: `gpt-5.5-agent` + `tools` реально исполняется как `read-only` (tools форсят read-only), хотя `model` в ответе эхо-отдаёт `gpt-5.5-agent`. Роутеры/логи должны смотреть на `usage.sandbox`, а не на имя модели.
+
 ## Безопасность
 
 - Bind по умолчанию `127.0.0.1`. Для LAN (`--host 0.0.0.0`) — bearer-токен обязателен (и так требуется).

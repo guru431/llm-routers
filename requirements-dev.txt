@@ -1,0 +1,8 @@
+# Dev/test dependencies for all subprojects (union). Install once, then:
+#   python run_tests.py --doctor   # verify they're importable
+#   python run_tests.py            # run the suites
+# The subprojects stay independent packages (no root pyproject/build step).
+pytest>=8.0
+pytest-asyncio>=0.23
+httpx>=0.27
+mcp[cli]>=1.0

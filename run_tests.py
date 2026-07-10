@@ -12,11 +12,13 @@ Profiles:
     --quick        (default) pytest suites only, no live servers
     --full         quick + compileall (byte-compile every package)
     --integration  live codex-agent-server/integration_suite.py (needs token+server)
+    --doctor       preflight: are the dev deps importable in THIS interpreter?
 
 Usage:
     python run_tests.py                  # quick
     python run_tests.py --full
     python run_tests.py --integration
+    python run_tests.py --doctor         # distinguish "deps missing" from "tests failing"
     python run_tests.py --quick -k foo   # extra args after the profile go to pytest
 """
 import subprocess
@@ -28,7 +30,7 @@ ROOT = Path(__file__).parent
 # Subprojects that ship pytest suites. Each runs in its own process with cwd set
 # to its own directory, so its conftest.py / pyproject.toml resolve exactly as in
 # a standalone `pytest` run.
-SUITES = ["mcp-council", "claude-agent-server"]
+SUITES = ["mcp-council", "claude-agent-server", "codex-agent-server"]
 
 # Packages to byte-compile in --full (catches syntax errors the test suites
 # don't import). The agent-server integration suite is excluded — it's live-only.
@@ -75,13 +77,39 @@ def run_integration(extra: list[str]) -> list[str]:
     return []
 
 
+def run_doctor() -> int:
+    """Stdlib-only preflight: is each dev dependency importable in THIS
+    interpreter? Uses importlib.util.find_spec so a MISSING module isn't itself
+    imported (works before deps are installed). Returns 1 if anything is missing.
+    Serves the global-CLAUDE.md note that 'No module named pytest' is an
+    environment problem, not a red suite."""
+    import importlib.util
+
+    required = ["pytest", "pytest_asyncio", "httpx", "mcp"]
+    print(f"python: {sys.version.split()[0]}  ({sys.executable})")
+    missing: list[str] = []
+    for mod in required:
+        ok = importlib.util.find_spec(mod) is not None
+        print(f"  {'OK     ' if ok else 'MISSING'} {mod}")
+        if not ok:
+            missing.append(mod)
+    if missing:
+        print(f"\nMISSING: {', '.join(missing)} — pip install -r requirements-dev.txt")
+        return 1
+    print("\nall dev deps present")
+    return 0
+
+
 def main() -> int:
     argv = sys.argv[1:]
     profile = "quick"
-    if argv and argv[0] in ("--quick", "--full", "--integration"):
+    if argv and argv[0] in ("--quick", "--full", "--integration", "--doctor"):
         profile = argv[0][2:]
         argv = argv[1:]
     extra = argv  # forwarded to pytest (quick/full) or the integration suite
+
+    if profile == "doctor":
+        return run_doctor()
 
     failed: list[str] = []
     if profile == "integration":

@@ -118,6 +118,7 @@ curl http://localhost:8765/health
 | `CLAUDE_AGENT_CACHE_BYTES` | `67108864` (64 MB) | Макс. суммарный размер значений кэша; больше → LRU eviction |
 | `CLAUDE_AGENT_MAX_BODY` | `10485760` (10 MB) | Макс. размер тела запроса; больше → `413` |
 | `CLAUDE_AGENT_MAX_CONCURRENCY` | `4` | Макс. параллельных claude-вызовов; сверх → `429` |
+| `CLAUDE_AGENT_MAX_SYSTEM_PROMPT` | `7000` | Макс. длина system-prompt (символов). Он идёт в `--system-prompt=` argv; на Windows больше ~8191 символов cmdline упирается в лимит cmd.exe. Больше → `400`. Поднять, если подтверждён больший реальный лимит. |
 
 ## Использование
 
@@ -181,6 +182,22 @@ client.chat.completions.create(
     }],
 )
 ```
+
+## Совместимость OpenAI API
+
+Сервер — drop-in для клиентов OpenAI, но `claude -p` CLI не отдаёт часть knob'ов. Что учитывается и что игнорируется:
+
+| Поле | Поведение |
+|---|---|
+| `messages` | учитывается (роли system/user/assistant/tool) |
+| `model` | учитывается (whitelist; неизвестная → `400`) |
+| `stream` | учитывается — псевдо-стрим (CLI отдаёт ответ целиком, режется на SSE-чанки); `tool_calls` идут индексированными delta по OpenAI-спеке |
+| `tools` | эмулируется через prompt-injection (не native tool use) |
+| `timeout` | учитывается, зажимается в `[10, 600]` секунд |
+| `tool_choice` | **игнорируется** — CLI не умеет форсить/запрещать конкретный вызов; модель решает сама |
+| `temperature`, `top_p`, `max_tokens`, `n`, `stop`, `response_format` | **игнорируются** — у `claude -p` нет соответствующих ключей (для JSON-режима используйте system-prompt) |
+
+`usage` — приблизительная оценка токенов (`len // 4`, помечена `estimate`), не реальные счётчики.
 
 ## Безопасность
 
