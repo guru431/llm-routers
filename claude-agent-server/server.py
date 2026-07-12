@@ -325,11 +325,14 @@ def run_claude(prompt: str, system_prompt: str | None = None,
         raise
 
     if proc.returncode != 0:
-        raise RuntimeError(
-            (stderr or "").strip()
-            or (stdout or "").strip()[:800]
-            or f"claude exit code {proc.returncode}"
-        )
+        # Log the raw claude stderr/stdout server-side only — it can carry the
+        # home dir / username, Max-quota internals and local paths. The exception
+        # message stays generic so _handle_chat never leaks it to the client even
+        # if the surrounding error handling changes. Mirrors codex-agent-server's
+        # run_codex (generic "codex command failed").
+        detail = (stderr or "").strip() or (stdout or "").strip()[:800]
+        logger.error("claude exit code %s; detail: %s", proc.returncode, detail or "(empty)")
+        raise RuntimeError("claude command failed")
     # Parse JSON output to extract result
     try:
         data = json.loads((stdout or "").strip())

@@ -1599,10 +1599,19 @@ async def dialogue_continue(
                 devils_advocate_rotation=s.devils_advocate_rotation, resume=True,
             )
     elif state.mode == "socratic":
+        # Resolve questioner/respondent by their declared role rather than a
+        # positional part_cfgs[0]/[1] assumption. participants order is set at
+        # creation ([questioner, respondent]) and preserved across persist, but a
+        # role lookup makes a future reorder unable to silently swap the two roles.
+        roles = [p.get("role") for p in state.participants]
+        q_idx = roles.index("questioner") if "questioner" in roles else 0
+        r_idx = roles.index("respondent") if "respondent" in roles else 1
+        q_cfg_s, r_cfg_s = part_cfgs[q_idx], part_cfgs[r_idx]
+
         async def runner(s):
             await run_socratic(
-                state=s, topic=s.question, questioner_cfg=part_cfgs[0],
-                respondent_cfg=part_cfgs[1], moderator_cfg=mod_cfg,
+                state=s, topic=s.question, questioner_cfg=q_cfg_s,
+                respondent_cfg=r_cfg_s, moderator_cfg=mod_cfg,
                 rounds=s.total_rounds, max_tokens=max_tokens, web_search=web_search,
                 files_section=files_section, resume=True,
             )

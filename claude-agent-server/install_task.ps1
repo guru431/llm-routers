@@ -9,12 +9,13 @@
 # Usage:
 #   .\install_task.ps1                                  # interactive (asks for password)
 #   .\install_task.ps1 -ServerPath '<full UNC path>'    # override server.py location
-#   .\install_task.ps1 -BindHost 127.0.0.1              # loopback-only (default 0.0.0.0 for LAN)
+#   .\install_task.ps1 -BindHost 0.0.0.0                # expose on LAN (default 127.0.0.1 loopback-only)
 #   .\install_task.ps1 -Uninstall                       # remove the task
 #
-# SECURITY: default bind is 0.0.0.0 (LAN-exposed). The server REQUIRES
-# CLAUDE_AGENT_TOKEN in its environment and refuses to start without it.
-# Set it before installing the task, e.g. Machine-scope:
+# SECURITY: default bind is 127.0.0.1 (loopback-only), matching server.py and
+# codex-agent-server. Pass -BindHost 0.0.0.0 to expose on the LAN — only do so
+# deliberately. The server REQUIRES CLAUDE_AGENT_TOKEN in its environment and
+# refuses to start without it. Set it before installing the task, e.g. Machine-scope:
 #   [Environment]::SetEnvironmentVariable('CLAUDE_AGENT_TOKEN','<token>','Machine')
 # Machine-scope is recommended so the scheduled task picks it up at boot,
 # independent of any user logon. After setting, restart the task:
@@ -24,7 +25,7 @@
 param(
     [switch]$Uninstall,
     [string]$ServerPath,
-    [string]$BindHost = '0.0.0.0',
+    [string]$BindHost = '127.0.0.1',
     [int]$Port = 8765
 )
 

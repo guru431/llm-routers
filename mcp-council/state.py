@@ -335,12 +335,18 @@ async def cancel_job(job_id: str) -> bool:
         # cancel_job itself — so cancelling the cancel handler still propagates
         # instead of being silently absorbed by a broad `except`.
         await asyncio.wait({task}, timeout=0.05)
-    if j.phase not in TERMINAL_PHASES:
-        # No handler ran (e.g. bare coroutine in tests) or it ran but didn't
-        # call mark_phase — finalize synchronously.
-        j.phase = "cancelled"
-        j.finished_at = time.time()
-        _persist(j)
+    # Finalize under the lock. The drain above yields the event loop, so the
+    # task's own CancelledError handler (mark_phase) or a concurrent _gc_locked
+    # may have reached a terminal phase / unlinked the job meanwhile. Re-checking
+    # and writing under _jobs_lock keeps this ordered against those and against a
+    # second cancel_job, and prevents the _persist here from racing GC's unlink.
+    async with _jobs_lock:
+        if j.phase not in TERMINAL_PHASES:
+            # No handler ran (e.g. bare coroutine in tests) or it ran but didn't
+            # call mark_phase — finalize synchronously.
+            j.phase = "cancelled"
+            j.finished_at = time.time()
+            _persist(j)
     return True
 
 
