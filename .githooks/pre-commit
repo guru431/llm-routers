@@ -10,11 +10,15 @@ set -eu
 repo_root=$(git rev-parse --show-toplevel)
 fail=0
 
-# 1) Block sensitive filenames being newly added (allow *.example* templates)
-added=$(git diff --cached --name-only --diff-filter=A || true)
+# 1) Block sensitive filenames entering the tree (allow *.example* templates).
+# ACMR (not just A) so a rename/copy INTO a sensitive name is caught by its
+# destination path — --name-only prints the new path for renames.
+# The .env pattern uses (\..+)? so multi-suffix names like .env.production.local
+# are matched too (the single-suffix form missed them); .example is re-included.
+added=$(git diff --cached --name-only --diff-filter=ACMR || true)
 if [ -n "$added" ]; then
   bad=$(printf '%s\n' "$added" \
-    | grep -iE '(^|/)(\.env(\.[A-Za-z0-9]+)?$|.*\.pem$|.*\.key$|.*\.p12$|.*\.pfx$|id_rsa|id_ed25519|id_dsa|vault\.env|\.sanitize-patterns$)' \
+    | grep -iE '(^|/)(\.env(\..+)?$|.*\.pem$|.*\.key$|.*\.p12$|.*\.pfx$|id_rsa|id_ed25519|id_dsa|vault\.env|\.sanitize-patterns$)' \
     | grep -ivE '\.example(\.|$)' || true)
   if [ -n "$bad" ]; then
     echo "BLOCKED: refusing to commit sensitive file(s):"
@@ -51,11 +55,13 @@ if [ -n "$added" ]; then
   fi
 fi
 
-# Collect staged diff once (exclude the hook itself to avoid self-matching).
+# Collect staged diff once. Exclude ONLY this pre-commit file (its regex
+# constants would self-match the token formats below) — other files under
+# .githooks/ ARE scanned, so a concrete token pasted into a sibling hook is caught.
 # Scan only ADDED lines (leading '+', minus the '+++' file header): a commit that
 # REMOVES a leaked value (e.g. untracking bench/results) must not be blocked by
 # the secret it is deleting — only newly INTRODUCED secrets matter.
-diff_content=$(git diff --cached --unified=0 -- . ':(exclude).githooks/' 2>/dev/null || git diff --cached --unified=0)
+diff_content=$(git diff --cached --unified=0 -- . ':(exclude).githooks/pre-commit' 2>/dev/null || git diff --cached --unified=0)
 added_content=$(printf '%s\n' "$diff_content" | grep '^+' | grep -v '^+++' || true)
 
 # 2) High-confidence secret/token formats (generic, very low false-positive)
@@ -67,20 +73,30 @@ if [ -n "$hits" ]; then
   fail=1
 fi
 
-# 3) Personal denylist — concrete values from untracked .sanitize-patterns
+# 3) Personal denylist — concrete values from untracked .sanitize-patterns.
+# Matched as FIXED strings (-F): the file holds literal values, so regex
+# metacharacters must not be interpreted and an invalid regex must not silently
+# disable the check. A scanner error (grep rc>1) fails the commit closed instead
+# of being swallowed as a no-hit. trap guarantees the temp file is removed.
 sp="$repo_root/.sanitize-patterns"
 if [ -f "$sp" ]; then
   pat=$(mktemp 2>/dev/null || echo "$repo_root/.sanitize-patterns.tmp")
+  trap 'rm -f "$pat"' EXIT
   grep -vE '^[[:space:]]*$' "$sp" > "$pat" 2>/dev/null || true
   if [ -s "$pat" ]; then
-    hits=$(printf '%s\n' "$added_content" | grep -inEf "$pat" || true)
-    if [ -n "$hits" ]; then
+    rc=0
+    hits=$(printf '%s\n' "$added_content" | grep -inFf "$pat") || rc=$?
+    if [ "$rc" -gt 1 ]; then
+      echo "BLOCKED: .sanitize-patterns scan failed (grep rc=$rc) — refusing to commit."
+      fail=1
+    elif [ -n "$hits" ]; then
       echo "BLOCKED: personal data (matched .sanitize-patterns) in staged changes:"
       printf '%s\n' "$hits" | sed 's/^/  /'
       fail=1
     fi
   fi
   rm -f "$pat"
+  trap - EXIT
 fi
 
 if [ "$fail" -ne 0 ]; then

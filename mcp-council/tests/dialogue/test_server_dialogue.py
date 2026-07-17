@@ -297,11 +297,16 @@ import os
 
 
 @pytest.mark.skipif(
-    not os.environ.get("DEEPSEEK_KEY") or not os.environ.get("OPENCODE_GO_KEY"),
-    reason="needs DEEPSEEK_KEY + OPENCODE_GO_KEY in env",
+    os.environ.get("COUNCIL_LIVE_TESTS") not in ("1", "true", "yes")
+    or not os.environ.get("OPENCODE_GO_KEY"),
+    reason="live test — set COUNCIL_LIVE_TESTS=1 (+ OPENCODE_GO_KEY) to opt in",
 )
 async def test_live_socratic_smoke():
-    """End-to-end test against real DeepSeek + GLM. Costs ~$0.01 and ~30s."""
+    """End-to-end test against real providers. Costs ~$0.01 and ~30s.
+
+    Gated on an EXPLICIT opt-in (COUNCIL_LIVE_TESTS=1), NOT merely the presence of
+    provider keys — those are always set in a configured environment, so keying on
+    them alone made `run_tests.py --quick` silently fire a paid live call."""
     started = await _server.model_socratic(
         topic="Why does water expand when it freezes?",
         questioner="deepseek-pro",

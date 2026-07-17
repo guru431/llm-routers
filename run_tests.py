@@ -41,12 +41,26 @@ def _run(cmd: list[str], cwd: Path) -> int:
     return subprocess.run(cmd, cwd=cwd).returncode
 
 
+def _has_selector(extra: list[str]) -> bool:
+    """True only if `extra` contains an actual test SELECTOR: -k/-m (with or
+    without an attached value) or a positional node-id/path. A non-selector flag
+    like --disable-warnings must NOT count — otherwise rc 5 ("no tests collected")
+    would be silently tolerated on a run that was supposed to collect everything."""
+    for a in extra:
+        if a in ("-k", "-m") or (len(a) > 2 and a.startswith(("-k", "-m"))):
+            return True
+        if not a.startswith("-") and ("::" in a or "/" in a or a.endswith(".py")):
+            return True
+    return False
+
+
 def run_pytest(extra: list[str]) -> list[str]:
-    # rc 5 == "no tests collected". Tolerate it only when a -k/-m filter is in
-    # effect (extra args present) — then a suite legitimately matching nothing is
-    # a skip. For an UNFILTERED run, rc 5 means the suite lost all its tests
+    # rc 5 == "no tests collected". Tolerate it only when a real -k/-m/node
+    # selector is in effect — then a suite legitimately matching nothing is a
+    # skip. For an UNFILTERED run (or one carrying only non-selector flags like
+    # --disable-warnings), rc 5 means the suite lost all its tests
     # (file deleted/renamed) and MUST fail loudly instead of reporting success.
-    filtered = bool(extra)
+    filtered = _has_selector(extra)
     ok_codes = (0, 5) if filtered else (0,)
     failed: list[str] = []
     for suite in SUITES:

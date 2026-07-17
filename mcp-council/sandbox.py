@@ -205,20 +205,34 @@ def resolve_and_validate(paths: list[str]) -> list[Path]:
 _BINARY_SNIFF_BYTES = 8192
 
 
-def _looks_binary(p: Path) -> bool:
-    """Heuristic: file is binary if its first 8KB contain a NUL byte. Same
-    rule git uses (`git diff` falls back to "binary patch" on a NUL hit).
-    Cheap, avoids feeding garbage to the LLM.
-
-    Exception: UTF-16 text (PowerShell 5.1's default Out-File encoding) is
-    full of NUL bytes but legitimate text. A leading UTF-16 BOM (FF FE LE /
-    FE FF BE) marks the file as text — `read_text(errors="replace")` decodes
-    it fine, so don't reject it as binary."""
-    with p.open("rb") as fh:
-        chunk = fh.read(_BINARY_SNIFF_BYTES)
+def _looks_binary_bytes(chunk: bytes) -> bool:
+    """Heuristic on an in-memory buffer: binary if the first 8KB contain a NUL
+    byte (same rule git uses). Exception: UTF-16 text (PowerShell 5.1's default
+    Out-File encoding) is full of NULs but legitimate — a leading UTF-16 BOM
+    (FF FE LE / FE FF BE) marks it as text."""
     if chunk[:2] in (b"\xff\xfe", b"\xfe\xff"):
         return False
-    return b"\x00" in chunk
+    return b"\x00" in chunk[:_BINARY_SNIFF_BYTES]
+
+
+def _looks_binary(p: Path) -> bool:
+    """Path wrapper around _looks_binary_bytes (kept for callers/tests)."""
+    with p.open("rb") as fh:
+        return _looks_binary_bytes(fh.read(_BINARY_SNIFF_BYTES))
+
+
+def _decode_text(raw: bytes) -> str:
+    """BOM-aware decode. The deny-list/sniff path already promised to read UTF-16
+    correctly, but the old `read_text(encoding="utf-8")` mangled it into
+    replacement chars / interleaved NULs. Honour the BOM: UTF-8-SIG, UTF-16 LE/BE,
+    else plain UTF-8 (errors='replace' for the odd stray byte)."""
+    if raw[:3] == b"\xef\xbb\xbf":
+        return raw[3:].decode("utf-8", errors="replace")
+    if raw[:2] == b"\xff\xfe":
+        return raw[2:].decode("utf-16-le", errors="replace")
+    if raw[:2] == b"\xfe\xff":
+        return raw[2:].decode("utf-16-be", errors="replace")
+    return raw.decode("utf-8", errors="replace")
 
 
 def read_files_with_limit(paths: list[Path]) -> list[tuple[Path, str]]:
@@ -226,20 +240,30 @@ def read_files_with_limit(paths: list[Path]) -> list[tuple[Path, str]]:
 
     Порядок результата соответствует порядку входных paths.
 
+    Каждый файл открывается РОВНО ОДИН раз: размер считается по фактически
+    прочитанным байтам (read budget+1), а не отдельным stat() — это закрывает
+    TOCTOU-окно между проверкой размера и чтением. Декодирование BOM-aware.
+
     Raises SandboxError если суммарный размер превышает MAX_TOTAL_BYTES
     или один из файлов выглядит бинарным (NUL byte в первых 8KB).
     """
     total = 0
     out: list[tuple[Path, str]] = []
     for p in paths:
-        total += p.stat().st_size
+        remaining = MAX_TOTAL_BYTES - total
+        # Read one byte past the remaining budget so overflow is detected from the
+        # bytes actually read — no separate stat() → no size/read TOCTOU window.
+        try:
+            with p.open("rb") as fh:
+                raw = fh.read(remaining + 1)
+        except OSError as e:
+            raise SandboxError(f"cannot read file: {p} ({e})")
+        total += len(raw)
         if total > MAX_TOTAL_BYTES:
             raise SandboxError(
-                f"size limit exceeded: {total // 1024} KB > "
-                f"{MAX_TOTAL_BYTES // 1024} KB"
+                f"size limit exceeded: > {MAX_TOTAL_BYTES // 1024} KB"
             )
-        if _looks_binary(p):
+        if _looks_binary_bytes(raw):
             raise SandboxError(f"binary file rejected: {p}")
-        text = p.read_text(encoding="utf-8", errors="replace")
-        out.append((p, text))
+        out.append((p, _decode_text(raw)))
     return out

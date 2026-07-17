@@ -84,11 +84,19 @@ def test_resolve_preset_unknown_raises():
 
 
 def test_resolve_preset_returns_copy():
+    # "cheap" is a legacy alias for the neutral name — resolve_preset accepts both.
     got = resolve_preset("cheap")
     got.append("MUTATED")
     # Mutating the returned list must not leak into PRESETS or future resolves.
     assert "MUTATED" not in resolve_preset("cheap")
-    assert "MUTATED" not in PRESETS["cheap"]
+    assert "MUTATED" not in PRESETS["fast-2-single-provider"]
+
+
+def test_resolve_preset_legacy_aliases():
+    # Old quality-implying names still resolve to the neutral presets.
+    assert resolve_preset("best") == PRESETS["full"]
+    assert resolve_preset("balanced") == PRESETS["diverse-3"]
+    assert resolve_preset("cheap") == PRESETS["fast-2-single-provider"]
 
 
 def test_provider_domain_groups_ocg_and_isolates_independent_backends():

@@ -85,3 +85,25 @@ def test_unicode_payload_preserved(tmp_path: Path):
     text = (tmp_path / "events" / "job-utf.jsonl").read_text(encoding="utf-8")
     assert "проверка" in text
     assert "→" in text
+
+
+def test_terminal_events_survive_truncation_cap(tmp_path: Path, monkeypatch):
+    # F16: past the byte cap, verbose events are dropped but TERMINAL events
+    # (result_ready / terminal phase) must still be written so a --until-done
+    # consumer never blocks forever.
+    monkeypatch.setattr(event_log, "MAX_EVENT_LOG_BYTES", 200)
+    w = event_log.open_writer("job-trunc", tmp_path)
+    for i in range(50):
+        w.write("tool_call", {"member_id": "m", "query": "x" * 80, "n": i})
+    w.write("phase", {"phase": "done"})
+    w.write("result_ready", {"status": "ok"})
+    event_log.close_writer("job-trunc")
+
+    recs = [
+        json.loads(line)
+        for line in (tmp_path / "events" / "job-trunc.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    events = [r["event"] for r in recs]
+    assert "log_truncated" in events               # cap was hit
+    assert "result_ready" in events                # terminal survived the cap
+    assert any(r["event"] == "phase" and r["payload"].get("phase") == "done" for r in recs)

@@ -7,9 +7,16 @@ Usage:
     python test_server.py                          # run all tests
     python test_server.py --url http://host:8765   # custom server URL
     python test_server.py --cat TextGen            # single category
+    python test_server.py --token <bearer>         # or env CLAUDE_AGENT_TOKEN
+
+Auth: the server refuses to start without CLAUDE_AGENT_TOKEN and requires the
+same bearer on /v1/*. Pass --token or set CLAUDE_AGENT_TOKEN, else this suite
+fails fast (every request would 401, making the ≈7/12 tool-calling claim
+non-reproducible).
 """
 
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -287,13 +294,15 @@ Uptime: 45 days"""}
 # API CALLER
 # ============================================================
 
-def call_server(url, messages, tools=None, timeout=120):
+def call_server(url, messages, tools=None, token=None, timeout=120):
     """Call Claude Agent Server, return (msg, elapsed)."""
     payload = {"messages": messages}
     if tools:
         payload["tools"] = tools
     data = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, data=data, headers=headers)
     t0 = time.time()
     try:
@@ -340,6 +349,11 @@ def fmt_result(msg, max_len=70):
 
 def run_tests(args):
     url = args.url
+    token = args.token or os.getenv("CLAUDE_AGENT_TOKEN")
+    if not token:
+        print("ERROR: no bearer token. Pass --token or set CLAUDE_AGENT_TOKEN — "
+              "the server requires it and every request would 401 without it.")
+        sys.exit(2)
 
     # Health check
     health_url = url.rsplit("/v1/", 1)[0] + "/health"
@@ -371,7 +385,7 @@ def run_tests(args):
             print(f"  {current_cat}")
             print(f"{'─'*90}")
 
-        msg, elapsed = call_server(url, test["messages"], test.get("tools"), timeout=180)
+        msg, elapsed = call_server(url, test["messages"], test.get("tools"), token=token, timeout=180)
 
         ok = False
         try:
@@ -402,5 +416,6 @@ def run_tests(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Test Claude Agent Server")
     parser.add_argument("--url", default=SERVER_URL)
+    parser.add_argument("--token", help="Bearer token (or env CLAUDE_AGENT_TOKEN)")
     parser.add_argument("--cat", help="Filter by category: ToolCall, TextGen, System, MultiTurn")
     run_tests(parser.parse_args())

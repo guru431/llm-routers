@@ -170,7 +170,8 @@ async def run_round(
     cfgs = [_participant_to_cfg(p) for p in participants]
 
     # --- PHASE A: critique ---
-    if do_critique and _has_prior_responses(state, round_n):
+    did_critique = do_critique and _has_prior_responses(state, round_n)
+    if did_critique:
         mark_phase(state, f"round_{round_n}_critique")
 
         def critique_prompt_for(cfg: dict) -> str:
@@ -203,6 +204,9 @@ async def run_round(
             round_n=round_n,
             files_section=files_section,
             anti_agreement_rule=rules.get(cfg["id"]),
+            # Opening round = no critique preceded this response, so don't ask the
+            # model to answer critique it never received.
+            opening=not did_critique,
         )
 
     response_results = await _run_phase(
@@ -218,8 +222,27 @@ async def run_round(
 
 
 import json  # noqa: E402
+import threading  # noqa: E402
+import uuid  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Awaitable  # noqa: E402
+
+# Per-session write lock. write_dump runs in worker threads (asyncio.to_thread),
+# and a cancel handler can fire a SECOND write of the same session while the
+# first is still in flight — two threads racing the same file previously caused
+# interleaved partial writes / FileNotFoundError on the shared temp. Serialize
+# per session so each write completes atomically. Guarded by a meta-lock.
+_write_locks: "dict[str, threading.Lock]" = {}
+_write_locks_meta = threading.Lock()
+
+
+def _write_lock_for(session_id: str) -> threading.Lock:
+    with _write_locks_meta:
+        lk = _write_locks.get(session_id)
+        if lk is None:
+            lk = threading.Lock()
+            _write_locks[session_id] = lk
+        return lk
 
 # A round is aborted if at least this many participants failed in any phase
 # (ceil(participants * FAILURE_THRESHOLD_RATIO), with a floor of 2).
@@ -337,8 +360,16 @@ async def run_dialogue(
 def write_dump(state: DialogueState, *, base_dir: Path) -> Path:
     """Persist the full state snapshot to <base_dir>/<session_id>.json.
 
-    base_dir is created if missing. Atomic-ish (write + rename).
+    base_dir is created if missing. Atomic-ish (write + rename). Serialized per
+    session via a threading lock, and each write uses a UNIQUE temp name so two
+    concurrent writers (e.g. an in-flight mid-run dump + a cancel handler's dump)
+    can't corrupt a shared .json.tmp.
     """
+    with _write_lock_for(state.session_id):
+        return _write_dump_locked(state, base_dir=base_dir)
+
+
+def _write_dump_locked(state: DialogueState, *, base_dir: Path) -> Path:
     base_dir.mkdir(parents=True, exist_ok=True)
     dump_path = base_dir / f"{state.session_id}.json"
     # Record the snapshot's OWN path into the snapshot before serializing it, so
@@ -365,7 +396,11 @@ def write_dump(state: DialogueState, *, base_dir: Path) -> Path:
         "created_at": state.created_at,
         "started_at": state.started_at,
         "finished_at": state.finished_at,
+        # Persist last_activity so startup recovery can judge staleness by real
+        # activity (matching the runtime GC), not by created_at.
+        "last_activity": state.last_activity,
         "error": state.error,
+        "warnings": state.warnings,
         "result_markdown": state.result_markdown,
         "dump_path": state.dump_path,
         "web_search": state.web_search,
@@ -375,7 +410,9 @@ def write_dump(state: DialogueState, *, base_dir: Path) -> Path:
         "diversity_threshold": state.diversity_threshold,
         "devils_advocate_rotation": state.devils_advocate_rotation,
     }
-    tmp = dump_path.with_suffix(".json.tmp")
+    # Unique temp name per write (not the shared "<id>.json.tmp") so a second
+    # concurrent writer of the same session can't clobber this one's temp file.
+    tmp = dump_path.with_suffix(f".{uuid.uuid4().hex}.tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     # On Windows os.replace fails with PermissionError if dump_path is held
     # open by another process (antivirus scan, `tail -F`, IDE preview). Retry
@@ -390,11 +427,16 @@ def write_dump(state: DialogueState, *, base_dir: Path) -> Path:
             time.sleep(0.05)
     # Last resort: overwrite directly. Loses atomicity but a stale dump_path
     # is worse than a successful (non-atomic) write of the latest snapshot.
-    # Keep `tmp` on disk: it already holds the fully-written snapshot, so if
-    # this in-place write crashes mid-way and corrupts dump_path, an intact
-    # copy survives for recovery instead of being lost.
     try:
         dump_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        return dump_path
     except OSError as e:
+        # Keep our unique tmp on disk — it holds the fully-written snapshot, so a
+        # crash mid-way here still leaves an intact copy for recovery.
         raise last_err or e
+    # Direct write succeeded — our unique temp is now redundant; drop it so
+    # unique-named temps don't accumulate.
+    try:
+        tmp.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return dump_path

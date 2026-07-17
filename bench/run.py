@@ -124,12 +124,15 @@ def call_openai(endpoint: str, model: str, system: str, user: str, api_key: str 
                         "tok_out": None, "http_status": http_status,
                         "streaming": False, "error": f"non-stream parse: {e}",
                     }
+            saw_done = False
+            finish_reason: str | None = None
             for line in r.iter_lines():
                 if not line:
                     continue
                 if line.startswith("data: "):
                     payload = line[6:].strip()
                     if payload == "[DONE]":
+                        saw_done = True
                         break
                     try:
                         chunk = json.loads(payload)
@@ -141,6 +144,8 @@ def call_openai(endpoint: str, model: str, system: str, user: str, api_key: str 
                     choices = chunk.get("choices") or []
                     if not choices:
                         continue
+                    if choices[0].get("finish_reason"):
+                        finish_reason = choices[0]["finish_reason"]
                     delta = choices[0].get("delta") or {}
                     rcontent = delta.get("reasoning_content")
                     if rcontent:
@@ -157,11 +162,18 @@ def call_openai(endpoint: str, model: str, system: str, user: str, api_key: str 
         reasoning = "".join(reasoning_buf)
         if tok_out is None and text:
             tok_out = max(1, len(text) // 4)
+        # A stream that produced no content AND never reached a terminal marker
+        # ([DONE] or a finish_reason) was truncated/dropped/malformed — do NOT
+        # record it as a clean "success-empty". (Reasoning-only models still emit
+        # [DONE]/finish_reason, so a legit empty content is not flagged.)
+        err = None
+        if not text and not saw_done and finish_reason is None:
+            err = "stream ended without [DONE]/finish_reason (no content)"
         return {
             "ttft_s": ttft, "ttft_reasoning_s": ttft_reasoning,
             "total_s": total, "text": text, "reasoning_text": reasoning,
             "tok_out": tok_out, "http_status": http_status,
-            "streaming": True, "error": None,
+            "streaming": True, "error": err,
         }
     except httpx.TimeoutException as e:
         return {
@@ -439,15 +451,20 @@ def main():
         out_file = RESULTS / f"{m['id']}.jsonl"
         existing: set[str] = set()
         if args.skip_existing and out_file.exists():
+            # Decide skip by the LATEST record per task, not by "any historical
+            # success". Records are appended in run order, so the last line for a
+            # task_id is its current state. A cell that later regressed to an error
+            # must be re-run (a stale older success must not keep it skipped).
+            latest: dict[str, dict] = {}
             for line in out_file.read_text(encoding="utf-8", errors="replace").splitlines():
                 try:
                     r = json.loads(line)
-                    # Only successful cells count as "existing" — error cells are
-                    # always re-run so --skip-existing backfills failed holes.
-                    if not r.get("error"):
-                        existing.add(r["task_id"])
                 except Exception:
-                    pass
+                    continue
+                tid = r.get("task_id")
+                if tid is not None:
+                    latest[tid] = r
+            existing = {tid for tid, r in latest.items() if not r.get("error")}
         # Open the per-model jsonl once for the whole task loop. Reduces I/O
         # overhead and removes the open/close-per-task window during which a
         # second run.py for the same model could race the existence check.

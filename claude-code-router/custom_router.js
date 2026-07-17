@@ -5,6 +5,9 @@
  *   1. Read model name from request body (req.body.model)
  *   2. If it's a known OpenCode Go model — pass through as-is
  *   3. If it's a Claude name (claude-*) — fall back to Router.default (set in config.json)
+ *   4. Missing model — fall back to CCR's built-in scenario routing (null)
+ *   5. Anything else (unknown/typo'd/decommissioned id) — throw, so the bad id
+ *      surfaces instead of being silently rerouted to Router.default
  *
  * How per-project model selection works:
  *   In each project's .claude/settings.local.json set:
@@ -15,7 +18,8 @@
  *   Our router sees it and routes to opencode provider with that exact model id.
  *
  * Falls back to Router.default if the model is a claude-* name (extension forgot
- * to apply env var) or if model is missing.
+ * to apply env var) or if model is missing. An unknown model id is rejected
+ * (thrown) rather than silently rerouted, so typos don't run on the wrong model.
  */
 
 // Fallback list of OpenCode Go models if config isn't passed to the router.
@@ -52,14 +56,18 @@ module.exports = async function router(req, config) {
     return `opencode,${model}`;
   }
 
-  // Unknown non-claude model: silent fallback to Router.default would mask a
-  // typo'd/decommissioned model id, so surface it.
-  // Guard: a non-string model (number/object) would throw on .startsWith.
-  if (typeof model !== 'string' || !model.startsWith('claude-')) {
-    console.warn(`[custom_router] unknown model "${model}" — falling back to Router.default`);
-  }
-
   // Claude name (claude-opus-4-8, claude-sonnet-4-6, claude-haiku-4-5, etc.)
   // → fall back to built-in routing (Router.default / .background / .think etc.)
-  return null;
+  if (typeof model === 'string' && model.startsWith('claude-')) {
+    return null;
+  }
+
+  // Unknown model id (typo'd / decommissioned / wrong provider). Returning null
+  // here would silently run the request on Router.default (a DIFFERENT model)
+  // and mask the mistake. Fail closed with an explicit, traceable error so the
+  // bad model id surfaces to the caller instead of being silently rerouted.
+  throw new Error(
+    `[custom_router] unknown model "${model}": not an OpenCode Go model and not a ` +
+    `claude-* name. Fix ANTHROPIC_MODEL, or add the id to Providers[opencode].models.`
+  );
 }

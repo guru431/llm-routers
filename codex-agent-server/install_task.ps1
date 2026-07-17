@@ -30,6 +30,7 @@
 
 param(
     [switch]$Uninstall,
+    [switch]$Force,
     [string]$ServerPath,
     [string]$BindHost = '127.0.0.1',
     [int]$Port = 8766
@@ -89,6 +90,20 @@ if ($root -match '^[A-Za-z]:\\$') {
 # Build command. Quote each path independently so spaces in either pythonw or
 # server path don't break tokenization (schtasks /tr passes the string to cmd.exe).
 $Arguments = "`"$ServerPath`" --host $BindHost --port $Port"
+
+# Refuse to clobber an already-registered task. On managed machines this task may
+# be owned by a central task registry + syncer; a manual Register-ScheduledTask
+# here drifts from it and the next sync reverts the change. If the task already
+# exists, assume it may be registry-managed and stop unless the operator
+# explicitly passes -Force for a standalone (unmanaged) deploy.
+$existing = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
+if ($existing -and -not $Force) {
+    Write-Error ("Scheduled task $FullName already exists. On managed machines it may be owned by a " +
+        "central task registry + syncer — re-registering here drifts from it and the next sync " +
+        "reverts your change. Edit the registry entry and re-run the syncer instead. " +
+        "For a STANDALONE (unmanaged) deploy, re-run with -Force to overwrite.")
+    exit 1
+}
 
 Write-Host "Creating scheduled task: $FullName"
 Write-Host "  Exe:  $pythonw"

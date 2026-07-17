@@ -10,11 +10,15 @@ Usage:
     python integration_suite.py                          # run all tests (localhost:8766)
     python integration_suite.py --url http://host:8766/v1/chat/completions
     python integration_suite.py --token <bearer>         # or env CODEX_AGENT_TOKEN
+    python integration_suite.py --agent-token <bearer>   # or env CODEX_AGENT_AGENT_TOKEN
     python integration_suite.py --cat TextGen            # single category
     python integration_suite.py --agentic                # also run slow workspace-write tests
 
-Auth: the server requires a bearer token. Pass --token or set CODEX_AGENT_TOKEN.
-Agentic tests need a writable CODEX_AGENT_WORKDIR on the server and live `codex login`.
+Auth: the server requires a read bearer (--token / CODEX_AGENT_TOKEN); the suite
+fails fast without it. workspace-write (--agentic) needs the SEPARATE agent bearer
+(--agent-token / CODEX_AGENT_AGENT_TOKEN) — the read token gets 403 on write, so
+using it there is the F31 bug. Agentic tests also need a writable CODEX_AGENT_WORKDIR
+on the server and live `codex login`.
 """
 
 import argparse
@@ -344,13 +348,19 @@ def fmt_result(msg, max_len=70):
 # AGENTIC TESTS (slow, opt-in via --agentic)
 # ============================================================
 
-def run_agentic_tests(url, token):
+def run_agentic_tests(url, agent_token):
     """Workspace-write file-write + workdir containment. Requires a writable
-    CODEX_AGENT_WORKDIR on the server (same host as this test runner)."""
+    CODEX_AGENT_WORKDIR on the server (same host as this test runner) and the
+    SEPARATE workspace-write bearer (the read token gets 403 here — F31)."""
     import tempfile
 
     print(f"\n{'─'*90}\n  Agentic (workspace-write)\n{'─'*90}")
     passed = failed = 0
+
+    if not agent_token:
+        print("  [SKIP] AG-01/AG-02 — set --agent-token / CODEX_AGENT_AGENT_TOKEN "
+              "(the read token gets 403 on workspace-write)")
+        return 0, 0
 
     workdir = os.getenv("CODEX_AGENT_WORKDIR")
     if not workdir or not os.path.isdir(workdir):
@@ -363,7 +373,7 @@ def run_agentic_tests(url, token):
     msg, elapsed = call_server(
         url,
         [{"role": "user", "content": f"Create a file named {sentinel} with the exact content: codex-was-here. Then stop."}],
-        token=token,
+        token=agent_token,
         extra={"model": "gpt-5.5-agent"},
         timeout=300,
     )
@@ -382,7 +392,7 @@ def run_agentic_tests(url, token):
     msg, elapsed = call_server(
         url,
         [{"role": "user", "content": "write a.txt"}],
-        token=token,
+        token=agent_token,
         extra={"model": "gpt-5.5-agent", "workdir": outside},
         timeout=30,
     )
@@ -402,6 +412,11 @@ def run_agentic_tests(url, token):
 def run_tests(args):
     url = args.url
     token = args.token or os.getenv("CODEX_AGENT_TOKEN")
+    agent_token = args.agent_token or os.getenv("CODEX_AGENT_AGENT_TOKEN")
+    if not token:
+        print("ERROR: no read bearer. Pass --token or set CODEX_AGENT_TOKEN — the "
+              "server requires it and every request would 401 without it.")
+        sys.exit(2)
 
     health_url = url.rsplit("/v1/", 1)[0] + "/health"
     try:
@@ -413,10 +428,6 @@ def run_tests(args):
     except Exception as e:
         print(f"ERROR: Cannot reach server at {health_url}: {e}")
         sys.exit(1)
-
-    if not token:
-        print("WARNING: no token provided (--token / CODEX_AGENT_TOKEN). "
-              "Requests will likely fail with 401.")
 
     tests = TESTS
     if args.cat:
@@ -453,7 +464,7 @@ def run_tests(args):
             errors.append((test["id"], test["name"], fmt_result(msg, 55)))
 
     if args.agentic:
-        ap, af = run_agentic_tests(url, token)
+        ap, af = run_agentic_tests(url, agent_token)
         passed += ap
         failed += af
 
@@ -469,7 +480,9 @@ def run_tests(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Test Codex Agent Server")
     parser.add_argument("--url", default=SERVER_URL)
-    parser.add_argument("--token", help="Bearer token (or env CODEX_AGENT_TOKEN)")
+    parser.add_argument("--token", help="Read bearer token (or env CODEX_AGENT_TOKEN)")
+    parser.add_argument("--agent-token", dest="agent_token",
+                        help="workspace-write bearer for --agentic (or env CODEX_AGENT_AGENT_TOKEN)")
     parser.add_argument("--cat", help="Filter by category: ToolCall, TextGen, System, MultiTurn")
     parser.add_argument("--agentic", action="store_true", help="Also run slow workspace-write tests")
     run_tests(parser.parse_args())

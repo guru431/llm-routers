@@ -1,7 +1,7 @@
 """JSONL logger for mcp-council. Writes metadata per-call + full dump for analysis."""
 
 import json
-import secrets
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -10,7 +10,11 @@ CALLS_DIR = LOG_DIR / "calls"
 
 
 def _new_call_id() -> str:
-    return f"{datetime.now().strftime('%Y-%m-%d-%H%M%S')}-{secrets.token_hex(2)}"
+    # 48 bits of uuid4 entropy, not 16 bits of token_hex(2): a single async fan-out
+    # can allocate several call_ids inside one second, and 16 bits collide at the
+    # birthday bound (~256 ids) — an overwrite of another call's dump file. The
+    # timestamp prefix stays for human-readable sort order.
+    return f"{datetime.now().strftime('%Y-%m-%d-%H%M%S')}-{uuid.uuid4().hex[:12]}"
 
 
 def write_full_dump(call_id: str, dump: dict) -> Path:

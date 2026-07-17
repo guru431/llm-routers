@@ -67,6 +67,74 @@ def test_resolve_workdir_no_root_disabled(monkeypatch):
         server.resolve_workdir("C:/whatever")
 
 
+def test_resolve_model_non_string_raises():
+    # F26: a numeric `model` must be rejected as a client error, not crash on
+    # name.endswith() with an AttributeError → worker crash.
+    with pytest.raises(server.BadRequest):
+        server.resolve_model(123)
+
+
+def test_parse_tool_calls_non_dict_json_left_as_text():
+    # F26: `<tool_call>1</tool_call>` is valid JSON but not an object — must not
+    # crash on data.get(...); the block yields no call and stays as text.
+    calls, remaining = server.parse_tool_calls("keep <tool_call>1</tool_call> me")
+    assert calls == []
+    assert "keep" in remaining and "me" in remaining
+    calls, _ = server.parse_tool_calls('<tool_call>[1, 2]</tool_call>')
+    assert calls == []
+
+
+def test_tokens_collapse_privilege(monkeypatch):
+    # F30: equal read/agent tokens are detected (main() exits on it).
+    monkeypatch.setattr(server, "AUTH_TOKEN", "same")
+    monkeypatch.setattr(server, "AGENT_AUTH_TOKEN", "same")
+    assert server._tokens_collapse_privilege() is True
+    monkeypatch.setattr(server, "AGENT_AUTH_TOKEN", "different")
+    assert server._tokens_collapse_privilege() is False
+    monkeypatch.setattr(server, "AGENT_AUTH_TOKEN", None)
+    assert server._tokens_collapse_privilege() is False
+
+
+def test_run_codex_isolation_flags(monkeypatch):
+    # F2: every codex call carries the host-coupling isolation flags.
+    captured = {}
+
+    class _FakeProc:
+        returncode = 0
+
+        def communicate(self, input=None, timeout=None):
+            return ("", "")
+
+        def poll(self):
+            return 0
+
+    def fake_popen(cmd, **kw):
+        captured["cmd"] = cmd
+        return _FakeProc()
+
+    monkeypatch.setattr(server, "READ_ROOT", None)  # avoid an extra -C token
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    server.run_codex("hi", model_base="gpt-5.5", sandbox="read-only")
+    cmd = captured["cmd"]
+    assert "--ephemeral" in cmd
+    assert "--ignore-user-config" in cmd
+    assert "--ignore-rules" in cmd
+
+
+def test_kill_process_tree_skips_dead_proc(monkeypatch):
+    # F29: a process that already exited (poll() != None) needs no taskkill.
+    called = {"run": False}
+    monkeypatch.setattr(server.subprocess, "run",
+                        lambda *a, **k: called.__setitem__("run", True))
+
+    class _DeadProc:
+        def poll(self):
+            return 0
+
+    server._kill_process_tree(_DeadProc())
+    assert called["run"] is False
+
+
 def test_parse_tool_calls_single_multiple_and_bad():
     calls, remaining = server.parse_tool_calls(
         'text before <tool_call>{"name": "a", "arguments": {"x": 1}}</tool_call> after'
@@ -166,6 +234,27 @@ def test_tools_force_readonly_reported_in_usage(monkeypatch):
 def test_bad_body_returns_400(monkeypatch):
     h = _handler(monkeypatch)
     h._handle_chat({"messages": "not a list"})
+    code, data = h.sent[0]
+    assert code == 400
+    assert data["error"]["type"] == "invalid_request_error"
+
+
+def test_tools_null_entry_returns_400(monkeypatch):
+    # F26: `tools:[null]` must be a clean 400, not an AttributeError in
+    # build_tools_system_prompt → worker crash.
+    monkeypatch.setattr(server, "run_codex", lambda *a, **k: "x")
+    h = _handler(monkeypatch)
+    h._handle_chat({"messages": [{"role": "user", "content": "hi"}], "tools": [None]})
+    code, data = h.sent[0]
+    assert code == 400
+    assert data["error"]["type"] == "invalid_request_error"
+
+
+def test_numeric_model_returns_400(monkeypatch):
+    # F26: a numeric `model` is a client error → 400, not a 500/crash.
+    monkeypatch.setattr(server, "run_codex", lambda *a, **k: "x")
+    h = _handler(monkeypatch)
+    h._handle_chat({"model": 123, "messages": [{"role": "user", "content": "hi"}]})
     code, data = h.sent[0]
     assert code == 400
     assert data["error"]["type"] == "invalid_request_error"

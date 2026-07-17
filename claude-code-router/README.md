@@ -17,7 +17,8 @@
 
 ```bash
 npm i -g @musistudio/claude-code-router
-# проверить: ccr --version
+# проверить установку (не зависит от версии CLI-флагов ccr):
+npm ls -g @musistudio/claude-code-router
 ```
 
 ## Привязка файлов к ccr

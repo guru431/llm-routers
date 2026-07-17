@@ -414,7 +414,11 @@ def test_build_summary_high_confidence_requires_quorum():
     s = _build_summary(stage1, stage2, aggregate, None)
     assert s["winner_id"] == "glm"
     assert s["independent_votes"] == 2
-    assert s["provider_domains"] == 3
+    # Domains are counted over the peers that ACTUALLY ranked the winner (glm):
+    # gemini(helicone) + codex(codex-agent) = 2. glm can't vote for itself, so
+    # opencode-go doesn't count — the winner's own survivor domain isn't a
+    # second independent source.
+    assert s["provider_domains"] == 2
     assert s["single_provider"] is False
     assert s["quorum_ok"] is True
     assert s["confidence"] == "high"
@@ -1312,3 +1316,22 @@ async def test_run_council_synthesis_error_noted_not_raised():
     assert any("stage3" in n.lower() for n in result["notes"])
     # stage1 / stage2 still populated.
     assert all(s["status"] == "ok" for s in result["stage1"])
+
+
+def test_compute_usage_dedups_cached_query_cost():
+    # F14: two members reusing the SAME query (one real Exa call, one cache hit)
+    # each carry cost_dollars in their tool log — but the run is billed ONCE.
+    rounds_detail = [{
+        "stage1": [
+            {"attempts": 1, "tokens_in": 1, "tokens_out": 1, "tool_calls_log": [
+                {"name": "web_search", "ok": True, "query": "same q", "cost_dollars": 0.005},
+            ]},
+            {"attempts": 1, "tokens_in": 1, "tokens_out": 1, "tool_calls_log": [
+                {"name": "web_search", "ok": True, "query": "  Same   Q ", "cost_dollars": 0.005},
+            ]},
+        ],
+        "stage2": [], "aggregate": [],
+    }]
+    u = _compute_usage(rounds_detail, None)
+    assert u["web_search_calls"] == 2          # both invocations still counted
+    assert u["web_search_cost_usd"] == 0.005   # normalized-duplicate billed once

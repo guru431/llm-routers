@@ -13,6 +13,7 @@ Strip <think>...</think> блоки из ответа (некоторые мод
 """
 
 import asyncio
+import random
 import re
 from urllib.parse import urlparse
 
@@ -31,13 +32,52 @@ DEFAULT_TIMEOUT = httpx.Timeout(connect=5.0, read=600.0, write=30.0, pool=5.0)
 # 504: gateway timeout (typical for an overloaded OCG gateway). 408: request
 # timeout. 529: Anthropic-style overload. 429: rate limit.
 RETRY_STATUSES = (408, 429, 500, 502, 503, 504, 529)
+# Throttling, NOT an infra outage: a rate limit means the provider is up but
+# asking us to slow down. These must NOT feed the circuit breaker (its docstring
+# already scopes it to real outages) — otherwise a burst of 429s across a co-hosted
+# fan-out would trip a host-wide breaker and take down healthy siblings.
+RATE_LIMIT_STATUSES = (429, 529)
 # Backoff for 5xx is shorter than for 429 because the upstream is usually back
 # within seconds; we still keep two attempts so a longer outage falls through.
 RETRY_BACKOFFS = (15, 45)  # seconds between attempts
+# Random jitter added to each backoff so a fan-out that all failed on the same
+# upstream blip doesn't retry in lockstep (a synchronized thundering herd).
+RETRY_JITTER_SECONDS = 5.0
+# Cap on a server-provided Retry-After so a hostile/misconfigured header can't
+# stall a request for minutes.
+RETRY_AFTER_CAP_SECONDS = 120.0
+
+
+def _parse_retry_after(resp: "httpx.Response") -> "float | None":
+    """Seconds from a `Retry-After` header (numeric form only; HTTP-date form is
+    ignored → fall back to backoff), capped. None when absent/unparseable."""
+    v = resp.headers.get("Retry-After")
+    if not v:
+        return None
+    try:
+        return min(max(0.0, float(v)), RETRY_AFTER_CAP_SECONDS)
+    except ValueError:
+        return None
+
+
+def _backoff_delay(attempt: int, retry_after: "float | None" = None) -> float:
+    """Delay before the next attempt: honour Retry-After when the server sent one,
+    else the fixed backoff, always plus jitter to de-synchronize a fan-out."""
+    base = retry_after if retry_after is not None else RETRY_BACKOFFS[attempt]
+    return base + random.uniform(0, RETRY_JITTER_SECONDS)
 
 
 class CouncilHTTPError(Exception):
-    """Любая ошибка вызова OpenAI-compatible endpoint."""
+    """Любая ошибка вызова OpenAI-compatible endpoint.
+
+    `attempts` carries the number of HTTP attempts actually spent before failing
+    (None when no request was made, e.g. a short-circuited open breaker). Council
+    usage-accounting reads it so a member that exhausted its retries still counts
+    its real calls instead of showing up as 0."""
+
+    def __init__(self, *args, attempts: int | None = None) -> None:
+        super().__init__(*args)
+        self.attempts = attempts
 
 
 # Module-level client, lazily created on first use. Reused across every call so
@@ -47,6 +87,16 @@ class CouncilHTTPError(Exception):
 # binds to the loop), hence lazy init rather than a module-import-time singleton.
 _CLIENT: "httpx.AsyncClient | None" = None
 
+# Connection-pool ceiling. MAX_ACTIVE_JOBS(16) councils × ~7 members can want
+# ~112 concurrent POSTs — far past the pool, so requests would PoolTimeout (5s)
+# instead of queueing. A process-wide semaphore of the SAME size makes excess
+# calls WAIT (fast, no handshake churn) for a free slot instead of erroring, so
+# the effective concurrency matches what the pool can actually serve. Dialogue
+# shares the same client+limiter. Not a per-provider scheduler — just a ceiling
+# aligned with the pool.
+MAX_CONNECTIONS = 64
+_INFLIGHT_SEMA: "asyncio.Semaphore | None" = None
+
 
 def _get_client() -> "httpx.AsyncClient":
     global _CLIENT
@@ -55,9 +105,18 @@ def _get_client() -> "httpx.AsyncClient":
         # (each fanning out to 7 members × multi-turn web_search) is predictable
         # instead of relying on httpx defaults (100/20).
         _CLIENT = httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=64, max_keepalive_connections=16),
+            limits=httpx.Limits(
+                max_connections=MAX_CONNECTIONS, max_keepalive_connections=16
+            ),
         )
     return _CLIENT
+
+
+def _get_inflight_sema() -> "asyncio.Semaphore":
+    global _INFLIGHT_SEMA
+    if _INFLIGHT_SEMA is None:
+        _INFLIGHT_SEMA = asyncio.Semaphore(MAX_CONNECTIONS)
+    return _INFLIGHT_SEMA
 
 
 async def close_client() -> None:
@@ -67,10 +126,13 @@ async def close_client() -> None:
     released cleanly. Also lets cross-loop tests / hot-reload drop a client
     bound to a now-dead event loop — the next call lazily re-creates it.
     """
-    global _CLIENT
+    global _CLIENT, _INFLIGHT_SEMA
     if _CLIENT is not None:
         await _CLIENT.aclose()
         _CLIENT = None
+    # Drop the limiter too so a re-created client (new event loop / hot reload)
+    # gets a fresh semaphore bound to that loop.
+    _INFLIGHT_SEMA = None
 
 
 def _strip_think(text: str) -> str:
@@ -167,7 +229,11 @@ async def call_openai_compat(
 
     for attempt in range(max_retries + 1):
         try:
-            resp = await client.post(url, headers=headers, json=payload, timeout=timeout)
+            # Gate concurrent in-flight requests to the pool size so a burst
+            # queues here rather than PoolTimeout-ing at httpx. Released on exit
+            # (incl. exception); the backoff sleeps below hold NO slot.
+            async with _get_inflight_sema():
+                resp = await client.post(url, headers=headers, json=payload, timeout=timeout)
         except httpx.TimeoutException as e:
             # ReadTimeout / ConnectTimeout / PoolTimeout. Thinking-mode models
             # can hold the connection for minutes and a transient blip from the
@@ -177,7 +243,8 @@ async def call_openai_compat(
             if attempt >= max_retries:
                 _record_failure()
                 raise CouncilHTTPError(
-                    f"timeout after {attempt + 1} attempts: {detail}"
+                    f"timeout after {attempt + 1} attempts: {detail}",
+                    attempts=attempt + 1,
                 ) from e
             # A concurrent member of the same fan-out may have tripped the breaker
             # while we were failing — re-check before spending another backoff so
@@ -185,7 +252,7 @@ async def call_openai_compat(
             # full retry budget before the breaker helps.
             if circuit_breaker.open_for(host):
                 raise CouncilHTTPError(f"circuit_open for {host}: tripped mid-retry")
-            await asyncio.sleep(RETRY_BACKOFFS[attempt])
+            await asyncio.sleep(_backoff_delay(attempt))
             last_error = f"timeout {detail} (retry)"
             continue
         except httpx.HTTPError as e:
@@ -193,29 +260,40 @@ async def call_openai_compat(
             # empty on these — fall back to the class name so logs aren't blank.
             detail = str(e) or type(e).__name__
             _record_failure()
-            raise CouncilHTTPError(f"network error: {detail}") from e
+            raise CouncilHTTPError(
+                f"network error: {detail}", attempts=attempt + 1
+            ) from e
 
         if resp.status_code == 402:
             body = resp.text[:200] if resp.text else ""
-            raise CouncilHTTPError(f"http 402 insufficient_balance: {body}")
+            raise CouncilHTTPError(
+                f"http 402 insufficient_balance: {body}", attempts=attempt + 1
+            )
 
         if resp.status_code in RETRY_STATUSES:
+            is_rate_limit = resp.status_code in RATE_LIMIT_STATUSES
             if attempt >= max_retries:
-                _record_failure()
+                # A rate limit means the host is UP (just throttling) — don't let
+                # an exhausted 429/529 open the infra breaker on a healthy host.
+                if not is_rate_limit:
+                    _record_failure()
                 raise CouncilHTTPError(
-                    f"overload after {attempt + 1} attempts (last status {resp.status_code})"
+                    f"overload after {attempt + 1} attempts (last status {resp.status_code})",
+                    attempts=attempt + 1,
                 )
             # See the timeout branch: short-circuit if a sibling already opened
             # the breaker for this host mid-retry.
             if circuit_breaker.open_for(host):
                 raise CouncilHTTPError(f"circuit_open for {host}: tripped mid-retry")
-            await asyncio.sleep(RETRY_BACKOFFS[attempt])
+            await asyncio.sleep(_backoff_delay(attempt, _parse_retry_after(resp)))
             last_error = f"http {resp.status_code} (retry)"
             continue
 
         if resp.status_code != 200:
             body = resp.text[:200] if resp.text else ""
-            raise CouncilHTTPError(f"http {resp.status_code}: {body}")
+            raise CouncilHTTPError(
+                f"http {resp.status_code}: {body}", attempts=attempt + 1
+            )
 
         # HTTP 200 = the host is up: clear any accumulated infra-failure streak
         # NOW, even if the body turns out empty/malformed below (those are not

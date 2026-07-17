@@ -57,3 +57,22 @@ def test_context_roots_configured_reflects_env(tmp_path, monkeypatch):
     assert context_roots_configured() is False
     monkeypatch.setenv(_CONTEXT_ROOTS_ENV, str(tmp_path))
     assert context_roots_configured() is True
+
+
+def test_read_files_decodes_utf16_le_bom(tmp_path):
+    # F20: a UTF-16 LE file (PowerShell 5.1 default) must decode to real text,
+    # not UTF-8-mangled replacement chars / interleaved NULs.
+    from sandbox import read_files_with_limit
+    p = tmp_path / "u16.txt"
+    p.write_bytes(b"\xff\xfe" + "Привет, мир".encode("utf-16-le"))
+    (_, text), = read_files_with_limit([p])
+    assert text == "Привет, мир"
+    assert "\x00" not in text and "�" not in text
+
+
+def test_read_files_decodes_utf8_bom(tmp_path):
+    from sandbox import read_files_with_limit
+    p = tmp_path / "u8.txt"
+    p.write_bytes(b"\xef\xbb\xbf" + "hello".encode("utf-8"))
+    (_, text), = read_files_with_limit([p])
+    assert text == "hello"

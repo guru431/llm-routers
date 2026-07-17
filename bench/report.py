@@ -124,6 +124,12 @@ def main():
             except Exception:
                 pass
 
+    # Actual run-date span of the loaded raw records (ts = "YYYY-MM-DDT..."). The
+    # report title/filename is a fixed 2026-05-15 snapshot, so surface when the
+    # tables actually aggregate cells collected on different dates.
+    run_dates = sorted({r["ts"][:10] for r in results.values()
+                        if isinstance(r.get("ts"), str) and len(r["ts"]) >= 10})
+
     # Load judge scores
     judges: dict[tuple[str, str], dict] = {}
     if JUDGE_FILE.exists():
@@ -213,11 +219,21 @@ def main():
     lines.append(f"**Моделей:** {len(rows)} ({sum(1 for r in rows if not r.get('skip'))} активных)")
     lines.append(f"**Задач:** {len(tasks)} (RU-edit, YT-summary EN/RU, JSON-extract, RU→EN translate, classify, bash one-liner, Python function)")
     lines.append(f"**Judge:** claude-opus-4-8 (через agent server, температура 0)")
+    if run_dates:
+        if len(run_dates) == 1:
+            lines.append(f"**Даты прогонов (из raw-данных):** {run_dates[0]}")
+        else:
+            lines.append(
+                f"> ⚠️ **Смешанные прогоны:** raw-данные собраны в {len(run_dates)} разных дат "
+                f"({run_dates[0]} … {run_dates[-1]}). Таблицы ниже агрегируют разные прогоны "
+                f"под фиксированным заголовком 2026-05-15, а не единый снимок."
+            )
     lines.append("")
     lines.append(
-        "> ⚠️ **Self-judge bias:** judge — claude-opus-4-8, и модели семейства "
-        "`claude_agent` судят сами себя (помечены `†`). Их Q завышены из-за "
-        "self-preference; сравнивать их с другими провайдерами с осторожностью. "
+        "> ⚠️ **Self-judge bias (гипотеза, не измерено):** judge — claude-opus-4-8, и модели "
+        "семейства `claude_agent` судят сами себя (помечены `†`). Их Q могут быть завышены "
+        "из-за self-preference — это правдоподобная гипотеза, но без контрольного judge она "
+        "не подтверждена; сравнивать их с другими провайдерами с осторожностью. "
         "`*` у Q = оценка по неполному покрытию задач (quality_n < задач) — "
         "ранжирование использует покрытие-взвешенный Q, не сырой средний."
     )

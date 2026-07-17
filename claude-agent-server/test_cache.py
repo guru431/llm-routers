@@ -124,6 +124,30 @@ def test_thread_safety():
     assert not errors, f"Thread errors: {errors}"
 
 
+def test_oversized_value_not_cached():
+    # F28: a single value larger than the whole byte budget must NOT be stored —
+    # eviction never drops the sole entry, so it would sit above max_bytes forever.
+    from cache import ResponseCache
+    c = ResponseCache(max_size=10, ttl_seconds=60, max_bytes=10)
+    c.put("m", "s", "p", "x" * 100)  # 100 bytes > 10 max_bytes
+    assert c.get("m", "s", "p") is None
+    stats = c.stats()
+    assert stats["size"] == 0
+    assert stats["bytes"] == 0
+
+
+def test_oversized_overwrite_drops_stale_entry():
+    # F28: overwriting an existing key with an oversized value evicts the old one
+    # (rather than leaving a stale small value cached).
+    from cache import ResponseCache
+    c = ResponseCache(max_size=10, ttl_seconds=60, max_bytes=50)
+    c.put("m", "s", "p", "small")
+    assert c.get("m", "s", "p") == "small"
+    c.put("m", "s", "p", "x" * 100)
+    assert c.get("m", "s", "p") is None
+    assert c.stats()["bytes"] == 0
+
+
 def test_expired_entry_evicted_on_access():
     """Просроченная запись не возвращается и удаляется из size."""
     from cache import ResponseCache

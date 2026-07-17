@@ -37,6 +37,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -227,6 +228,11 @@ def parse_tool_calls(text: str) -> tuple[list[dict], str]:
     for match in pattern.finditer(text):
         try:
             data = json.loads(match.group(1))
+            # A block whose JSON is not an object (e.g. a bare `1` or a list)
+            # is not a valid call: leave it as text instead of crashing on
+            # data.get(...). Malformed model tool blocks degrade to text.
+            if not isinstance(data, dict):
+                continue
             calls.append({
                 "id": f"call_{uuid.uuid4().hex[:8]}",
                 "type": "function",
@@ -254,12 +260,30 @@ def run_claude(prompt: str, system_prompt: str | None = None,
     m = model or MODEL
     if m not in MODELS:
         raise ValueError(f"model not in whitelist: {m!r}")
-    cmd = [CLAUDE_BIN, "--model", m, "-p", "-", "--output-format", "json"]
+    # Chat-profile isolation flags (F2): `--tools ""` disables ALL built-in
+    # tools (this server emulates tools via prompt injection and never wants
+    # claude to actually run Bash/Edit/Read on the host); `--strict-mcp-config`
+    # with no `--mcp-config` loads no MCP servers; `--no-session-persistence`
+    # stops session files being written to disk. These do NOT sandbox the
+    # filesystem — claude still runs as this OS user (see README security
+    # section) — they only shrink the host-action surface a "chat" bearer reaches.
+    cmd = [
+        CLAUDE_BIN, "--model", m, "-p", "-", "--output-format", "json",
+        "--tools", "", "--strict-mcp-config", "--no-session-persistence",
+    ]
+    # Pass the client-controlled system prompt via a temp FILE
+    # (`--system-prompt-file`), never as a `--system-prompt=<value>` argv (F1).
+    # On Windows CLAUDE_BIN is a `claude.CMD` shim, so subprocess routes argv
+    # through cmd.exe, whose metacharacter re-parsing (BatBadBut) a crafted
+    # system prompt (embedded quote + `&|^<>()%`) could exploit to break out of
+    # the quoting and run a command as this service. Only the server-generated
+    # temp path — which has no shell metacharacters — enters argv now.
+    sysprompt_file = None
     if system_prompt:
-        # `--system-prompt=VALUE` (single argv with `=`) prevents argument
-        # injection: even if VALUE starts with `--`, argparse binds it as
-        # the value of --system-prompt rather than parsing it as a new flag.
-        cmd.append(f"--system-prompt={system_prompt}")
+        fd, sysprompt_file = tempfile.mkstemp(suffix=".txt", prefix="claude-sys-")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(system_prompt)
+        cmd += ["--system-prompt-file", sysprompt_file]
     # Сигнал хукам Claude Code (~/.claude/settings.json: SessionStart/SessionEnd),
     # что это headless-вызов сервера: тяжёлая инъекция wiki-контекста (~162K токенов,
     # ~$3/вызов, упор в лимит Max → "claude exit code 1") должна быть пропущена.
@@ -288,59 +312,79 @@ def run_claude(prompt: str, system_prompt: str | None = None,
     else:
         popen_kwargs["start_new_session"] = True
 
-    proc = subprocess.Popen(cmd, **popen_kwargs)
     try:
-        stdout, stderr = proc.communicate(input=prompt, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        # Kill the whole tree, then reap so we don't leave a zombie/orphan.
-        # Bound both the kill and the reap so a hung taskkill/communicate can't
-        # pin the _CLAUDE_SEM slot forever (concurrency leak → eventual 429s).
-        if sys.platform == "win32":
-            try:
-                subprocess.run(
-                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                    capture_output=True,
-                    creationflags=CREATE_NO_WINDOW,
-                    timeout=15,
-                )
-            except subprocess.TimeoutExpired:
-                # proc may already be dead (ProcessLookupError) — don't let a
-                # fallback kill turn a 504 timeout into a 500.
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-        else:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
+        proc = subprocess.Popen(cmd, **popen_kwargs)
         try:
-            proc.communicate(timeout=10)
+            stdout, stderr = proc.communicate(input=prompt, timeout=timeout)
         except subprocess.TimeoutExpired:
-            pass
-        raise
+            # Kill the whole tree, then reap so we don't leave a zombie/orphan.
+            # Bound both the kill and the reap so a hung taskkill/communicate can't
+            # pin the _CLAUDE_SEM slot forever (concurrency leak → eventual 429s).
+            if sys.platform == "win32":
+                try:
+                    r = subprocess.run(
+                        ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                        capture_output=True,
+                        creationflags=CREATE_NO_WINDOW,
+                        timeout=15,
+                    )
+                    # F29: taskkill can fail (race, elevation) WITHOUT raising —
+                    # verify the process actually died and hard-kill the shim if
+                    # not, so a live child can't keep burning the Max quota.
+                    if r.returncode != 0 and proc.poll() is None:
+                        proc.kill()
+                except subprocess.TimeoutExpired:
+                    # proc may already be dead (ProcessLookupError) — don't let a
+                    # fallback kill turn a 504 timeout into a 500.
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+            else:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+            try:
+                proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            raise
 
-    if proc.returncode != 0:
-        # Log the raw claude stderr/stdout server-side only — it can carry the
-        # home dir / username, Max-quota internals and local paths. The exception
-        # message stays generic so _handle_chat never leaks it to the client even
-        # if the surrounding error handling changes. Mirrors codex-agent-server's
-        # run_codex (generic "codex command failed").
-        detail = (stderr or "").strip() or (stdout or "").strip()[:800]
-        logger.error("claude exit code %s; detail: %s", proc.returncode, detail or "(empty)")
-        raise RuntimeError("claude command failed")
-    # Parse JSON output to extract result
-    try:
-        data = json.loads((stdout or "").strip())
-        if data.get("is_error"):
-            raise RuntimeError(data.get("result", "Unknown error"))
-        return data.get("result", "").strip()
-    except json.JSONDecodeError:
-        return (stdout or "").strip()
+        if proc.returncode != 0:
+            # Log the raw claude stderr/stdout server-side only — it can carry the
+            # home dir / username, Max-quota internals and local paths. The exception
+            # message stays generic so _handle_chat never leaks it to the client even
+            # if the surrounding error handling changes. Mirrors codex-agent-server's
+            # run_codex (generic "codex command failed").
+            detail = (stderr or "").strip() or (stdout or "").strip()[:800]
+            logger.error("claude exit code %s; detail: %s", proc.returncode, detail or "(empty)")
+            raise RuntimeError("claude command failed")
+        # Parse JSON output to extract result
+        try:
+            data = json.loads((stdout or "").strip())
+            if data.get("is_error"):
+                raise RuntimeError(data.get("result", "Unknown error"))
+            return data.get("result", "").strip()
+        except json.JSONDecodeError:
+            return (stdout or "").strip()
+    finally:
+        # Remove the system-prompt temp file. Retry briefly: on Windows the
+        # child (or an AV scan) may still hold it for a moment after exit.
+        if sysprompt_file:
+            for _ in range(5):
+                try:
+                    os.remove(sysprompt_file)
+                    break
+                except FileNotFoundError:
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            else:
+                logger.warning("could not delete claude system-prompt temp file (leaked): %s", sysprompt_file)
 
 
 def extract_content(content) -> str:
@@ -478,6 +522,16 @@ class Handler(BaseHTTPRequestHandler):
         if tools_raw is not None and not isinstance(tools_raw, list):
             self._send(400, {"error": {"message": "tools must be a list", "type": "invalid_request_error"}})
             return
+        # Each tool must be an object with an object `function` (a `tools:[null]`
+        # or `function: 1` would otherwise reach build_tools_system_prompt and
+        # crash on .get(...) → worker exception → RemoteDisconnected. Client error → 400.
+        if isinstance(tools_raw, list):
+            for t in tools_raw:
+                if not isinstance(t, dict) or not isinstance(t.get("function", {}), dict):
+                    self._send(400, {"error": {
+                        "message": "each tool must be an object with a function object",
+                        "type": "invalid_request_error"}})
+                    return
 
         model = body.get("model")
         # Reject an unknown model with 400 invalid_request_error rather than
@@ -836,6 +890,16 @@ def main():
                      args.host, args.port, exc)
         sys.exit(1)
     logger.info("Claude Agent Server started: http://%s:%d", args.host, args.port)
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        # F3: this server speaks plain HTTP. Bound off loopback, the bearer
+        # token crosses the LAN in clear text and can be sniffed/replayed. The
+        # only supported LAN exposure is behind a TLS/mTLS reverse proxy or a VPN.
+        logger.warning(
+            "Bound to %s (NOT loopback) over PLAIN HTTP: the bearer token travels "
+            "the network unencrypted. Do not expose directly on the LAN — put a "
+            "TLS/mTLS reverse proxy (nginx/caddy) or a VPN in front, and bind this "
+            "server to 127.0.0.1 behind it.", args.host,
+        )
     logger.info("Model: %s", MODEL)
     if CACHE is not None:
         logger.info("Cache: enabled (max=%d entries, ttl=%.0fs)", _CACHE_SIZE, _CACHE_TTL)

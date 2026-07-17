@@ -17,7 +17,7 @@ from dialogue.prompts import (
     render_socratic_respondent_prompt,
     render_summary_prompt,
 )
-from dialogue.state import DialogueState, mark_phase
+from dialogue.state import DialogueState, mark_phase, resolve_dump_dir
 
 DUMP_DIR = Path(__file__).parent.parent / "logs" / "dialogues"
 
@@ -106,6 +106,16 @@ async def run_socratic(
             "latency_ms": q_result.latency_ms, "status": q_result.status,
         })
 
+        # Short-circuit: a failed question makes the respondent's answer (and the
+        # moderator note) meaningless — don't spend those calls. Record the round
+        # and let check_round_failures decide the abort (a dead questioner is 1/2
+        # participants → over threshold for a socratic pair).
+        if q_result.status != "ok":
+            state.current_round = round_n
+            check_round_failures(state, round_n)
+            await maybe_dump(state, resolve_dump_dir(DUMP_DIR))
+            continue
+
         # --- answer phase ---
         mark_phase(state, f"round_{round_n}_answer")
         a_prompt = render_socratic_respondent_prompt(
@@ -140,7 +150,7 @@ async def run_socratic(
         # for every remaining round. Moderator-note failures don't count.
         check_round_failures(state, round_n)
         # Mid-run persistence — snapshot after each completed round.
-        await maybe_dump(state, DUMP_DIR)
+        await maybe_dump(state, resolve_dump_dir(DUMP_DIR))
 
     # --- final summary (only if moderator present) ---
     if moderator_cfg:
@@ -157,8 +167,10 @@ async def run_socratic(
             ),
             "latency_ms": s_result.latency_ms, "status": s_result.status,
         })
+        if s_result.status != "ok":
+            state.warnings.append(f"final summary failed: {s_result.error}")
 
     from dialogue.render import format_dialogue_markdown
     state.result_markdown = format_dialogue_markdown(state, topic)
     mark_phase(state, "done")
-    state.dump_path = str(await asyncio.to_thread(write_dump, state, base_dir=DUMP_DIR))
+    state.dump_path = str(await asyncio.to_thread(write_dump, state, base_dir=resolve_dump_dir(DUMP_DIR)))

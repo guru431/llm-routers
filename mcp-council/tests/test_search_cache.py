@@ -47,3 +47,43 @@ def test_concurrent_identical_queries_collapse_to_one_call():
     assert cache.misses == 1
     assert cache.hits == 4
     assert all(r["query"] == "same q" for r in results)
+
+
+def test_run_budget_exhausted_raises():
+    # F13: a run-wide cap on distinct (billed) searches. New distinct queries past
+    # the cap raise WebSearchError (caught upstream and surfaced to the model);
+    # cached repeats stay free.
+    from web_search import WebSearchError
+
+    async def fake_search(query):
+        return {"query": query, "results": [], "latency_ms": 1}
+
+    async def run():
+        cache = RunSearchCache(search_fn=fake_search, max_searches=2)
+        await cache.search("q1")
+        await cache.search("q2")
+        await cache.search("q1")  # cache hit — still allowed past the cap
+        with pytest.raises(WebSearchError, match="budget exhausted"):
+            await cache.search("q3")  # new distinct query → over budget
+
+    asyncio.run(run())
+
+
+def test_execute_tool_call_rejects_malformed_shapes():
+    # F13: a malformed tool_calls array (non-dict entry, non-object args) must
+    # return a tool-error message, not raise AttributeError and kill the member.
+    from web_search_tool import execute_tool_call
+
+    def noop(*a, **k):
+        return None
+
+    async def run():
+        # tc is a bare scalar
+        msg, log = await execute_tool_call(1, noop, "m")
+        assert "Malformed tool_call" in msg and log["ok"] is False
+        # arguments parse to a JSON array, not an object
+        tc = {"function": {"name": "web_search", "arguments": "[1, 2, 3]"}}
+        msg, log = await execute_tool_call(tc, noop, "m")
+        assert "must be a JSON object" in msg and log["ok"] is False
+
+    asyncio.run(run())

@@ -51,9 +51,24 @@ _DEFAULT_BASE_DIR = Path(__file__).parent / "logs"
 
 # Cap on a single job's event log. A long multi-round web_search run emits many
 # tool_call events; without a ceiling one .jsonl could grow very large and stall
-# tail -F consumers. Past the cap we write one truncation notice and go silent —
-# this is best-effort observability, not an audit trail.
+# tail -F consumers. Past the cap we write one truncation notice, then stay silent
+# for verbose (non-terminal) events — this is best-effort observability, not an
+# audit trail. TERMINAL events (result_ready and the terminal `phase` markers) are
+# ALWAYS written even past the cap, so a `tail -F --until-done` consumer can never
+# hang forever waiting on a result_ready that got suppressed by the size guard.
 MAX_EVENT_LOG_BYTES = 8 * 1024 * 1024  # 8 MB
+
+# Phase values that mark the run as finished (mirrors state.TERMINAL_PHASES; kept
+# local to avoid an import cycle event_log ⇄ state).
+_TERMINAL_PHASES = frozenset({"done", "error", "cancelled", "interrupted"})
+
+
+def _is_terminal_event(event_type: str, payload: dict[str, Any]) -> bool:
+    """A terminal event tells watchers the run is consumable/finished. These must
+    survive the size cap so `--until-done` consumers always see the end."""
+    if event_type == "result_ready":
+        return True
+    return event_type == "phase" and payload.get("phase") in _TERMINAL_PHASES
 
 
 class EventWriter:
@@ -74,8 +89,11 @@ class EventWriter:
         if self._fh is None:
             return
         # Once the size cap is hit, emit a single truncation marker, then stay
-        # silent for the rest of the run so the file can't grow without bound.
-        if self._bytes_written >= MAX_EVENT_LOG_BYTES:
+        # silent for VERBOSE events so the file can't grow without bound. Terminal
+        # events (result_ready / terminal phase) always fall through below so a
+        # watcher's --until-done never blocks on a suppressed result_ready.
+        terminal = _is_terminal_event(event_type, payload)
+        if self._bytes_written >= MAX_EVENT_LOG_BYTES and not terminal:
             if not self._truncated:
                 self._truncated = True
                 notice = json.dumps(

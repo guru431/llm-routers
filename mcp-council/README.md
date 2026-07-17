@@ -55,6 +55,37 @@ council_ask_async(question, context_paths=None, max_response_tokens=8192,
 
 Используй когда вызывающий агент (Claude в сессии) хочет продолжать отвечать пользователю пока council работает.
 
+Оба `council_ask`/`council_ask_async` принимают `models=[...]` (подмножество CATALOG, ≥2) или `models_preset` (`"full"` / `"diverse-3"` / `"fast-2-single-provider"` — описательные имена, НЕ рейтинг качества; легаси `best`/`balanced`/`cheap` — алиасы), взаимоисключимо.
+
+### `model_ask` — один прямой вызов конкретной модели
+
+```python
+model_ask(model_id: str, prompt: str, context_paths=None, example_paths=None,
+          max_response_tokens=4096, web_search=False) -> str
+```
+
+Один вызов модели из `models.CATALOG` (без council deliberation). Для тяжёлой суммаризации, шаблонной генерации, переводов, QA по файлам. `deepseek-flash` доступен только здесь. Заменил старые `deepseek_read/draft` и `minimax_read/draft`.
+
+### `model_healthcheck` — пинг моделей
+
+```python
+model_healthcheck(models: list[str] | None = None) -> dict
+```
+
+Пингует каждую модель CATALOG (или подмножество) тривиальным промптом; возвращает per-model `status` (ok|disabled|no_key|auth|insufficient_balance|rate_limited|timeout|empty_response|network|circuit_open|error), `circuit_breakers` snapshot, `context_roots_configured`/`context_fail_open`, и агрегаты `ok`/`disabled`/`failed` (disabled-члены считаются отдельно, а не как failed). Использовать ДО council при подозрении на проблему провайдера.
+
+### Dialogue tools — продолжительные диалоги моделей (async-only)
+
+Отдельная группа для многораундовых обсуждений с anti-convergence (детали — `dialogue/`):
+
+- `model_debate(question, participants=["glm","kimi","codex"], moderator=None, rounds=5, ...)` — 2+ модели с противоположными позициями (модератор автогенерирует), N раундов critique/response.
+- `model_panel(question, participants=<7 default>, roles=None, diversity_monitor=True, devils_advocate_rotation=True, rounds=5, ...)` — 4+ моделей в свободной дискуссии, devil's advocate ротация + diversity monitor.
+- `model_socratic(topic, questioner="deepseek-pro", respondent="glm", moderator=None, rounds=5, ...)` — questioner углубляет вопросами, respondent отвечает, optional moderator note+summary.
+- `dialogue_continue(session_id, directive, rounds=3)` — продолжить done/interrupted-сессию ещё N раундов (считаются от `current_round`).
+- `dialogue_status` / `dialogue_result` / `dialogue_cancel` / `dialogue_list_sessions` — наблюдение/выгрузка. `dialogue_result` отдаёт `warnings` (например провал финального summary) на успешном `done`.
+
+Все 3 стартовых tool'а async (5-50 мин): возвращают `session_id`, прогресс через `dialogue_status`. `moderator`/`monitor_model` обязан отличаться от participants (fail-fast). Снапшоты — `logs/dialogues/<id>.json` (override `COUNCIL_DIALOGUES_DIR`), при рестарте незавершённые → `interrupted` (resumable через `dialogue_continue`).
+
 ### Real-time event stream (Monitor-friendly)
 
 Каждый `council_ask_async` создаёт `logs/events/<job_id>.jsonl` (один JSON-event на строку, line-buffered). `council_ask_async` возвращает путь в поле `event_log`. Внешний наблюдатель — например Claude в основной сессии с tool `Monitor` — может `tail -F <event_log>` и реагировать на события в реальном времени без polling'а `council_status`.
@@ -69,11 +100,11 @@ Event types:
 
 ### Web search per-model (`web_search=True`)
 
-Когда включено: каждая stage-1 модель получает OpenAI-style tool `web_search(query)` через Exa.ai. Модели **независимо** формулируют свои queries (probe показал что 6 моделей выдают 6 разных формулировок — от простых до boolean syntax типа `"A" OR "B"`), исполнитель в MCP дёргает Exa, отдаёт title/url/summary/highlights, модель может вызвать ещё раз или сразу написать финальный ответ. Max 5 iterations на модель (защита от зацикливания).
+Когда включено: каждая stage-1 модель получает OpenAI-style tool `web_search(query)` через Exa.ai. Модели **независимо** формулируют свои queries (probe показал что 6 моделей выдают 6 разных формулировок — от простых до boolean syntax типа `"A" OR "B"`), исполнитель в MCP дёргает Exa, отдаёт title/url/summary/highlights, модель может вызвать ещё раз или сразу написать финальный ответ. Cap `MAX_TOOL_ITERATIONS=12` tool-turns на модель (на последнем turn форсится `tool_choice="none"`, и любые всё-таки возвращённые tool_calls **отбрасываются**, а не исполняются — реальный потолок ровно 12 поисков на члена). Сверх этого — **run-wide budget** `MAX_RUN_SEARCHES=40` оплаченных (distinct) Exa-запросов на весь council (общий кэш `RunSearchCache`): при исчерпании новые distinct-запросы возвращают модели `budget_exhausted`, кэш-повторы бесплатны.
 
-Stage 2 (peer-ranking) и Stage 3 (chairman synthesis) — **без** tools, они работают с собранными в stage 1 материалами.
+Stage 2 (peer-ranking) — **без** tools; при `synthesis=True` chairman (Stage 3) тоже получает `web_search` для фактчека спорных claim'ов (делит общий кэш со stage 1).
 
-Trade-off: каждая модель тратит +30-90s на 1-3 search iterations. Стоимость Exa ~$0.005-0.01/query × 5-15 queries за council = $0.05-0.15.
+Trade-off: каждая модель тратит +30-90s на 1-3 search iterations. Стоимость Exa ~$0.005-0.01/query, run-budget 40 запросов ⇒ worst-case ≈ $0.20 за council. Точная стоимость (billed once per distinct query) — в `usage.web_search_cost_usd`.
 
 ## Когда применять
 
@@ -127,7 +158,9 @@ Async-job исполнение council живёт в `state.py`; промпты 
 
 ## HTTP behaviour
 
-- `DEFAULT_TIMEOUT = 600s` (thinking-модели через OCG могут долго думать без emitting bytes).
-- Retry on HTTP 429/500/502/503/529: 2 попытки, backoff (15s, 45s).
+- `DEFAULT_TIMEOUT`: connect=5s / read=600s / write=30s / pool=5s (thinking-модели через OCG могут долго держать соединение без emitting bytes; короткий connect/pool не даёт мёртвому хосту съесть весь бюджет).
+- Retry on HTTP 408/429/500/502/503/504/529 + timeout: 2 попытки, backoff (15s, 45s) **+ случайный jitter 0-5s** (де-синхронизирует fan-out) и учёт заголовка `Retry-After` (capped 120s).
+- **429/529 (throttling) НЕ открывают circuit breaker** — хост жив, просто просит сбавить темп; breaker копит только infra-outage (5xx/timeout/network). 402/401/400 тоже не открывают.
 - HTTP 402 (insufficient balance) — без retry, сразу error.
+- In-flight semaphore (`MAX_CONNECTIONS=64`) согласован с connection pool: burst из нескольких async-job'ов очередится на семафоре, а не падает в `PoolTimeout`.
 - Pустой `str(exception)` в httpx ошибках заменяется на `type(e).__name__` (`ReadTimeout`, `ConnectTimeout`, …).

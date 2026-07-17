@@ -17,7 +17,7 @@ import time
 from typing import Any, Awaitable, Callable
 
 from healthcheck import _classify_error
-from models import CATALOG, provider_domain, resolve_members
+from models import CATALOG, effective_max_tokens, provider_domain, resolve_members
 from openai_client import call_openai_compat
 from prompts import (
     STAGE1_ROUND_N_SYSTEM,
@@ -93,7 +93,7 @@ async def _run_member_stage1(
             "tool_calls_log": [],
         }
 
-    max_tokens = max(max_response_tokens, member.get("min_max_tokens", 0))
+    max_tokens = effective_max_tokens(max_response_tokens, member)
     messages = [
         {"role": "system", "content": STAGE1_SYSTEM},
         {"role": "user", "content": build_stage1_user(question, files_section)},
@@ -133,6 +133,9 @@ async def _run_member_stage1(
             "latency_ms": int((time.monotonic() - start) * 1000),
             "tokens_in": None,
             "tokens_out": None,
+            # HTTP attempts spent before failing (CouncilHTTPError carries it) so
+            # usage-accounting counts an exhausted-retry member's real calls.
+            "attempts": getattr(e, "attempts", None),
             "tool_calls_log": [],
         }
 
@@ -194,7 +197,7 @@ async def _run_member_stage1_round_n(
             "tool_calls_log": [],
         }
 
-    max_tokens = max(max_response_tokens, member.get("min_max_tokens", 0))
+    max_tokens = effective_max_tokens(max_response_tokens, member)
     messages = [
         {"role": "system", "content": STAGE1_ROUND_N_SYSTEM},
         {
@@ -223,6 +226,7 @@ async def _run_member_stage1_round_n(
             "error": str(e), "answer": None,
             "latency_ms": int((time.monotonic() - start) * 1000),
             "tokens_in": None, "tokens_out": None,
+            "attempts": getattr(e, "attempts", None),
             "tool_calls_log": [],
         }
 
@@ -394,7 +398,7 @@ async def _run_member_stage2(
     ]
 
     # Request larger output for Kimi-style rankers; min_max_tokens still applies.
-    max_tokens = max(max_response_tokens, ranker.get("min_max_tokens", 0))
+    max_tokens = effective_max_tokens(max_response_tokens, ranker)
     extra = dict(ranker.get("extra") or {})
 
     try:
@@ -418,6 +422,7 @@ async def _run_member_stage2(
             "rankings": [],
             "pseudonyms": pseudonyms,
             "latency_ms": int((time.monotonic() - start) * 1000),
+            "attempts": getattr(e, "attempts", None),
         }
 
     try:
@@ -459,11 +464,18 @@ async def _run_member_stage2(
     # Normalize: keep only entries with valid pseudonym letter and integer score.
     letter_to_id = {v: k for k, v in pseudonyms.items()}
     clean: list[dict] = []
+    seen_ranked: set[str] = set()
     for r in rankings:
         if not isinstance(r, dict):
             continue
         letter = str(r.get("member", "")).strip().upper()
         if letter not in letter_to_id:
+            continue
+        ranked_id = letter_to_id[letter]
+        # One ranker ranks each peer AT MOST once. A model repeating the same
+        # pseudonym would otherwise let a single ranker inflate a candidate's
+        # independent-vote count — drop the duplicate, keep the first.
+        if ranked_id in seen_ranked:
             continue
         try:
             score = int(r.get("score"))
@@ -471,9 +483,10 @@ async def _run_member_stage2(
             continue
         if not (1 <= score <= 10):
             continue
+        seen_ranked.add(ranked_id)
         clean.append(
             {
-                "ranked_id": letter_to_id[letter],
+                "ranked_id": ranked_id,
                 "pseudonym": letter,
                 "score": score,
                 # 1200 chars ≈ 5-6 sentences with comparative reasoning headroom.
@@ -622,7 +635,7 @@ async def _run_stage3_synthesis(
             ),
         },
     ]
-    max_tokens = max(max_response_tokens, chairman.get("min_max_tokens", 0))
+    max_tokens = effective_max_tokens(max_response_tokens, chairman)
     tools = [WEB_SEARCH_TOOL_SPEC] if web_search else None
 
     try:
@@ -655,6 +668,7 @@ async def _run_stage3_synthesis(
             "synthesis": None,
             "error": str(e),
             "latency_ms": int((time.monotonic() - start) * 1000),
+            "attempts": getattr(e, "attempts", None),
         }
 
     # A tool-looping chairman can exhaust its iterations still wanting to search
@@ -757,13 +771,18 @@ def _compute_usage(
     calls = tin = tout = retries = web = 0
     cost = 0.0
     web_cost = 0.0
-    any_priced = False
+    priced_calls = 0
+    # A query is billed by Exa exactly ONCE per run (RunSearchCache collapses
+    # duplicates), but every member that reused it carries the same cost_dollars
+    # in its tool log. Dedup by normalized query so a cache hit isn't re-summed
+    # (reproduced: one $0.005 query doubling to $0.010).
+    paid_queries: set[str] = set()
 
     def _model_id(rec: dict) -> str | None:
         return rec.get("id") or rec.get("ranker_id") or rec.get("chairman_id")
 
     def _acc(rec: dict) -> None:
-        nonlocal calls, tin, tout, retries, web, cost, web_cost, any_priced
+        nonlocal calls, tin, tout, retries, web, cost, web_cost, priced_calls
         # Prefer the tool-loop aggregates for web_search members (calls/tokens/
         # attempts summed across every iteration); fall back to the single-call
         # figures for plain (non-web) members.
@@ -777,6 +796,10 @@ def _compute_usage(
         else:
             rec_in = rec.get("tokens_in") or 0
             rec_out = rec.get("tokens_out") or 0
+            # `attempts` is set on the SUCCESS path and, since the retry/attempt
+            # count is now carried on CouncilHTTPError, on the FAILURE path too —
+            # so a member that exhausted its retries and errored still counts its
+            # real HTTP attempts instead of vanishing as 0 calls.
             attempts = rec.get("attempts")
             if attempts is not None:
                 calls += 1
@@ -786,19 +809,28 @@ def _compute_usage(
         tool_log = rec.get("tool_calls_log") or []
         web += len(tool_log)
         for entry in tool_log:
-            c = entry.get("cost_dollars") if isinstance(entry, dict) else None
-            if isinstance(c, (int, float)):
-                web_cost += c
+            if not isinstance(entry, dict):
+                continue
+            c = entry.get("cost_dollars")
+            if not isinstance(c, (int, float)):
+                continue
+            q = entry.get("query")
+            nq = " ".join(str(q).strip().lower().split()) if q else None
+            if nq is not None and nq in paid_queries:
+                continue  # duplicate query already billed once this run
+            if nq is not None:
+                paid_queries.add(nq)
+            web_cost += c
 
         cfg = CATALOG.get(_model_id(rec) or "")
         if cfg:
             pin, pout = cfg.get("price_in"), cfg.get("price_out")
-            if pin is not None:
-                cost += rec_in * pin / 1_000_000
-                any_priced = True
-            if pout is not None:
-                cost += rec_out * pout / 1_000_000
-                any_priced = True
+            if pin is not None or pout is not None:
+                if pin is not None:
+                    cost += rec_in * pin / 1_000_000
+                if pout is not None:
+                    cost += rec_out * pout / 1_000_000
+                priced_calls += 1
 
     # A failed round-1 member is carried forward by identity (the SAME dict
     # object) into every later round's stage1, so dedup by id() to avoid
@@ -827,7 +859,12 @@ def _compute_usage(
         "web_search_cache_hits": search_cache.hits if search_cache is not None else 0,
         "web_search_cost_usd": round(web_cost, 6),
         "retries": retries,
-        "reference_payg_cost_usd": round(cost, 6) if any_priced else None,
+        "reference_payg_cost_usd": round(cost, 6) if priced_calls else None,
+        # Coverage of the PAYG estimate: how many contributing calls had a
+        # per-token list price (vs flat-rate members with none). When
+        # priced_calls << llm_calls the estimate covers only a slice of the run —
+        # never read reference_payg_cost_usd as the whole run's PAYG cost.
+        "reference_payg_priced_calls": priced_calls,
     }
 
 
@@ -854,9 +891,14 @@ def _build_summary(
     stage2: list[dict],
     aggregate: list[tuple[str, float, int]],
     stage3: dict | None,
+    rounds: int = 1,
 ) -> dict:
     """Machine-readable verdict for automation (n8n etc.): winner, confidence,
-    failed models, top disagreements, recommended next action."""
+    failed models, top disagreements, recommended next action.
+
+    `rounds` = the requested round count for this run, so the recommendation
+    builder never suggests an action already taken (synthesis, or "another round"
+    when already at MAX_ROUNDS)."""
     model_by_id = {s["id"]: s["model"] for s in stage1}
 
     failed_models: list[dict] = []
@@ -889,13 +931,23 @@ def _build_summary(
     # checks: members behind one gateway+credential (the 5 OCG models share
     # OPENCODE_GO_KEY) fail together and tend to agree for the same reasons. So a
     # verdict only counts as corroborated when the winner was ranked by ≥2 peers
-    # AND the survivors span ≥2 independent provider domains. Below quorum the
+    # AND those peers span ≥2 independent provider domains. Below quorum the
     # winner is at most one opinion — we never let it read as "high" confidence
-    # or an automatic "adopt" (guards F2's 2-model preset and F1's OCG-outage
-    # case where 5 "votes" collapse to a single failure domain).
-    survivor_domains = {provider_domain(s["id"]) for s in stage1 if s["status"] == "ok"}
-    provider_domains = len(survivor_domains)
-    independent_votes = aggregate[0][2] if aggregate else 0
+    # or an automatic "adopt" (guards the 2-model "cheap" preset and an OCG-outage
+    # where 5 "votes" collapse to a single failure domain).
+    #
+    # Both signals are computed from the rankers that ACTUALLY ranked the winner
+    # (not from all stage-1 survivors): a cross-provider survivor whose own
+    # ranking failed must not lend the winner a second domain it never voted from.
+    winner_voter_ids: set[str] = set()
+    if winner_id is not None:
+        for s in stage2:
+            if s["status"] != "ok":
+                continue
+            if any(r["ranked_id"] == winner_id for r in s["rankings"]):
+                winner_voter_ids.add(s["ranker_id"])
+    independent_votes = len(winner_voter_ids)
+    provider_domains = len({provider_domain(rid) for rid in winner_voter_ids})
     quorum_ok = independent_votes >= 2 and provider_domains >= 2
 
     # Confidence from the margin between the top two aggregate means. A single
@@ -940,9 +992,22 @@ def _build_summary(
     top_disagreements = top_disagreements[:3]
 
     ok_stage1 = sum(1 for s in stage1 if s["status"] == "ok")
+    synthesized_ok = bool(stage3 and stage3.get("status") == "ok")
+    # A provider/health failure (auth/402/timeout/5xx/rate/network) is worth a
+    # healthcheck; a purely parse-level failure (invalid_json / tool-exhaustion,
+    # both classified "error") is not — healthcheck would come back green.
+    health_failures = [
+        f for f in failed_models if f.get("failure_reason") not in (None, "error")
+    ]
     # "half or more of the members had a failure" — integer math (no float /2).
     if failed_models and len(failed_models) * 2 >= len(stage1):
-        next_action = "Several models failed — run model_healthcheck and retry."
+        if health_failures:
+            next_action = "Several models failed on provider errors — run model_healthcheck and retry."
+        else:
+            next_action = (
+                "Several models returned unparseable rankings — retry; if it "
+                "persists, shorten/clarify the question."
+            )
     elif not quorum_ok:
         next_action = (
             f"Not independently corroborated — winner rests on {independent_votes} "
@@ -951,9 +1016,20 @@ def _build_summary(
             "review) before adopting."
         )
     elif confidence == "low" or top_disagreements:
-        next_action = (
-            "Low agreement — consider synthesis=True or another round (rounds=2)."
-        )
+        # Only suggest levers NOT already pulled: synthesis if it didn't run,
+        # another round if we're below MAX_ROUNDS.
+        levers: list[str] = []
+        if not synthesized_ok:
+            levers.append("synthesis=True")
+        if rounds < MAX_ROUNDS:
+            levers.append(f"another round (rounds={rounds + 1})")
+        if levers:
+            next_action = "Low agreement — consider " + " or ".join(levers) + "."
+        else:
+            next_action = (
+                "Low agreement, and synthesis + max rounds already applied — treat "
+                "as genuinely contested; get human review."
+            )
     else:
         next_action = "Clear winner — adopt the top-ranked answer."
 
@@ -961,12 +1037,19 @@ def _build_summary(
         "winner_id": winner_id,
         "winner_model": winner_model,
         "winner_mean_score": winner_mean,
+        # This signal is the AGREEMENT margin between correlated LLM rankers — it
+        # measures how much the council concurred, NOT whether the answer is
+        # correct (there's no evidence/test gate). `agreement_confidence` is the
+        # honest name; `confidence` is kept as a back-compat alias for existing
+        # automation. Gate risk-sensitive auto-adopt on quorum_ok + human review,
+        # not on this number alone.
         "confidence": confidence,
+        "agreement_confidence": confidence,
         # Corroboration signals: independent_votes = peers who ranked the winner;
-        # provider_domains = distinct provider/credential domains among survivors.
-        # single_provider flags a council that can't self-corroborate. quorum_ok
-        # is the gate behind the "adopt"/"high" verdict — downstream automation
-        # can branch on it without re-deriving the rule.
+        # provider_domains = distinct provider/credential domains among THOSE
+        # winner-voting peers. single_provider flags a council that can't
+        # self-corroborate. quorum_ok is the gate behind the "adopt"/"high"
+        # verdict — downstream automation can branch on it without re-deriving it.
         "independent_votes": independent_votes,
         "provider_domains": provider_domains,
         "single_provider": provider_domains < 2,
@@ -1246,5 +1329,5 @@ async def run_council(
         "stage3": stage3,
         "notes": notes,
         "usage": _compute_usage(rounds_detail, stage3, search_cache),
-        "summary": _build_summary(stage1, stage2, aggregate, stage3),
+        "summary": _build_summary(stage1, stage2, aggregate, stage3, rounds=rounds),
     }

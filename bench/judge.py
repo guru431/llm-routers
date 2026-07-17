@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -42,7 +43,21 @@ def _vault() -> dict[str, str]:
 
 JUDGE_ENDPOINT = (os.environ.get("JUDGE_ENDPOINT") or _vault().get("JUDGE_ENDPOINT")
                   or "http://localhost:8765/v1/chat/completions")
+# claude-agent-server refuses requests without a bearer token; the judge runs
+# through it, so send CLAUDE_AGENT_TOKEN (else every call 401s).
+JUDGE_TOKEN = os.environ.get("CLAUDE_AGENT_TOKEN") or _vault().get("CLAUDE_AGENT_TOKEN")
 JUDGE_MODEL = "claude-opus-4-8"
+
+
+def _resp_hash(task: dict, response_text: str) -> str:
+    """Fingerprint of exactly what was judged: judge model + task id + rubric +
+    the response text. Used as part of the "already judged" key so that re-running
+    a cell whose response CHANGED gets re-scored instead of reusing a stale score
+    tied only to (model_id, task_id)."""
+    rubric = RUBRIC.get(task["category"], "")
+    h = hashlib.sha256()
+    h.update("\x1e".join((JUDGE_MODEL, task["id"], rubric, response_text)).encode("utf-8"))
+    return h.hexdigest()[:16]
 
 RUBRIC = {
     "edit": "Оцени правку русской устной речи. 5=идеально (пунктуация, без слов-паразитов, смысл не изменён), 3=ok с минорами, 1=серьёзные искажения смысла, 0=мусор/пусто/отказ.",
@@ -77,15 +92,20 @@ def _parse_score(text: str) -> int | None:
     return None
 
 
-def call_judge(prompt: str) -> dict:
+def call_judge(prompt: str, bypass_cache: bool = False) -> dict:
     body = {
         "model": JUDGE_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.0,
         "max_tokens": 250,
     }
+    # --rescore must re-evaluate, not return the agent-server's cached judgement
+    # for an identical prompt (`cache: false` is the server's documented bypass).
+    if bypass_cache:
+        body["cache"] = False
+    headers = {"Authorization": f"Bearer {JUDGE_TOKEN}"} if JUDGE_TOKEN else {}
     try:
-        r = httpx.post(JUDGE_ENDPOINT, json=body, timeout=120.0)
+        r = httpx.post(JUDGE_ENDPOINT, json=body, headers=headers, timeout=120.0)
         if r.status_code != 200:
             return {"score": None, "reason": f"judge HTTP {r.status_code}: {r.text[:200]}"}
         data = r.json()
@@ -103,7 +123,10 @@ def build_prompt(task: dict, response_text: str) -> str:
     # `SCORE:` / "ignore the above" instruction (prompt-injection to inflate its
     # own judge score). The explicit "opaque data" instruction below is the
     # primary defence; this is belt-and-suspenders.
-    truncated = response_text[:2000].replace('"""', '" " "')
+    # 8000 chars ≈ the full 2048-token answer budget (~4 chars/token); the old
+    # 2000-char cap silently truncated longer answers and penalised them on the
+    # completeness rubrics. Kept bounded to cap judge prompt size.
+    truncated = response_text[:8000].replace('"""', '" " "')
     return f"""Ты строгий judge для бенчмарка LLM. Задача и эталон ниже.
 
 ЗАДАЧА (категория {task['category']}):
@@ -122,7 +145,12 @@ USER: {task['user']}
 Верни строго одну строку формата: `SCORE: N | REASON: краткое обоснование (≤20 слов)`. N — целое 0-5."""
 
 
-def load_judged() -> set[tuple[str, str]]:
+def load_judged() -> set[tuple[str, str, str]]:
+    """Set of (model_id, task_id, resp_hash) already scored. resp_hash pins the
+    score to the exact response text, so a changed answer is NOT treated as judged.
+    Legacy records without resp_hash use "" — they still match if the current
+    response also hashes to "" (never), i.e. legacy rows are effectively re-judged
+    once, which is the safe direction."""
     if not JUDGE_FILE.exists():
         return set()
     seen = set()
@@ -135,7 +163,7 @@ def load_judged() -> set[tuple[str, str]]:
             # so a re-run can re-score just those pairs without a full --rescore.
             if d.get("score") is None:
                 continue
-            seen.add((d["model_id"], d["task_id"]))
+            seen.add((d["model_id"], d["task_id"], d.get("resp_hash", "")))
         except Exception:
             pass
     return seen
@@ -169,7 +197,10 @@ def main():
                 continue
             if args.task and tid != args.task:
                 continue
-            if (model_id, tid) in judged:
+            task = tasks_by_id.get(tid)
+            if task is None:
+                continue
+            if (model_id, tid, _resp_hash(task, r["text"])) in judged:
                 continue
             pairs.append((model_id, tid, r["text"]))
 
@@ -206,11 +237,12 @@ def main():
                 continue
             sys.stderr.write(f"[{i}/{len(pairs)}] {mid} / {tid}... ")
             sys.stderr.flush()
-            res = call_judge(build_prompt(task, text))
+            res = call_judge(build_prompt(task, text), bypass_cache=args.rescore)
             sys.stderr.write(f"score={res['score']}\n")
             rec = {
                 "model_id": mid, "task_id": tid,
                 "score": res["score"], "reason": res["reason"],
+                "resp_hash": _resp_hash(task, text),
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
             }
             out.write(json.dumps(rec, ensure_ascii=False) + "\n")

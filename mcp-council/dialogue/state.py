@@ -34,8 +34,16 @@ TERMINAL_PHASES = {"done", "error", "cancelled", "interrupted"}
 _DEFAULT_DUMP_DIR = Path(__file__).parent.parent / "logs" / "dialogues"
 
 
+def resolve_dump_dir(default: Path) -> Path:
+    """Single source of the COUNCIL_DIALOGUES_DIR precedence: the env override if
+    set, else `default`. EVERY dialogue writer AND the loader/GC route through
+    this, so an override can't send snapshots to one directory while recovery
+    reads another (which silently lost sessions on restart)."""
+    return Path(os.environ.get("COUNCIL_DIALOGUES_DIR") or default)
+
+
 def _dump_dir() -> Path:
-    return Path(os.environ.get("COUNCIL_DIALOGUES_DIR") or _DEFAULT_DUMP_DIR)
+    return resolve_dump_dir(_DEFAULT_DUMP_DIR)
 
 
 def _unlink_dump(session_id: str) -> None:
@@ -74,6 +82,10 @@ class DialogueState:
     error: str | None = None
     result_markdown: str | None = None
     dump_path: str | None = None
+    # Non-fatal degradations that still let the run reach 'done' (a failed final
+    # summary, a diversity-monitor call that errored). Surfaced by dialogue_result
+    # so a 'done' with partial quality isn't indistinguishable from a clean run.
+    warnings: list[str] = field(default_factory=list)
 
     # Original session parameters, preserved so dialogue_continue can resume
     # with the same configuration instead of silently downgrading to defaults.
@@ -140,6 +152,7 @@ def _state_from_dump(data: dict) -> DialogueState:
     s.started_at = data.get("started_at")
     s.finished_at = data.get("finished_at")
     s.error = data.get("error")
+    s.warnings = data.get("warnings") or []
     s.result_markdown = data.get("result_markdown")
     s.dump_path = data.get("dump_path")
     s.web_search = bool(data.get("web_search"))
@@ -162,7 +175,14 @@ def _state_from_dump(data: dict) -> DialogueState:
         s.finished_at = s.finished_at or now
     else:
         s.phase = phase
-    s.last_activity = s.finished_at or s.started_at or s.created_at
+    # Prefer the persisted last_activity so a session that was active/finished
+    # recently (but CREATED hours ago) isn't judged stale by the loader — matches
+    # the runtime GC, which also keys on last_activity. Fall back through the
+    # timing fields for snapshots written before last_activity was persisted.
+    s.last_activity = (
+        data.get("last_activity")
+        or s.finished_at or s.started_at or s.created_at
+    )
     return s
 
 
@@ -189,9 +209,15 @@ def load_persisted_dialogues() -> int:
                 pass
             continue
         # Drop snapshots past the inactive timeout so a restart doesn't resurrect
-        # ancient sessions; matches the in-memory GC horizon. Unlink so the file
-        # isn't rescanned on every subsequent restart.
-        if now - (data.get("created_at") or 0) > INACTIVE_TIMEOUT_SECONDS:
+        # ancient sessions; matches the in-memory GC horizon (which keys on
+        # last_activity, NOT created_at — a long-lived but recently-active session
+        # must survive a restart). Unlink so the file isn't rescanned every restart.
+        activity = (
+            data.get("last_activity")
+            or data.get("finished_at") or data.get("started_at")
+            or data.get("created_at") or 0
+        )
+        if now - activity > INACTIVE_TIMEOUT_SECONDS:
             try:
                 f.unlink(missing_ok=True)
             except OSError:
@@ -340,6 +366,7 @@ def snapshot(state: DialogueState) -> dict:
         "moderator": state.moderator,
         "elapsed_ms": elapsed_ms,
         "error": state.error,
+        "warnings": list(state.warnings),
         "has_result": state.result_markdown is not None,
         "dump_path": state.dump_path,
         "diversity_scores": list(state.diversity_scores),

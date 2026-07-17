@@ -22,7 +22,7 @@ from dialogue.prompts import (
     render_position_split_prompt,
     render_summary_prompt,
 )
-from dialogue.state import DialogueState, mark_phase
+from dialogue.state import DialogueState, mark_phase, resolve_dump_dir
 
 DUMP_DIR = Path(__file__).parent.parent / "logs" / "dialogues"
 
@@ -67,7 +67,15 @@ async def generate_positions(
         raise RuntimeError(f"expected {n} positions, got {len(parsed)}: {parsed}")
     if not all(isinstance(p, str) for p in parsed):
         raise RuntimeError(f"all positions must be strings, got: {parsed}")
-    return parsed
+    stripped = [p.strip() for p in parsed]
+    # A blank or duplicate position collapses the debate (two debaters handed the
+    # same or an empty thesis defend nothing distinct) — reject so the moderator
+    # is re-run rather than silently seeding a degenerate debate.
+    if any(not p for p in stripped):
+        raise RuntimeError(f"moderator returned a blank position: {parsed}")
+    if len({p.lower() for p in stripped}) != len(stripped):
+        raise RuntimeError(f"moderator returned duplicate positions: {parsed}")
+    return stripped
 
 
 def cfg_to_participant(cfg: dict) -> dict:
@@ -132,7 +140,7 @@ async def run_debate(
         do_critique=True,
         per_round_hook=None,
         start_round=state.current_round + 1,
-        dump_dir=DUMP_DIR,
+        dump_dir=resolve_dump_dir(DUMP_DIR),
     )
 
     mark_phase(state, "summarizing")
@@ -154,6 +162,8 @@ async def run_debate(
         "latency_ms": summary_result.latency_ms,
         "status": summary_result.status,
     })
+    if summary_result.status != "ok":
+        state.warnings.append(f"final summary failed: {summary_result.error}")
 
     from dialogue.render import format_dialogue_markdown
     state.result_markdown = format_dialogue_markdown(state, question)
@@ -161,4 +171,4 @@ async def run_debate(
     # phase (otherwise dumps freeze at "summarizing" and post-mortem inspection
     # makes it look like the run never finished).
     mark_phase(state, "done")
-    state.dump_path = str(await asyncio.to_thread(write_dump, state, base_dir=DUMP_DIR))
+    state.dump_path = str(await asyncio.to_thread(write_dump, state, base_dir=resolve_dump_dir(DUMP_DIR)))

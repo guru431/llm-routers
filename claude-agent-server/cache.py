@@ -102,6 +102,15 @@ class ResponseCache:
         now = time.monotonic()
         nbytes = len(value.encode("utf-8", errors="replace"))
         with self._lock:
+            if nbytes > self._max_bytes:
+                # A single value larger than the whole byte budget must NOT be
+                # stored: eviction never drops the sole/just-added entry, so it
+                # would sit above max_bytes forever. Drop any stale entry for the
+                # key and skip caching (caller re-computes on next request).
+                old = self._data.pop(key, None)
+                if old is not None:
+                    self._total_bytes -= old[2]
+                return
             old = self._data.get(key)
             if old is not None:
                 # Перезапись — вычитаем старый размер, переносим в MRU

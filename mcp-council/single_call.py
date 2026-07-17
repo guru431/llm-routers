@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 
+from models import effective_max_tokens
 from openai_client import call_openai_compat
 from web_search import WEB_SEARCH_TOOL_SPEC
 from web_search_tool import run_with_tool_loop
@@ -31,7 +32,7 @@ async def run_single(
     if not api_key:
         raise RuntimeError(f"env var {cfg['env_key']} not set for {cfg['id']}")
 
-    effective_max = max(max_tokens, cfg.get("min_max_tokens", 0))
+    effective_max = effective_max_tokens(max_tokens, cfg)
     messages = [{"role": "user", "content": prompt}]
 
     if web_search:

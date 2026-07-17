@@ -48,7 +48,14 @@ python server.py --host 0.0.0.0     # открыть на LAN (токен обя
 .\install_task.ps1
 ```
 
-Создаёт задачу `\codex_agent_server` с запуском при старте системы (через `pythonw.exe`). Как и `claude_agent_server`, задача ведётся отдельно от общего реестра задач.
+Создаёт задачу `\codex_agent_server` с запуском при старте системы (через `pythonw.exe`).
+
+**Managed vs standalone.** Если на машине задачами управляет центральный реестр
+задач + syncer, managed-путь — это запись в реестре: менять расписание/delay/
+restart/host правкой реестра и повторным запуском синкера, а **не** этим скриптом
+(прямой `Register-ScheduledTask` создаёт дрейф, который синк ревертит).
+`install_task.ps1` предназначен только для **standalone** (unmanaged) развёртывания
+и **отказывается перезаписывать** уже существующую задачу без явного `-Force`.
 
 ## Режимы и переключение
 
@@ -180,9 +187,18 @@ print(resp.choices[0].message.content)
 
 В read-only режиме tool calling эмулируется через prompt-injection (как в `claude-agent-server`): описания функций инжектируются в system-промпт, модель возвращает `<tool_call>{...}</tool_call>`, парсер конвертирует в `tool_calls`. Точность ниже native tool use. В агентном режиме Codex использует **свои** нативные инструменты — клиентские `tools` туда не передаются.
 
+**Поддерживаемый subset схемы функций.** Инжектируется только плоское описание: имя,
+описание и параметры первого уровня (`name: type [required] — description`). **Не**
+передаются вложенные `object`/`array` схемы, `items`, `enum`, `oneOf`/`anyOf`/`allOf`,
+`default`, `additionalProperties` — модель их не увидит; сложную вложенность опишите
+словами в `description`. `content` — строка или массив `{"type":"text"}` частей
+(image/audio игнорируются).
+
 ## Совместимость OpenAI API
 
-Drop-in для клиентов OpenAI, но `codex exec` не отдаёт часть knob'ов:
+Совместим с клиентами OpenAI Chat Completions в пределах поддерживаемого subset'а
+(таблица ниже + [Tool calling](#tool-calling)) — не полная реализация API. `codex exec`
+не отдаёт часть knob'ов:
 
 | Поле | Поведение |
 |---|---|
@@ -199,7 +215,20 @@ Drop-in для клиентов OpenAI, но `codex exec` не отдаёт ча
 
 ## Безопасность
 
-- Bind по умолчанию `127.0.0.1`. Для LAN (`--host 0.0.0.0`) — bearer-токен обязателен (и так требуется).
+- **Транспорт — только loopback либо TLS-прокси.** Сервер говорит по plain HTTP.
+  Единственный встроенно-поддерживаемый режим — bind на `127.0.0.1` (default). Bearer
+  поверх незашифрованного HTTP на LAN недостаточен: перехваченный read-token даёт
+  full-host read через Codex, а agent-token — shell/write. Для доступа из LAN не
+  биндить `0.0.0.0` напрямую, а ставить перед сервером **TLS/mTLS reverse proxy** или
+  **VPN**, оставив сам сервер на `127.0.0.1` за прокси. При bind не на loopback сервер
+  печатает предупреждение на старте.
+- **read-only профиль НЕ изолирован от файловой системы хоста** — `codex` запускается
+  тем же OS-пользователем. Каждый вызов идёт с `--ephemeral` (сессии не пишутся на
+  диск), `--ignore-user-config` (не грузится `~/.codex/config.toml`; auth через
+  `CODEX_HOME` продолжает работать) и `--ignore-rules` (не грузятся user/project
+  execpolicy `.rules`), плюс `-c mcp_servers={}`. Это снижает host-coupling, но **не**
+  является песочницей чтения: истинная изоляция (отдельный low-privilege OS-user /
+  контейнер) — на усмотрение оператора развёртывания.
 - `CODEX_AGENT_TOKEN` **обязателен** — без него сервер не стартует (exit 2). Все endpoint кроме `/health` требуют `Authorization: Bearer`.
 - **`/health` без токена отдаёт только `{"status":"ok"}`.** Конфиг (model/default_sandbox/uptime/security) — лишь при валидном read-токене, чтобы endpoint не фингерпринтил сервер.
 - **Раздельные токены для read-only и workspace-write.** read-only — `CODEX_AGENT_TOKEN`; workspace-write дополнительно требует `CODEX_AGENT_AGENT_TOKEN`. Утечка read-only токена не даёт агентного write/exec. Если agent-токен не задан — workspace-write `403`.

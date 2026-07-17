@@ -201,7 +201,9 @@ async def test_http_429_retried_then_succeeds(patch_httpx, monkeypatch):
     )
     assert out["content"] == "hello world"
     # First-attempt backoff per RETRY_BACKOFFS[0].
-    assert sleeps == [15]
+    # First retry backoff = RETRY_BACKOFFS[0] plus up to RETRY_JITTER_SECONDS of
+    # random jitter (de-synchronizes a fan-out), so assert the range not an exact value.
+    assert len(sleeps) == 1 and 15 <= sleeps[0] < 15 + 5
 
 
 async def test_reasoning_content_surfaced_for_deepseek_thinking(patch_httpx):
@@ -254,7 +256,9 @@ async def test_http_500_retried_then_succeeds(patch_httpx, monkeypatch):
         max_tokens=10,
     )
     assert out["content"] == "hello world"
-    assert sleeps == [15]
+    # First retry backoff = RETRY_BACKOFFS[0] plus up to RETRY_JITTER_SECONDS of
+    # random jitter (de-synchronizes a fan-out), so assert the range not an exact value.
+    assert len(sleeps) == 1 and 15 <= sleeps[0] < 15 + 5
 
 
 async def test_http_500_exhausted_raises(patch_httpx, monkeypatch):

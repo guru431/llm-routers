@@ -160,18 +160,27 @@ COUNCIL_DEFAULT: list[str] = [
 # EXPLICIT lists so a change is a one-line edit that never silently reshuffles a
 # caller's council. No "local" preset: the catalog has no local-runtime members.
 #
-# CAVEAT: these labels are a HEURISTIC, not a bench-validated product ranking.
-# The last local bench run predates the current catalog (models have since
-# changed — e.g. GLM 5.2, Kimi K2.7-code), and raw bench results are gitignored,
-# so "best"/"balanced"/"cheap" are NOT reproducible claims for today's model
-# versions. Editing CATALOG can silently degrade a preset. Treat as a starting
-# point; re-run bench/ and update deliberately before relying on preset quality.
-# Note also "cheap" is a single-provider pair (both OCG) — a two-model, one-domain
-# council never earns a quorum-backed "adopt" verdict (see council._build_summary).
+# Names are DESCRIPTIVE (member count / composition), NOT a quality ranking: the
+# old "best"/"balanced"/"cheap" labels implied a bench-validated ordering the
+# project can't back — the last local bench predates the current catalog (GLM 5.2,
+# Kimi K2.7-code) and raw results are gitignored. Editing CATALOG can silently
+# change what a preset contains; re-run bench/ before treating any preset as
+# "better". "fast-2-single-provider" is deliberately explicit that it's a
+# single-domain pair (both OCG) — a two-model, one-domain council never earns a
+# quorum-backed "adopt" verdict (see council._build_summary).
 PRESETS: dict[str, list[str]] = {
-    "best": list(COUNCIL_DEFAULT),                    # all strongest members
-    "balanced": ["deepseek-pro", "glm", "gemini"],    # strong + mid mix, fewer calls
-    "cheap": ["glm", "qwen"],                          # lowest-cost OCG pair
+    "full": list(COUNCIL_DEFAULT),                          # all 7 default members
+    "diverse-3": ["deepseek-pro", "glm", "gemini"],         # 3 members, 2 domains
+    "fast-2-single-provider": ["glm", "qwen"],              # 2 members, 1 domain (OCG)
+}
+
+# Back-compat aliases for the old quality-implying names. Kept so existing callers
+# passing models_preset="best"/"balanced"/"cheap" don't break; prefer the neutral
+# names above.
+PRESET_ALIASES: dict[str, str] = {
+    "best": "full",
+    "balanced": "diverse-3",
+    "cheap": "fast-2-single-provider",
 }
 
 
@@ -188,12 +197,33 @@ class UnknownPresetError(RuntimeError):
 
 
 def resolve_preset(name: str) -> list[str]:
-    """Return the model-id list for a named preset (copy). Raises UnknownPresetError."""
-    if name not in PRESETS:
+    """Return the model-id list for a named preset (copy). Accepts the neutral
+    names and the legacy best/balanced/cheap aliases. Raises UnknownPresetError."""
+    canonical = PRESET_ALIASES.get(name, name)
+    if canonical not in PRESETS:
         raise UnknownPresetError(
-            f"unknown preset: '{name}'. Available: {sorted(PRESETS)}"
+            f"unknown preset: '{name}'. Available: {sorted(PRESETS)} "
+            f"(aliases: {sorted(PRESET_ALIASES)})"
         )
-    return list(PRESETS[name])
+    return list(PRESETS[canonical])
+
+
+# Absolute completion-token ceiling. server._clamp_tokens caps the CALLER-REQUESTED
+# value at MAX_RESPONSE_TOKENS_HARD_CAP (16384); a model's `min_max_tokens` then
+# RAISES that to a provider-required floor (kimi/minimax/gemini need 30000 or they
+# truncate). So the effective per-call cap can exceed 16384 by design — this is the
+# real hard ceiling that even a min_max_tokens floor cannot cross, so a bad catalog
+# entry can't request an unbounded completion.
+ABSOLUTE_MAX_TOKENS = 32768
+
+
+def effective_max_tokens(requested: int, member: dict) -> int:
+    """The completion-token budget actually sent for `member`: the caller's
+    requested value, raised to the model's min_max_tokens floor, then capped at
+    the absolute ceiling. Single source of truth so requested vs effective caps
+    don't drift across call sites (council stages, single_call)."""
+    floored = max(requested, member.get("min_max_tokens", 0))
+    return min(floored, ABSOLUTE_MAX_TOKENS)
 
 
 def provider_domain(model_id: str) -> str:

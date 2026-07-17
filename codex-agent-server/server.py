@@ -156,6 +156,14 @@ AUTH_TOKEN = os.getenv("CODEX_AGENT_TOKEN") or None
 # with 403 while read-only keeps working with AUTH_TOKEN (backward-compatible).
 AGENT_AUTH_TOKEN = os.getenv("CODEX_AGENT_AGENT_TOKEN") or None
 
+
+def _tokens_collapse_privilege() -> bool:
+    """True when a workspace-write agent token is set AND equal to the read-only
+    token — which collapses the read/agent privilege separation (a leaked read
+    token would also unlock workspace-write). Timing-safe compare."""
+    return bool(AGENT_AUTH_TOKEN) and bool(AUTH_TOKEN) and hmac.compare_digest(
+        AGENT_AUTH_TOKEN.encode("utf-8"), AUTH_TOKEN.encode("utf-8"))
+
 # cmd.exe metacharacters: codex resolves to a `.cmd` shim on Windows, so a
 # workdir path containing these would be reinterpreted by cmd.exe (BatBadBut)
 # even though it passed realpath containment. Reject such workdirs early.
@@ -191,6 +199,10 @@ def resolve_model(requested: str | None) -> tuple[str, str | None]:
     `<base>-agent` → (base, "workspace-write"); `<base>` → (base, None).
     Raises BadRequest if the base model is not in the whitelist.
     """
+    # A non-string `model` (e.g. numeric JSON) would blow up on name.endswith()
+    # below with an AttributeError → worker crash. Reject it as a client error.
+    if requested is not None and not isinstance(requested, str):
+        raise BadRequest(f"model must be a string: {requested!r}")
     name = requested or DEFAULT_MODEL
     suffix_mode = None
     base = name
@@ -323,6 +335,11 @@ def parse_tool_calls(text: str) -> tuple[list[dict], str]:
     for match in pattern.finditer(text):
         try:
             data = json.loads(match.group(1))
+            # A block whose JSON is not an object (e.g. a bare `1` or a list)
+            # is not a valid call: leave it as text instead of crashing on
+            # data.get(...). Malformed model tool blocks degrade to text.
+            if not isinstance(data, dict):
+                continue
             calls.append({
                 "id": f"call_{uuid.uuid4().hex[:8]}",
                 "type": "function",
@@ -352,12 +369,17 @@ def _kill_process_tree(proc: "subprocess.Popen") -> None:
         return
     if sys.platform == "win32":
         try:
-            subprocess.run(
+            r = subprocess.run(
                 ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
                 capture_output=True,
                 creationflags=CREATE_NO_WINDOW,
                 timeout=15,
             )
+            # F29: taskkill can fail (race, elevation) WITHOUT raising — verify
+            # the process actually died and hard-kill the shim if not, so a live
+            # orphaned node can't keep burning the subscription / holding outfile.
+            if r.returncode != 0 and proc.poll() is None:
+                proc.kill()
         except Exception:
             try:
                 proc.kill()
@@ -383,11 +405,21 @@ def run_codex(prompt: str, *, model_base: str, sandbox: str,
     so the service doesn't trigger the user's zabbix/n8n/etc. on every call.
     """
     # `-` (stdin) goes first as the PROMPT positional; flags follow.
+    # Isolation flags (F2): `--ephemeral` writes no session files to disk;
+    # `--ignore-user-config` skips ~/.codex/config.toml (auth still uses
+    # CODEX_HOME, so the subscription login keeps working) so the request can't
+    # pick up the user's providers/model/settings; `--ignore-rules` skips
+    # user/project execpolicy .rules. These shrink host coupling but do NOT
+    # sandbox host reads — read-only codex still has full host read access
+    # (see README security section).
     cmd = [
         CODEX_BIN, "exec", "-",
         "-m", model_base,
         "--sandbox", sandbox,
         "--skip-git-repo-check",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
         "--color", "never",
         "-c", "mcp_servers={}",
     ]
@@ -619,6 +651,16 @@ class Handler(BaseHTTPRequestHandler):
         if tools is not None and not isinstance(tools, list):
             self._send(400, {"error": {"message": "tools must be a list", "type": "invalid_request_error"}})
             return
+        # Each tool must be an object with an object `function` (a `tools:[null]`
+        # or `function: 1` would otherwise reach build_tools_system_prompt and
+        # crash on .get(...) → worker exception. Client error → 400.
+        if isinstance(tools, list):
+            for t in tools:
+                if not isinstance(t, dict) or not isinstance(t.get("function", {}), dict):
+                    self._send(400, {"error": {
+                        "message": "each tool must be an object with a function object",
+                        "type": "invalid_request_error"}})
+                    return
 
         try:
             timeout = int(body.get("timeout", 300))
@@ -930,16 +972,17 @@ def main():
         sys.exit(2)
 
     # Equal read-only and agent tokens collapse the privilege separation: a
-    # leaked read-only token would then also unlock workspace-write. Warn loudly
-    # rather than silently breaking the read-only/agent split.
-    if AGENT_AUTH_TOKEN and hmac.compare_digest(
-        AGENT_AUTH_TOKEN.encode("utf-8"), AUTH_TOKEN.encode("utf-8")
-    ):
-        logger.warning(
+    # leaked read-only token would then also unlock workspace-write. Refuse to
+    # start (F30) — a mere warning is invisible under pythonw and would leave the
+    # write gate silently open.
+    if _tokens_collapse_privilege():
+        logger.error(
             "CODEX_AGENT_AGENT_TOKEN equals CODEX_AGENT_TOKEN — read-only/agent "
-            "privilege separation is broken; a leaked read token also grants "
-            "workspace-write. Use a DISTINCT agent token."
+            "privilege separation is broken (a leaked read token would also grant "
+            "workspace-write). Set a DISTINCT agent token, or unset it to disable "
+            "workspace-write, and restart."
         )
+        sys.exit(2)
 
     try:
         subprocess.run([CODEX_BIN, "--version"], capture_output=True, check=True, creationflags=CREATE_NO_WINDOW)
@@ -954,6 +997,18 @@ def main():
                      args.host, args.port, exc)
         sys.exit(1)
     logger.info("Codex Agent Server started: http://%s:%d", args.host, args.port)
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        # F3: this server speaks plain HTTP. Bound off loopback, the bearer
+        # token crosses the LAN in clear text — and it unlocks full host read
+        # (read-only) or file-write/exec (agent). The only supported LAN
+        # exposure is behind a TLS/mTLS reverse proxy or a VPN.
+        logger.warning(
+            "Bound to %s (NOT loopback) over PLAIN HTTP: the bearer token travels "
+            "the network unencrypted and unlocks full host read (and file-write/exec "
+            "with the agent token). Do not expose directly on the LAN — put a "
+            "TLS/mTLS reverse proxy or a VPN in front and bind to 127.0.0.1 behind it.",
+            args.host,
+        )
     logger.info("Models: %s", EXPOSED_MODELS)
     logger.info("Default sandbox: %s", DEFAULT_SANDBOX)
     if WORKDIR:

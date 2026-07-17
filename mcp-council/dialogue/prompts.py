@@ -147,16 +147,28 @@ def render_response_prompt(
     round_n: int,
     files_section: str | None,
     anti_agreement_rule: str | None,
+    opening: bool = False,
 ) -> str:
-    task = (
-        f"You are entering round {round_n}, phase response.\n"
-        "You have just seen critiques from other participants (see history above, "
-        "phase=critique entries for the current round).\n"
-        "Write your updated position in 1-3 short paragraphs. You MUST:\n"
-        "- Address the critique aimed at you (defend or concede a specific point).\n"
-        "- Advance your argument — do not merely restate it.\n"
-        "Stay in your assigned role/position."
-    )
+    if opening:
+        # Round 1 (or any round with no preceding critique): there is nothing to
+        # "address" yet, so don't instruct the model to respond to critique it
+        # never saw — ask for a clear opening statement instead.
+        task = (
+            f"You are entering round {round_n}, the OPENING round.\n"
+            "No one has spoken yet. State your initial position on the topic in "
+            "1-3 short paragraphs: make your strongest concrete argument for your "
+            "assigned role/position. Be specific; avoid hedging."
+        )
+    else:
+        task = (
+            f"You are entering round {round_n}, phase response.\n"
+            "You have just seen critiques from other participants (see history above, "
+            "phase=critique entries for the current round).\n"
+            "Write your updated position in 1-3 short paragraphs. You MUST:\n"
+            "- Address the critique aimed at you (defend or concede a specific point).\n"
+            "- Advance your argument — do not merely restate it.\n"
+            "Stay in your assigned role/position."
+        )
     return _assemble_prompt(
         role=role_descriptor,
         topic=topic,

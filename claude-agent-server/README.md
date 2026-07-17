@@ -51,7 +51,9 @@ python server.py --host 0.0.0.0           # открыть на LAN (по умо
 
 ### `POST /v1/chat/completions` — OpenAI-compatible
 
-Drop-in замена для любого клиента, который умеет OpenAI API.
+Совместим с клиентами OpenAI Chat Completions в пределах поддерживаемого subset'а
+(см. [Совместимость OpenAI API](#совместимость-openai-api) и [Tool calling](#tool-calling)) —
+не полная реализация API.
 
 ```bash
 curl -X POST http://localhost:8765/v1/chat/completions \
@@ -164,6 +166,14 @@ Tool calling эмулируется через prompt injection: описани�
 
 **Ограничение:** это не настоящий native tool use Anthropic API — точность ниже, чем у прямого вызова `claude` CLI с MCP-серверами. На штатных бенчмарках tool-calling работает примерно в 7 случаях из 12 (см. `test_server.py`).
 
+**Поддерживаемый subset схемы функций.** В system-prompt инжектируется только плоское
+описание: имя функции, описание и параметры первого уровня (`name: type [required] — description`).
+**Не** передаются вложенные `object`/`array` схемы (`properties.*.properties`, `items`),
+`enum`, `oneOf`/`anyOf`/`allOf`, `default`, `additionalProperties` и прочие JSON-Schema
+конструкции — модель их не увидит. Для сложных вложенных аргументов опишите структуру
+словами в `description`. `content` сообщений поддерживается как строка или массив
+`{"type":"text"}` частей (image/audio-части игнорируются).
+
 ```python
 client.chat.completions.create(
     model="claude-opus-4-8",
@@ -224,9 +234,26 @@ from openai import OpenAI
 client = OpenAI(base_url="http://host:8765/v1", api_key="sk-local-<random>")
 ```
 
+**Транспорт — только loopback либо TLS-прокси.** Сервер говорит по plain HTTP.
+Единственный встроенно-поддерживаемый режим — bind на `127.0.0.1` (default). Bearer
+поверх незашифрованного HTTP на LAN недостаточен: токен уходит по сети в открытом
+виде, его можно перехватить/переиграть. Если нужен доступ из LAN — не биндить
+`0.0.0.0` напрямую, а поставить перед сервером **TLS/mTLS reverse proxy** (nginx/caddy)
+или пускать трафик через **VPN**, оставив сам сервер на `127.0.0.1` за прокси. При
+bind не на loopback сервер печатает предупреждение на старте.
+
+**Профиль «чат» НЕ изолирован от файловой системы хоста.** `claude` запускается тем
+же OS-пользователем, что и сервер. Чтобы урезать поверхность, каждый вызов идёт с
+`--tools ""` (все встроенные инструменты Claude отключены — сервер эмулирует
+tool-calling через prompt-injection и никогда не даёт Claude реально исполнять
+Bash/Edit/Read), `--strict-mcp-config` (пользовательские MCP-серверы не загружаются)
+и `--no-session-persistence` (сессии не пишутся на диск). Это снижает host-action
+surface, но **не является песочницей**: истинная изоляция (отдельный low-privilege
+OS-user / контейнер с allowlisted mount) — на усмотрение оператора развёртывания.
+
 Рекомендации:
 - В open Internet — не выставлять.
-- В LAN — задать `CLAUDE_AGENT_TOKEN`, либо поставить за reverse proxy (nginx/caddy) с собственной auth-логикой.
+- В LAN — только за TLS/mTLS reverse proxy или через VPN; сам сервер на `127.0.0.1`.
 - Для локальной разработки — `--host 127.0.0.1` (тогда токен не нужен).
 
 ## Тесты

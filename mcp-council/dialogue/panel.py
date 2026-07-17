@@ -25,7 +25,7 @@ from dialogue.prompts import (
     render_summary_prompt,
     render_response_prompt,
 )
-from dialogue.state import DialogueState, mark_phase
+from dialogue.state import DialogueState, mark_phase, resolve_dump_dir
 
 DUMP_DIR = Path(__file__).parent.parent / "logs" / "dialogues"
 
@@ -275,7 +275,7 @@ async def run_panel(
             check_round_failures(state, round_n)
 
         # Mid-run persistence — snapshot after each completed round.
-        await maybe_dump(state, DUMP_DIR)
+        await maybe_dump(state, resolve_dump_dir(DUMP_DIR))
 
     mark_phase(state, "summarizing")
     summary_prompt = render_summary_prompt(topic=question, history=state.history, mode="panel")
@@ -293,8 +293,10 @@ async def run_panel(
         "latency_ms": summary_result.latency_ms,
         "status": summary_result.status,
     })
+    if summary_result.status != "ok":
+        state.warnings.append(f"final summary failed: {summary_result.error}")
 
     from dialogue.render import format_dialogue_markdown
     state.result_markdown = format_dialogue_markdown(state, question)
     mark_phase(state, "done")
-    state.dump_path = str(await asyncio.to_thread(write_dump, state, base_dir=DUMP_DIR))
+    state.dump_path = str(await asyncio.to_thread(write_dump, state, base_dir=resolve_dump_dir(DUMP_DIR)))

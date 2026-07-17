@@ -25,6 +25,13 @@ from web_search import (
 # On turn MAX+1 we additionally pass tool_choice="none" — see run_with_tool_loop.
 MAX_TOOL_ITERATIONS = 12
 
+# Run-wide ceiling on ACTUAL (billed) Exa searches, shared via RunSearchCache
+# across every member + the stage-3 chairman. Per-member MAX_TOOL_ITERATIONS
+# bounds one member; without a run cap a 7-member council + chairman could reach
+# ~100 distinct paid queries. 40 ≈ $0.20 worst-case — past it, further distinct
+# queries return a budget_exhausted note to the model instead of hitting Exa.
+MAX_RUN_SEARCHES = 40
+
 CallFn = Callable[..., Awaitable[dict]]
 ProgressFn = Callable[[str, dict[str, Any]], None]
 
@@ -43,12 +50,13 @@ class RunSearchCache:
     identical queries collapse to a single Exa call rather than racing.
     """
 
-    def __init__(self, search_fn=None) -> None:
+    def __init__(self, search_fn=None, max_searches: int = MAX_RUN_SEARCHES) -> None:
         # None → resolve the module-level web_search_exa at call time so test
         # patches of `web_search_tool.web_search_exa` take effect.
         self._search_fn = search_fn
         self._tasks: dict[str, asyncio.Task] = {}
         self._lock = asyncio.Lock()
+        self._max_searches = max_searches
         self.hits = 0
         self.misses = 0
 
@@ -61,6 +69,13 @@ class RunSearchCache:
         async with self._lock:
             task = self._tasks.get(key)
             if task is None:
+                # Run-wide budget: a NEW distinct query is a billed Exa call.
+                # Cached repeats (task is not None) are always free and allowed.
+                if self.misses >= self._max_searches:
+                    raise WebSearchError(
+                        f"run web_search budget exhausted "
+                        f"({self._max_searches} searches) — answer from what you have"
+                    )
                 self.misses += 1
                 fn = self._search_fn or web_search_exa
                 task = asyncio.ensure_future(fn(query))
@@ -81,7 +96,16 @@ async def execute_tool_call(
 ) -> tuple[str, dict]:
     """Execute one OpenAI-style tool_call (currently only web_search).
     Returns (tool_message_content, log_entry)."""
-    fn = tc.get("function", {}) or {}
+    # A model can emit a malformed tool_calls array — a bare scalar, a null, or
+    # `function` set to a non-object. Guard every access so a bad shape becomes a
+    # tool-error message the loop can relay, not an AttributeError that kills the
+    # whole member mid-fan-out.
+    if not isinstance(tc, dict):
+        return ("# Tool call error\nMalformed tool_call (not an object).",
+                {"name": "", "ok": False, "error": "tool_call is not an object"})
+    fn = tc.get("function")
+    if not isinstance(fn, dict):
+        fn = {}
     name = fn.get("name", "")
     raw_args = fn.get("arguments", "")
     log: dict[str, Any] = {"name": name, "raw_arguments": raw_args, "ok": False}
@@ -90,6 +114,11 @@ async def execute_tool_call(
     except (TypeError, ValueError) as e:
         log["error"] = f"invalid JSON in tool arguments: {e}"
         return (f"# Tool call error\nInvalid JSON arguments to `{name}`: {e}", log)
+    # Arguments must be a JSON object; a bare array/string/number would break the
+    # `.get("query")` below with an AttributeError.
+    if not isinstance(args, dict):
+        log["error"] = "tool arguments are not a JSON object"
+        return (f"# Tool call error\nArguments to `{name}` must be a JSON object.", log)
 
     if name == "web_search":
         query = (args.get("query") or "").strip()
@@ -179,7 +208,12 @@ async def run_with_tool_loop(
         loop_tout += result.get("tokens_out") or 0
         loop_attempts += result.get("attempts") or 1
         tool_calls = result.get("tool_calls")
-        if not tool_calls:
+        if not tool_calls or force_no_tools:
+            # Stop here when there are no tool calls OR this is the forced-final
+            # turn: any tool_calls a provider returns despite tool_choice="none"
+            # are DROPPED (not executed), so a run can't exceed
+            # MAX_TOOL_ITERATIONS actual searches by one. If `content` is present
+            # it's the final answer; if not, the caller marks the member error.
             result.update({
                 "loop_calls": loop_calls,
                 "loop_tokens_in": loop_tin,
