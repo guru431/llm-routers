@@ -127,7 +127,24 @@ curl -X POST http://localhost:8766/v1/chat/completions \
 
 ```bash
 curl http://localhost:8766/health
-# {"status":"ok","model":"gpt-5.5","default_sandbox":"read-only","uptime":3600,"security":"authenticated"}
+# {"status":"ok","model":"gpt-5.5","default_sandbox":"read-only","default_profile":"chat","profiles":[...],"uptime":3600,"security":"authenticated"}
+```
+
+### `GET /ready` — readiness probe
+
+Liveness ≠ readiness: `/ready` проверяет реальную готовность обслуживать. Без токена (только булевы флаги, без путей). `200 {ready:true}` либо `503 {ready:false, checks:{...}}`.
+
+```bash
+curl http://localhost:8766/ready
+# {"ready":true,"checks":{"auth_token_configured":true,"cli_found":true,"workdir_root_exists":true,"not_overloaded":true}}
+```
+
+### `GET /metrics` — счётчики (JSON, не prometheus)
+
+Требует bearer. `total_requests`, `active`, `rejected_overload`, `timeouts`, `killed_processes`, `uptime`, latency `median`/`p90`.
+
+```bash
+curl -H "Authorization: Bearer $CODEX_AGENT_TOKEN" http://localhost:8766/metrics
 ```
 
 ## Агентный режим (workspace-write)
@@ -163,7 +180,35 @@ workspace-write требует заданного `CODEX_AGENT_AGENT_TOKEN` (и�
 | `CODEX_AGENT_READ_ROOT` | = `WORKDIR_ROOT` | cwd для read-only codex (не песочница чтения); не задан → warning |
 | `CODEX_AGENT_REASONING` | `medium` | `model_reasoning_effort` |
 | `CODEX_AGENT_MAX_BODY` | `10485760` (10 MB) | макс. размер тела запроса; больше → `413` |
-| `CODEX_AGENT_MAX_CONCURRENCY` | `4` | макс. параллельных codex-вызовов; сверх → `429` |
+| `CODEX_AGENT_MAX_CONCURRENCY` | `4` | макс. параллельных codex-вызовов; сверх → bounded queue |
+| `CODEX_AGENT_QUEUE_WAIT` | `5` | сек. ожидания свободного слота перед `429` (Idea 13) |
+| `CODEX_AGENT_MAX_QUEUE` | `2×concurrency` | макс. ожидающих; переполнение → сразу `429 + Retry-After` |
+
+## Профили, structured output, стриминг и наблюдаемость
+
+### Capability profiles (`profile`)
+
+Явные именованные «позы» запроса поверх механизма sandbox/`-agent`-суффикс (оба сохранены для back-compat). Выбираются полем `profile` в body:
+
+| profile | sandbox | Что означает |
+|---|---|---|
+| `chat` | `read-only` | чистая генерация, без записи/session persistence |
+| `research` | `read-only` | read-only + tool/web эмуляция, но никогда не пишет |
+| `agent` | `workspace-write` | пишет файлы / запускает shell; требует отдельный agent-токен + containment `workdir` |
+
+`profile` имеет приоритет над `sandbox`/суффиксом; `profile:"agent"` + `tools` → `400` (tools форсят read-only). Без `profile` режим определяется прежней логикой, а имя профиля выводится из эффективного sandbox (`workspace-write`→`agent`, иначе `chat`). Активный профиль — в `usage.profile` и `/health` (`default_profile`, `profiles`). **Профиль — ярлык + селектор режима, НЕ OS-песочница чтения** (read-only codex всё равно имеет полный read-доступ к хосту — см. [Безопасность](#безопасность)).
+
+### Structured output (`response_format`)
+
+Поддержаны `{"type":"json_object"}` и `{"type":"json_schema","json_schema":{...}}`: требование вернуть валидный JSON (и схема при json_schema) инжектируется в промпт; ответ валидируется (парс JSON; при json_schema — required-поля верхнего уровня и вложенных object-required, без внешних libs); при провале — **один** repair-retry. `usage.structured_output: true`. Tool-эмуляция передаёт **полную** JSON Schema функции в промпт + валидирует required-аргументы после `<tool_call>` (тоже один repair-retry).
+
+### Настоящий стриминг + cancellation (`stream: true`)
+
+Для **чистого текста** (без tools/response_format) сервер запускает `codex exec --json`, читает JSONL-события построчно и отдаёт реальные OpenAI SSE-deltas по мере поступления; реальный `usage` (`estimate:false`) когда codex его отдаёт. Авторитетный финальный ответ по-прежнему берётся из `-o` outfile — если JSONL-схема не распознана, весь ответ отдаётся одним финальным delta (корректность не зависит от версии схемы событий). При отключении клиента дерево процессов `codex` немедленно убивается (disconnect → cancellation). Если `--json` не даёт JSON — прозрачный fallback на буферный режим. Для `tools`/`response_format` — псевдо-стрим.
+
+### Readiness, metrics, bounded queue
+
+`/ready` и `/metrics` — см. [Endpoints](#endpoints). При перегрузке вместо мгновенного `429` запрос ждёт свободный слот в bounded queue (до `CODEX_AGENT_QUEUE_WAIT` сек); не дождался или очередь переполнена → `429` с `Retry-After`.
 
 ## Использование как провайдера
 
@@ -187,12 +232,11 @@ print(resp.choices[0].message.content)
 
 В read-only режиме tool calling эмулируется через prompt-injection (как в `claude-agent-server`): описания функций инжектируются в system-промпт, модель возвращает `<tool_call>{...}</tool_call>`, парсер конвертирует в `tool_calls`. Точность ниже native tool use. В агентном режиме Codex использует **свои** нативные инструменты — клиентские `tools` туда не передаются.
 
-**Поддерживаемый subset схемы функций.** Инжектируется только плоское описание: имя,
-описание и параметры первого уровня (`name: type [required] — description`). **Не**
-передаются вложенные `object`/`array` схемы, `items`, `enum`, `oneOf`/`anyOf`/`allOf`,
-`default`, `additionalProperties` — модель их не увидит; сложную вложенность опишите
-словами в `description`. `content` — строка или массив `{"type":"text"}` частей
-(image/audio игнорируются).
+**Схема функций.** Инжектируется плоское описание (`name: type [required] — description`)
+**плюс полная JSON Schema** параметров (`Full JSON Schema: {...}`) — вложенные `object`/`array`,
+`items`, `enum`, `oneOf`/`anyOf` доходят до модели дословно. После `<tool_call>` наличие
+required-полей валидируется; при их отсутствии — один repair-retry. `content` — строка или
+массив `{"type":"text"}` частей (image/audio игнорируются).
 
 ## Совместимость OpenAI API
 
@@ -205,13 +249,15 @@ print(resp.choices[0].message.content)
 | `messages` | учитывается (роли system/user/assistant/tool; `assistant.tool_calls` разворачиваются в промпт) |
 | `model` | учитывается (whitelist + суффикс `-agent`; неизвестная → `400`) |
 | `sandbox`, `workdir`/`cwd` | учитываются (см. [Режимы](#режимы-и-переключение)) |
-| `stream` | учитывается — псевдо-стрим; `tool_calls` идут индексированными delta по OpenAI-спеке |
-| `tools` | эмулируется через prompt-injection; **форсит read-only** |
+| `profile` | учитывается — `chat`\|`research`\|`agent` (см. [Profiles](#capability-profiles-profile)) |
+| `stream` | учитывается — **настоящий** стрим для чистого текста (`codex exec --json`, реальные deltas + cancellation при disconnect); для `tools`/`response_format` — псевдо-стрим; `tool_calls` идут индексированными delta |
+| `tools` | эмулируется через prompt-injection; **форсит read-only**; полная JSON Schema + валидация required-аргументов + один repair-retry |
+| `response_format` | учитывается — `json_object` и `json_schema` (инъекция + валидация + один repair-retry; `usage.structured_output:true`). См. [Structured output](#structured-output-response_format) |
 | `timeout`, `reasoning` | учитываются |
 | `tool_choice` | **игнорируется** — CLI не форсит/запрещает конкретный вызов; модель решает сама |
-| `temperature`, `top_p`, `max_tokens`, `n`, `stop`, `response_format` | **игнорируются** — у `codex exec` нет соответствующих ключей |
+| `temperature`, `top_p`, `max_tokens`, `n`, `stop` | **игнорируются** — у `codex exec` нет соответствующих ключей |
 
-`usage` — приблизительная оценка токенов (`len // 4`, помечена `estimate`), плюс поле **`usage.sandbox`** — фактический режим исполнения. Он может отличаться от запрошенной модели: `gpt-5.5-agent` + `tools` реально исполняется как `read-only` (tools форсят read-only), хотя `model` в ответе эхо-отдаёт `gpt-5.5-agent`. Роутеры/логи должны смотреть на `usage.sandbox`, а не на имя модели.
+`usage` — приблизительная оценка токенов (`len // 4`, `estimate:true`) в буферном режиме; в настоящем стриме чистого текста — реальные счётчики из `codex --json`, когда доступны (`estimate:false`). Поля **`usage.sandbox`** — фактический режим исполнения, **`usage.profile`** — активный профиль, **`usage.structured_output`** — если задан `response_format`. Он может отличаться от запрошенной модели: `gpt-5.5-agent` + `tools` реально исполняется как `read-only` (tools форсят read-only), хотя `model` в ответе эхо-отдаёт `gpt-5.5-agent`. Роутеры/логи должны смотреть на `usage.sandbox`, а не на имя модели.
 
 ## Безопасность
 

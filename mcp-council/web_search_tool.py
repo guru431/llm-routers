@@ -9,6 +9,7 @@ import asyncio
 import json
 from typing import Any, Awaitable, Callable
 
+from dlp import scrub_outbound_query
 from openai_client import call_openai_compat
 from web_search import (
     WEB_SEARCH_TOOL_SPEC,
@@ -126,6 +127,23 @@ async def execute_tool_call(
         if not query:
             log["error"] = "empty query"
             return (f"# Web search failed\nEmpty query passed to web_search.", log)
+        # Outbound DLP: a model can echo a secret it saw (context, peer answer,
+        # its own reasoning) into a query and ship it to a third-party search
+        # API. Scrub BEFORE the query leaves the process — a blocked query never
+        # hits Exa and the model gets a refusal it can retry from.
+        _safe, block_reason = scrub_outbound_query(query)
+        if block_reason is not None:
+            log["error"] = block_reason
+            log["dlp_blocked"] = True
+            on_progress("tool_call", {
+                "member_id": member_id, "name": "web_search",
+                "query": "[redacted]", "status": "error", "error": block_reason,
+            })
+            return (
+                f"# Web search blocked (data-loss prevention)\n{block_reason}. "
+                "Rephrase without any secret/credential/local path and try again.",
+                log,
+            )
         try:
             result = await (
                 search_cache.search(query) if search_cache is not None
@@ -143,6 +161,9 @@ async def execute_tool_call(
             "num_results": len(result["results"]),
             "cost_dollars": result.get("cost_dollars"),
             "latency_ms": result.get("latency_ms"),
+            # Result URLs backing this query — consumed by dlp.build_claim_ledger
+            # to map each executed search to the sources it surfaced.
+            "sources": [r.get("url") for r in result["results"] if r.get("url")],
         })
         on_progress("tool_call", {
             "member_id": member_id, "name": "web_search",

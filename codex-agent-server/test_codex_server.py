@@ -184,8 +184,10 @@ def _handler(monkeypatch, headers=None):
     h.headers = headers or {}
     h.sent = []
     h.stream_calls = []
-    h._send = lambda code, data: h.sent.append((code, data))
+    h.stream_live_calls = []
+    h._send = lambda code, data, headers=None: h.sent.append((code, data))
     h._send_stream = lambda *a: h.stream_calls.append(a)
+    h._send_stream_live = lambda *a: h.stream_live_calls.append(a)
     return h
 
 
@@ -294,3 +296,247 @@ def test_stream_tool_calls_indexed():
     assert [t["function"]["name"] for t in tc] == ["a", "b"]
     finish = [p for p in payloads if p["choices"][0]["finish_reason"] == "tool_calls"]
     assert finish and finish[0]["usage"]["estimate"] is True
+
+
+# ── Idea 1: capability profiles ────────────────────────────────────────────
+
+def test_resolve_profile_and_sandbox_explicit():
+    assert server.resolve_profile_and_sandbox(None, None, "chat", None) == ("chat", "read-only")
+    assert server.resolve_profile_and_sandbox(None, None, "research", None) == ("research", "read-only")
+    assert server.resolve_profile_and_sandbox(None, None, "agent", None) == ("agent", "workspace-write")
+
+
+def test_resolve_profile_agent_with_tools_conflicts():
+    with pytest.raises(server.BadRequest):
+        server.resolve_profile_and_sandbox([{"x": 1}], None, "agent", None)
+
+
+def test_resolve_profile_invalid():
+    with pytest.raises(server.BadRequest):
+        server.resolve_profile_and_sandbox(None, None, "bogus", None)
+
+
+def test_resolve_profile_legacy_fallback():
+    # `-agent` suffix (workspace-write) → reported as agent profile
+    assert server.resolve_profile_and_sandbox(None, None, None, "workspace-write") == ("agent", "workspace-write")
+    # nothing → chat + default sandbox (read-only)
+    assert server.resolve_profile_and_sandbox(None, None, None, None) == ("chat", server.DEFAULT_SANDBOX)
+
+
+def test_handle_chat_reports_profile(monkeypatch):
+    monkeypatch.setattr(server, "run_codex", lambda *a, **k: "hi")
+    h = _handler(monkeypatch)
+    h._handle_chat({"messages": [{"role": "user", "content": "hi"}], "profile": "research"})
+    code, data = h.sent[0]
+    assert code == 200
+    assert data["usage"]["profile"] == "research"
+    assert data["usage"]["sandbox"] == "read-only"
+
+
+# ── Idea 12: structured output helpers + validation/repair ─────────────────
+
+def test_json_schema_errors_required_and_nested():
+    schema = {"type": "object", "required": ["a", "b"],
+              "properties": {"b": {"type": "object", "required": ["c"]}}}
+    assert server.json_schema_errors({"a": 1, "b": {"c": 2}}, schema) == []
+    errs = server.json_schema_errors({"a": 1}, schema)
+    assert any("b" in e for e in errs)
+    errs = server.json_schema_errors({"a": 1, "b": {}}, schema)
+    assert any("c" in e for e in errs)  # nested required missing
+    assert server.json_schema_errors([], schema)  # not an object
+
+
+def test_validate_structured_output_fence_and_schema():
+    ok, _ = server.validate_structured_output('```json\n{"x": 1}\n```', None)
+    assert ok
+    ok, err = server.validate_structured_output("not json", None)
+    assert not ok and "not valid JSON" in err
+    ok, err = server.validate_structured_output('{"x": 1}', {"type": "object", "required": ["y"]})
+    assert not ok and "y" in err
+
+
+def test_build_response_format_prompt_types():
+    assert server.build_response_format_prompt({"type": "json_object"}).startswith("# OUTPUT FORMAT")
+    p = server.build_response_format_prompt(
+        {"type": "json_schema", "json_schema": {"schema": {"type": "object", "required": ["a"]}}})
+    assert "JSON Schema" in p and '"required"' in p
+    assert server.build_response_format_prompt({"type": "text"}) is None
+
+
+def test_build_tools_system_prompt_includes_full_schema():
+    prompt = server.build_tools_system_prompt([
+        {"function": {"name": "f", "description": "d", "parameters": {
+            "type": "object", "properties": {"x": {"type": "string", "enum": ["a", "b"]}},
+            "required": ["x"]}}}
+    ])
+    assert "Full JSON Schema" in prompt and '"enum"' in prompt
+
+
+def test_tool_calls_schema_errors_detects_missing():
+    tools = [{"function": {"name": "f", "parameters": {"type": "object", "required": ["x"]}}}]
+    good = [{"function": {"name": "f", "arguments": '{"x": 1}'}}]
+    bad = [{"function": {"name": "f", "arguments": '{}'}}]
+    assert server.tool_calls_schema_errors(good, tools) == []
+    assert server.tool_calls_schema_errors(bad, tools)
+
+
+def test_handle_chat_structured_output_repair(monkeypatch):
+    calls = {"n": 0}
+
+    def fake(*a, **k):
+        calls["n"] += 1
+        return "not json" if calls["n"] == 1 else '{"a": 1}'
+
+    monkeypatch.setattr(server, "run_codex", fake)
+    h = _handler(monkeypatch)
+    h._handle_chat({"messages": [{"role": "user", "content": "hi"}],
+                    "response_format": {"type": "json_object"}})
+    code, data = h.sent[0]
+    assert code == 200
+    assert calls["n"] == 2  # one repair-retry
+    assert data["usage"]["structured_output"] is True
+    assert data["choices"][0]["message"]["content"] == '{"a": 1}'
+
+
+# ── Idea 11: streaming runner + live SSE + cancellation fallback ────────────
+
+class _FakeStdin:
+    def write(self, s):
+        pass
+
+    def close(self):
+        pass
+
+
+class _FakeStream:
+    def __init__(self, lines):
+        self._it = iter(lines)
+
+    def __iter__(self):
+        return self._it
+
+    def close(self):
+        pass
+
+
+class _FakeStreamProc:
+    def __init__(self, lines):
+        self.stdout = _FakeStream(lines)
+        self.stderr = _FakeStream([])
+        self.stdin = _FakeStdin()
+        self.returncode = 0
+        self.pid = 4242
+
+    def poll(self):
+        return 0
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def test_run_codex_stream_parses_events(monkeypatch):
+    lines = [
+        json.dumps({"type": "item.completed",
+                    "item": {"type": "agent_message", "text": "Hello world"}}) + "\n",
+        json.dumps({"type": "turn.completed",
+                    "usage": {"input_tokens": 10, "output_tokens": 5}}) + "\n",
+    ]
+    monkeypatch.setattr(server, "READ_ROOT", None)
+    monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **k: _FakeStreamProc(lines))
+    items = list(server.run_codex_stream("hi", model_base="gpt-5.5", sandbox="read-only"))
+    kinds = [i[0] for i in items]
+    assert ("text", "Hello world") in items
+    assert kinds[-1] == "meta"
+    meta = items[-1][1]
+    assert meta["usage"]["estimate"] is False
+    assert meta["usage"]["prompt_tokens"] == 10 and meta["usage"]["completion_tokens"] == 5
+
+
+def test_run_codex_stream_unsupported_raises(monkeypatch):
+    monkeypatch.setattr(server, "READ_ROOT", None)
+    monkeypatch.setattr(server.subprocess, "Popen",
+                        lambda *a, **k: _FakeStreamProc(["this is not json\n"]))
+    gen = server.run_codex_stream("hi", model_base="gpt-5.5", sandbox="read-only")
+    with pytest.raises(server.StreamUnsupported):
+        next(gen)
+
+
+def test_send_stream_live_emits_real_usage():
+    def gen_items():
+        yield ("text", "Hel")
+        yield ("text", "lo")
+        yield ("meta", {"usage": {"prompt_tokens": 1, "completion_tokens": 2,
+                                  "total_tokens": 3, "estimate": False}, "stop_reason": "stop"})
+
+    g = gen_items()
+    first = next(g)
+    h = server.Handler.__new__(server.Handler)
+    h.send_response = lambda *a, **k: None
+    h.send_header = lambda *a, **k: None
+    h.end_headers = lambda *a, **k: None
+    h.wfile = io.BytesIO()
+    h._send_stream_live(g, first, "id1", 123, "gpt-5.5", {"profile": "chat", "estimate": True, "sandbox": "read-only"})
+    blocks = [b for b in h.wfile.getvalue().decode("utf-8").split("\n\n") if b.strip()]
+    assert blocks[-1] == "data: [DONE]"
+    payloads = [json.loads(b[len("data: "):]) for b in blocks if not b.endswith("[DONE]")]
+    contents = [p["choices"][0]["delta"].get("content") for p in payloads
+                if "content" in p["choices"][0]["delta"]]
+    assert contents == ["Hel", "lo"]
+    finish = [p for p in payloads if p["choices"][0]["finish_reason"] == "stop"]
+    assert finish and finish[0]["usage"]["estimate"] is False
+    assert finish[0]["usage"]["profile"] == "chat"  # base_usage preserved
+
+
+def test_handle_chat_stream_routes_to_live(monkeypatch):
+    def fake_stream(*a, **k):
+        yield ("text", "hi")
+        yield ("meta", {"usage": None, "stop_reason": "stop"})
+
+    monkeypatch.setattr(server, "run_codex_stream", fake_stream)
+    h = _handler(monkeypatch)
+    h._handle_chat({"messages": [{"role": "user", "content": "hi"}], "stream": True})
+    assert h.stream_live_calls and not h.sent
+
+
+def test_handle_chat_stream_fallback_on_unsupported(monkeypatch):
+    def fake_stream(*a, **k):
+        raise server.StreamUnsupported("nope")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(server, "run_codex_stream", fake_stream)
+    monkeypatch.setattr(server, "run_codex", lambda *a, **k: "buffered answer")
+    h = _handler(monkeypatch)
+    h._handle_chat({"messages": [{"role": "user", "content": "hi"}], "stream": True})
+    # fell back to buffered → pseudo-stream
+    assert h.stream_calls and not h.stream_live_calls
+
+
+# ── Idea 13: readiness / metrics / bounded queue ───────────────────────────
+
+def test_acquire_slot_and_release():
+    assert server._acquire_slot() is True
+    server._CODEX_SEM.release()
+
+
+def test_metrics_snapshot_shape():
+    snap = server.METRICS.snapshot(42)
+    for k in ("total_requests", "active", "rejected_overload", "timeouts",
+              "killed_processes", "latency_median_s", "latency_p90_s", "max_queue"):
+        assert k in snap
+
+
+def test_do_get_metrics_and_ready(monkeypatch):
+    # /metrics requires auth; present a valid bearer if the server has a token.
+    hdrs = {"Authorization": f"Bearer {server.AUTH_TOKEN}"} if server.AUTH_TOKEN else {}
+    h = _handler(monkeypatch, headers=hdrs)
+    h.path = "/metrics"
+    h.do_GET()
+    code, data = h.sent[-1]
+    assert code == 200 and "total_requests" in data
+    h.sent.clear()
+    h.path = "/ready"
+    h.do_GET()
+    code, data = h.sent[-1]
+    assert code in (200, 503)
+    assert "ready" in data and "checks" in data
+    assert set(data["checks"]) >= {"auth_token_configured", "cli_found", "not_overloaded"}

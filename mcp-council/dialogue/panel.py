@@ -18,7 +18,7 @@ import asyncio
 
 from dialogue.engine import (
     _run_turn, _run_phase, run_round, write_dump,
-    check_round_failures, maybe_dump,
+    check_round_failures, maybe_dump, emit_event,
 )
 from dialogue.prompts import (
     render_diversity_monitor_prompt,
@@ -74,31 +74,55 @@ def _strip_code_fence(text: str) -> str:
     return _CODE_FENCE_RE.sub("", text).strip()
 
 
+async def run_diversity_check_v2(
+    *,
+    monitor_cfg: dict,
+    responses: dict[str, str],
+) -> dict:
+    """Diversity monitor 2.0 — structured result that DISTINGUISHES a monitor
+    failure from a genuine low score.
+
+    Returns {"status": "ok"|"failed", "score": int, "agreers": [str],
+    "uncertainty": float|None, "reasoning": str, "error": str|None}. A call or
+    parse failure yields status="failed" (score 0) instead of the old (0, [])
+    that was indistinguishable from "everyone genuinely diverged"."""
+    prompt = render_diversity_monitor_prompt(responses=responses)
+    try:
+        raw = await _call_monitor(monitor_cfg, prompt, 256, False)
+    except Exception as e:
+        return {"status": "failed", "score": 0, "agreers": [], "uncertainty": None,
+                "reasoning": "", "error": f"monitor call failed: {type(e).__name__}: {e}"}
+    cleaned = _strip_code_fence(raw)
+    try:
+        parsed = json.loads(cleaned)
+        score = max(0, min(10, int(parsed.get("score", 0))))
+        agreers = parsed.get("agreers") or []
+        if not isinstance(agreers, list):
+            agreers = []
+        agreers = [str(a) for a in agreers]
+        unc = parsed.get("uncertainty")
+        try:
+            uncertainty = float(unc) if unc is not None else None
+        except (TypeError, ValueError):
+            uncertainty = None
+        return {"status": "ok", "score": score, "agreers": agreers,
+                "uncertainty": uncertainty,
+                "reasoning": str(parsed.get("reasoning", ""))[:400], "error": None}
+    except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as e:
+        return {"status": "failed", "score": 0, "agreers": [], "uncertainty": None,
+                "reasoning": "", "error": f"monitor JSON invalid: {e}"}
+
+
 async def run_diversity_check(
     *,
     monitor_cfg: dict,
     responses: dict[str, str],
 ) -> tuple[int, list[str]]:
-    """Ask monitor to rate response similarity. Returns (score, agreers).
-
-    On any parsing failure returns (0, []) — neutral, no re-prompt.
-    """
-    prompt = render_diversity_monitor_prompt(responses=responses)
-    try:
-        raw = await _call_monitor(monitor_cfg, prompt, 256, False)
-    except Exception:
-        return 0, []
-    cleaned = _strip_code_fence(raw)
-    try:
-        parsed = json.loads(cleaned)
-        score = int(parsed.get("score", 0))
-        agreers = parsed.get("agreers") or []
-        if not isinstance(agreers, list):
-            agreers = []
-        agreers = [str(a) for a in agreers]
-        return max(0, min(10, score)), agreers
-    except (json.JSONDecodeError, ValueError, TypeError, AttributeError):
-        return 0, []
+    """Back-compat tuple wrapper around run_diversity_check_v2. Returns
+    (score, agreers); a monitor failure still collapses to (0, []) here — callers
+    wanting to tell failure apart from a real 0 should use run_diversity_check_v2."""
+    r = await run_diversity_check_v2(monitor_cfg=monitor_cfg, responses=responses)
+    return r["score"], r["agreers"]
 
 
 async def _maybe_reprompt(
@@ -253,10 +277,23 @@ async def run_panel(
                 for h in state.history
                 if h["round"] == round_n and h["phase"] == "response" and h.get("status") == "ok"
             }
-            score, agreers = await run_diversity_check(
+            mon = await run_diversity_check_v2(
                 monitor_cfg=monitor_cfg, responses=responses_this_round,
             )
+            score, agreers = mon["score"], mon["agreers"]
             state.diversity_scores.append(score)
+            # Record the monitor OUTCOME separately from the score so a monitor
+            # failure (call/parse error) is no longer indistinguishable from a
+            # genuine score=0. A failure is a non-fatal degradation → warning.
+            status_entry = {
+                "round": round_n, "status": mon["status"], "score": score,
+                "uncertainty": mon.get("uncertainty"), "agreers": agreers,
+                "post_reprompt_score": None, "delta": None,
+            }
+            if mon["status"] == "failed":
+                state.warnings.append(
+                    f"diversity monitor failed in round {round_n}: {mon.get('error')}"
+                )
             await _maybe_reprompt(
                 state=state,
                 round_n=round_n,
@@ -269,6 +306,21 @@ async def run_panel(
                 max_tokens=max_tokens,
                 files_section=files_section,
             )
+            # If a reprompt actually ran, re-measure diversity on the reprompted
+            # answers and record the delta — did forcing dissent move the needle?
+            reprompt_ok = {
+                h["id"]: h["text"] for h in state.history
+                if h["round"] == round_n and h["phase"] == "reprompt" and h.get("status") == "ok"
+            }
+            if reprompt_ok and mon["status"] == "ok":
+                merged = dict(responses_this_round)
+                merged.update(reprompt_ok)
+                after = await run_diversity_check_v2(monitor_cfg=monitor_cfg, responses=merged)
+                if after["status"] == "ok":
+                    status_entry["post_reprompt_score"] = after["score"]
+                    status_entry["delta"] = after["score"] - score
+            state.diversity_monitor_status.append(status_entry)
+            emit_event(state, "diversity", status_entry)
             # Re-check after reprompt: a provider that only fails on the heavy
             # reprompt call adds an error entry to this same round that the
             # pre-reprompt check above could not have seen.

@@ -10,6 +10,7 @@ Exposes two flavours of the council deliberation:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import string
 import sys
 import time
@@ -20,7 +21,7 @@ from mcp.server.fastmcp import FastMCP
 
 from models import resolve_member, resolve_members, resolve_preset
 from council import _aggregate as _aggregate_helper  # noqa: F401 — re-exported for tests
-from council import run_council
+from council import run_council, run_adaptive_council
 from council import MAX_ROUNDS as COUNCIL_MAX_ROUNDS
 from single_call import run_single
 from openai_client import CouncilHTTPError
@@ -29,12 +30,39 @@ from sandbox import SandboxError, read_files_with_limit, resolve_and_validate
 import sandbox
 import circuit_breaker
 from healthcheck import healthcheck_models
+from budget import RunBudget, estimate_run
+from response_cache import ResponseCache, fingerprint as _cache_fingerprint
+import capabilities as capabilities_mod
+import retention as retention_mod
 import event_log
 import state as job_state
 
 LOGS_DIR = Path(__file__).parent / "logs"
 
 MAX_RESPONSE_TOKENS_HARD_CAP = 16384
+
+# Process-global opt-in council response cache (cache=True on council_ask). In
+# memory only (privacy: a council brief can carry sensitive context), dropped on
+# restart. See response_cache.ResponseCache.
+_RESPONSE_CACHE = ResponseCache()
+
+
+def _make_budget(
+    deadline_seconds: float | None,
+    max_cost_usd: float | None,
+    max_web_searches: int | None,
+    max_llm_calls: int | None,
+) -> RunBudget | None:
+    """Build a RunBudget when any ceiling is set, else None (no budget)."""
+    if all(v is None for v in (deadline_seconds, max_cost_usd, max_web_searches, max_llm_calls)):
+        return None
+    return RunBudget(
+        deadline_seconds=deadline_seconds,
+        max_cost_usd=max_cost_usd,
+        max_web_searches=max_web_searches,
+        max_llm_calls=max_llm_calls,
+    )
+
 
 mcp = FastMCP("mcp-council")
 
@@ -411,23 +439,31 @@ async def _do_council_ask_async(
     web_search: bool = False,
     models: list[str] | None = None,
     context_in_stage2: bool = True,
+    *,
+    adaptive: bool = False,
+    cache: bool = False,
+    deadline_seconds: float | None = None,
+    max_cost_usd: float | None = None,
+    max_web_searches: int | None = None,
 ) -> str:
     """Validate paths, read files, run council, log, return markdown brief.
 
     Async core. Use this from MCP-tool (already inside a running event loop).
     For sync callers (tests, CLI) use the `_do_council_ask` wrapper below.
+
+    `adaptive` routes through run_adaptive_council (health-filter + start-small-
+    escalate). `cache` serves an identical prior run from the opt-in response
+    cache (with provenance). deadline/cost/web-search ceilings build a RunBudget.
     """
     start = time.monotonic()
     call_id = _new_call_id()
     prompt_size = 0
-    members_ok_stage1 = 0
-    members_ok_stage2 = 0
-    log_dump_rel: str | None = None
 
     # Resolve member subset before touching the sandbox. Validation errors here
     # are immediate — no half-started runs.
     _validate_council_args(models, rounds, tool="council_ask")
     members = resolve_members(models)
+    budget = _make_budget(deadline_seconds, max_cost_usd, max_web_searches, None)
 
     try:
         max_tokens = _clamp_tokens(max_response_tokens)
@@ -441,16 +477,70 @@ async def _do_council_ask_async(
         prompt_for_size = (files_section or "") + question
         prompt_size = len(prompt_for_size.encode("utf-8"))
 
-        result = await run_council(
-            question=question,
-            files_section=files_section,
-            max_response_tokens=max_tokens,
-            synthesis=synthesis,
-            rounds=rounds,
-            web_search=web_search,
-            members=members,
-            context_in_stage2=context_in_stage2,
-        )
+        async def _run_and_render() -> str:
+            if adaptive:
+                result = await run_adaptive_council(
+                    question, members=members, healthcheck=True,
+                    files_section=files_section, max_response_tokens=max_tokens,
+                    synthesis=synthesis, rounds=rounds, web_search=web_search,
+                    context_in_stage2=context_in_stage2, budget=budget,
+                )
+            else:
+                result = await run_council(
+                    question=question, files_section=files_section,
+                    max_response_tokens=max_tokens, synthesis=synthesis,
+                    rounds=rounds, web_search=web_search, members=members,
+                    context_in_stage2=context_in_stage2, budget=budget,
+                )
+            members_ok_stage1 = sum(1 for s in result["stage1"] if s["status"] == "ok")
+            members_ok_stage2 = sum(1 for s in result["stage2"] if s["status"] == "ok")
+            dump = {
+                "call_id": call_id, "question": question,
+                "context_paths": list(context_paths),
+                "stage1": result["stage1"], "stage2": result["stage2"],
+                "aggregate": result["aggregate"], "borda": result.get("borda"),
+                "rounds_detail": result.get("rounds_detail"),
+                "stage3": result.get("stage3"), "notes": result["notes"],
+                "claim_ledger": result.get("claim_ledger"),
+                "adaptive": result.get("adaptive"),
+                "usage": result.get("usage"), "summary": result.get("summary"),
+            }
+            dump_path = write_full_dump(call_id, dump)
+            log_dump_rel = str(dump_path.relative_to(Path(__file__).parent))
+            latency_ms = int((time.monotonic() - start) * 1000)
+            log_call(
+                call_id=call_id, members_total=len(members),
+                members_ok_stage1=members_ok_stage1,
+                members_ok_stage2=members_ok_stage2,
+                prompt_size_bytes=prompt_size, total_latency_ms=latency_ms,
+                status="ok", log_dump=log_dump_rel,
+            )
+            return format_markdown(question, result)
+
+        if cache:
+            ctx_fp = hashlib.sha256((files_section or "").encode("utf-8")).hexdigest()[:16]
+            key = _cache_fingerprint(
+                question=question, model_configs=members, synthesis=synthesis,
+                rounds=rounds, web_search=web_search, max_tokens=max_tokens,
+                context_fingerprint=ctx_fp,
+            )
+            markdown, prov = await _RESPONSE_CACHE.get_or_compute(key, _run_and_render)
+            if prov is not None:
+                latency_ms = int((time.monotonic() - start) * 1000)
+                log_call(
+                    call_id=call_id, members_total=len(members),
+                    members_ok_stage1=0, members_ok_stage2=0,
+                    prompt_size_bytes=prompt_size, total_latency_ms=latency_ms,
+                    status="ok (cache hit)", log_dump=None,
+                )
+                age = prov.get("age_seconds")
+                markdown = (
+                    f"{markdown}\n\n---\n_Cached council result "
+                    f"(age {age}s, fingerprint {key[:12]}). Pass cache=False to force a fresh run._"
+                )
+            return markdown
+
+        return await _run_and_render()
     except SandboxError as e:
         latency_ms = int((time.monotonic() - start) * 1000)
         log_call(
@@ -478,39 +568,6 @@ async def _do_council_ask_async(
         )
         raise
 
-    members_ok_stage1 = sum(1 for s in result["stage1"] if s["status"] == "ok")
-    members_ok_stage2 = sum(1 for s in result["stage2"] if s["status"] == "ok")
-
-    dump = {
-        "call_id": call_id,
-        "question": question,
-        "context_paths": list(context_paths),
-        "stage1": result["stage1"],
-        "stage2": result["stage2"],
-        "aggregate": result["aggregate"],
-        "rounds_detail": result.get("rounds_detail"),
-        "stage3": result.get("stage3"),
-        "notes": result["notes"],
-        "usage": result.get("usage"),
-        "summary": result.get("summary"),
-    }
-    dump_path = write_full_dump(call_id, dump)
-    log_dump_rel = str(dump_path.relative_to(Path(__file__).parent))
-
-    latency_ms = int((time.monotonic() - start) * 1000)
-    log_call(
-        call_id=call_id,
-        members_total=len(members),
-        members_ok_stage1=members_ok_stage1,
-        members_ok_stage2=members_ok_stage2,
-        prompt_size_bytes=prompt_size,
-        total_latency_ms=latency_ms,
-        status="ok",
-        log_dump=log_dump_rel,
-    )
-
-    return format_markdown(question, result)
-
 
 def _do_council_ask(
     question: str,
@@ -521,6 +578,12 @@ def _do_council_ask(
     web_search: bool = False,
     models: list[str] | None = None,
     context_in_stage2: bool = True,
+    *,
+    adaptive: bool = False,
+    cache: bool = False,
+    deadline_seconds: float | None = None,
+    max_cost_usd: float | None = None,
+    max_web_searches: int | None = None,
 ) -> str:
     """Sync wrapper around `_do_council_ask_async` for tests and CLI use.
 
@@ -531,6 +594,8 @@ def _do_council_ask(
         _do_council_ask_async(
             question, context_paths, max_response_tokens, synthesis, rounds,
             web_search, models, context_in_stage2,
+            adaptive=adaptive, cache=cache, deadline_seconds=deadline_seconds,
+            max_cost_usd=max_cost_usd, max_web_searches=max_web_searches,
         )
     )
 
@@ -546,6 +611,11 @@ async def council_ask(
     models: list[str] | None = None,
     models_preset: str | None = None,
     context_in_stage2: bool = True,
+    adaptive: bool = False,
+    cache: bool = False,
+    deadline_seconds: float | None = None,
+    max_cost_usd: float | None = None,
+    max_web_searches: int | None = None,
 ) -> str:
     """Спросить council по методу Karpathy: independent answers → anonymized
     peer-ranking → optional stage 3 synthesis. Synthesis off by default —
@@ -578,7 +648,22 @@ async def council_ask(
         `web_search(query)` через Exa.ai (per-model exploration, не shared
         context). Stage 2 без поиска; при synthesis=True chairman тоже получает
         web_search для фактчека спорных claim'ов. Добавляет 30-90s к каждому
-        stage 1 вызову и расход на Exa API.
+        stage 1 вызову и расход на Exa API. Исходящие запросы проходят DLP-скраб
+        (dlp.py) — секрет/credential/локальный путь в query блокируется до Exa.
+      adaptive — если True, council идёт health-aware start-small-escalate:
+        pre-flight healthcheck отсеивает нездоровых участников, стартует малый
+        diverse-субсет (≥2 provider-домена) и эскалирует состав только при low
+        quorum / low agreement. Снижает время и число вызовов на «лёгких» вопросах.
+      cache — если True, идентичный предыдущий прогон (тот же вопрос + состав +
+        параметры + контекст) отдаётся из opt-in response-кэша с provenance-
+        футером вместо пересчёта (2-8 мин). In-memory, privacy: не пишется на диск.
+      deadline_seconds / max_cost_usd / max_web_searches — run-budget: graceful
+        deadline (проверяется на границе раундов), потолок reference-PAYG стоимости
+        и число Exa-поисков. Пересекается ceiling → лишние раунды/synthesis
+        пропускаются, готовые ответы сохраняются.
+      В verdict (summary) добавлены evidence-aware поля: verdict.{agreement,
+        evidence,source_quality,risk_class,human_review_required}, borda_winner_id,
+        ranking_methods_agree — для risk-sensitive gating auto-adopt.
 
     Note: блокирующий вызов; для long-running неблокирующего паттерна
     используй council_ask_async / council_status / council_result.
@@ -587,6 +672,8 @@ async def council_ask(
     return await _do_council_ask_async(
         question, context_paths or [], max_response_tokens, synthesis, rounds,
         web_search, models, context_in_stage2,
+        adaptive=adaptive, cache=cache, deadline_seconds=deadline_seconds,
+        max_cost_usd=max_cost_usd, max_web_searches=max_web_searches,
     )
 
 
@@ -978,6 +1065,57 @@ async def council_list_jobs(limit: int = 20) -> list[dict]:
 
 
 @mcp.tool()
+async def council_capabilities() -> dict:
+    """Machine-readable capabilities reference, GENERATED from live constants
+    (models.CATALOG / PRESETS / limits) so it never drifts from the code.
+
+    Returns: models (id/model/provider/role/price/limits), council_default,
+    presets + aliases, provider_domains, run limits (rounds, token caps, web
+    search caps, active-job cap), the tool list, and the verdict axes. Use this
+    to discover what the server offers without reading the source."""
+    return capabilities_mod.build_capabilities()
+
+
+@mcp.tool()
+async def council_purge_logs() -> dict:
+    """Purge expired / over-quota on-disk artifacts (job snapshots, dialogue
+    dumps, event journals, call dumps) under the server's logs directory.
+
+    Respects COUNCIL_LOG_RETENTION_HOURS (default 168h; 0 disables the age sweep)
+    and COUNCIL_LOG_DIR_QUOTA_BYTES (default 256 MB per directory). Returns
+    per-directory removal counts. Safe to call anytime; runs off the event loop."""
+    return await asyncio.to_thread(retention_mod.purge_all, LOGS_DIR)
+
+
+@mcp.tool()
+async def council_estimate(
+    models: list[str] | None = None,
+    models_preset: str | None = None,
+    synthesis: bool = False,
+    rounds: int = 1,
+    web_search: bool = False,
+) -> dict:
+    """Dry-run estimate for a council run BEFORE committing to it: expected LLM
+    calls, tokens, wall-minutes, and a reference-PAYG dollar yardstick (NOT billed
+    — members are flat-rate). Cheap, no LLM calls. Mirror the args you'd pass to
+    council_ask to see its cost first."""
+    resolved = _resolve_models_arg(models, models_preset)
+    members = resolve_members(resolved)
+    # Reference price from the first priced member, if any (yardstick only).
+    price_in = price_out = None
+    for m in members:
+        if m.get("price_in") is not None or m.get("price_out") is not None:
+            price_in, price_out = m.get("price_in"), m.get("price_out")
+            break
+    est = estimate_run(
+        n_members=len(members), rounds=rounds, synthesis=synthesis,
+        web_search=web_search, price_in=price_in, price_out=price_out,
+    )
+    est["members"] = [m["id"] for m in members]
+    return est
+
+
+@mcp.tool()
 async def model_healthcheck(models: list[str] | None = None) -> dict:
     """Ping every CATALOG model (or a subset) with a trivial prompt and report
     per-model health: key present, HTTP status class, latency, empty-response.
@@ -1223,6 +1361,20 @@ async def _dialogue_runner_guard(state, runner_coro_factory) -> None:
             )
         except Exception:
             pass
+    finally:
+        # Emit a terminal event so a Monitor consumer tailing the session's
+        # event journal sees the run is finished, then close the writer (EOF).
+        writer = getattr(state, "event_writer", None)
+        if writer is not None:
+            try:
+                writer.write("result_ready", {
+                    "status": state.phase, "error": state.error,
+                    "current_round": state.current_round,
+                    "dump_path": state.dump_path,
+                })
+            except Exception:
+                pass
+            event_log.close_writer(state.session_id)
 
 
 async def _start_dialogue_session(
@@ -1245,6 +1397,11 @@ async def _start_dialogue_session(
     )
     state.participants = participants
     state.moderator = moderator
+    # Append-only event journal for the dialogue (mirrors the council event log):
+    # per-round events land in logs/events/<session_id>.jsonl for live tail -F.
+    state.event_writer = event_log.open_writer(state.session_id, LOGS_DIR)
+    state.event_writer.write("phase", {"phase": "starting", "mode": mode,
+                                       "participants": [p.get("id") for p in participants]})
 
     task = asyncio.create_task(_dialogue_runner_guard(state, runner_coro_factory))
     dialogue_state.attach_task(state, task)
@@ -1256,10 +1413,11 @@ async def _start_dialogue_session(
         "total_rounds": state.total_rounds,
         "participants": list(state.participants),
         "moderator": state.moderator,
+        "event_log": str(LOGS_DIR / "events" / f"{state.session_id}.jsonl"),
         "hint": (
             "Poll dialogue_status(session_id). When phase=='done', call "
             "dialogue_result(session_id). Full transcript ends up in "
-            f"logs/dialogues/{state.session_id}.json."
+            f"logs/dialogues/{state.session_id}.json. Tail the event_log for live events."
         ),
     }
 
@@ -1647,6 +1805,26 @@ async def dialogue_continue(
         except Exception:
             pass
 
+    runner = _build_resume_runner(state, part_cfgs, mod_cfg, files_section, web_search, max_tokens)
+
+    # Fork/continue share the event journal: reopen (or reuse) a writer so the
+    # continued run's events land in the session's journal.
+    state.event_writer = event_log.open_writer(state.session_id, LOGS_DIR)
+    task = asyncio.create_task(_dialogue_runner_guard(state, runner))
+    dialogue_state.attach_task(state, task)
+    return {
+        "session_id": state.session_id,
+        "mode": state.mode,
+        "phase": state.phase,
+        "total_rounds": state.total_rounds,
+        "participants": list(state.participants),
+        "hint": "Poll dialogue_status(session_id). When phase=='done', call dialogue_result(session_id).",
+    }
+
+
+def _build_resume_runner(state, part_cfgs, mod_cfg, files_section, web_search, max_tokens):
+    """Build the resume runner coroutine-factory for a session's mode. Shared by
+    dialogue_continue and dialogue_fork so the per-mode wiring lives in one place."""
     if state.mode == "debate":
         async def runner(s):
             await run_debate(
@@ -1654,7 +1832,8 @@ async def dialogue_continue(
                 moderator_cfg=mod_cfg, rounds=s.total_rounds, max_tokens=max_tokens,
                 web_search=web_search, files_section=files_section, resume=True,
             )
-    elif state.mode == "panel":
+        return runner
+    if state.mode == "panel":
         async def runner(s):
             await run_panel(
                 state=s, question=s.question, participant_cfgs=part_cfgs,
@@ -1664,11 +1843,8 @@ async def dialogue_continue(
                 diversity_threshold=s.diversity_threshold,
                 devils_advocate_rotation=s.devils_advocate_rotation, resume=True,
             )
-    elif state.mode == "socratic":
-        # Resolve questioner/respondent by their declared role rather than a
-        # positional part_cfgs[0]/[1] assumption. participants order is set at
-        # creation ([questioner, respondent]) and preserved across persist, but a
-        # role lookup makes a future reorder unable to silently swap the two roles.
+        return runner
+    if state.mode == "socratic":
         roles = [p.get("role") for p in state.participants]
         q_idx = roles.index("questioner") if "questioner" in roles else 0
         r_idx = roles.index("respondent") if "respondent" in roles else 1
@@ -1681,18 +1857,90 @@ async def dialogue_continue(
                 rounds=s.total_rounds, max_tokens=max_tokens, web_search=web_search,
                 files_section=files_section, resume=True,
             )
-    else:
-        raise RuntimeError(f"unknown mode {state.mode!r}")
+        return runner
+    raise RuntimeError(f"unknown mode {state.mode!r}")
 
-    task = asyncio.create_task(_dialogue_runner_guard(state, runner))
-    dialogue_state.attach_task(state, task)
+
+@mcp.tool()
+async def dialogue_fork(
+    session_id: str,
+    directive: str,
+    rounds: int = 3,
+) -> dict:
+    """Fork a done/interrupted dialogue into a NEW branch session and continue it.
+
+    Unlike dialogue_continue (which mutates the session in place), fork DEEP-COPIES
+    the source session's transcript into a fresh session_id, injects `directive`,
+    and runs `rounds` more rounds on the COPY — the original stays intact, so you
+    can branch a discussion (e.g. explore two directives from the same point) and
+    compare the two transcripts afterwards.
+
+    Errors: unknown session_id; source not in phase 'done'/'interrupted'; rounds<1.
+    """
+    src = await dialogue_state.get_session(session_id)
+    if src is None:
+        raise RuntimeError(f"unknown session_id: {session_id}")
+    if src.phase not in ("done", "interrupted"):
+        raise RuntimeError(
+            f"dialogue_fork requires source phase 'done' or 'interrupted', got '{src.phase}'"
+        )
+    if rounds < 1:
+        raise RuntimeError(f"rounds must be >= 1, got {rounds}")
+    new_total = src.current_round + rounds
+    if new_total > DIALOGUE_ROUNDS_MAX:
+        raise RuntimeError(f"total rounds would be {new_total}, exceeds max {DIALOGUE_ROUNDS_MAX}")
+
+    # Pre-flight resolves BEFORE creating the fork so a bad catalog/context can't
+    # leave an orphan session.
+    part_cfgs = [_resolve_engine_cfg(p["id"]) for p in src.participants]
+    mod_cfg = _resolve_engine_cfg(src.moderator["id"]) if src.moderator else None
+    files_section = await _build_files_section_or_none(src.context_paths or None)
+
+    import copy
+    fork = await dialogue_state.create_session(
+        mode=src.mode, question_preview=src.question, total_rounds=new_total,
+        web_search=src.web_search, max_tokens=src.max_tokens,
+        context_paths=list(src.context_paths or []),
+    )
+    # Deep-copy the branch point so mutating the fork never touches the source.
+    fork.question = src.question
+    fork.participants = copy.deepcopy(src.participants)
+    fork.moderator = copy.deepcopy(src.moderator)
+    fork.history = [h for h in copy.deepcopy(src.history) if h["phase"] != "summary"]
+    fork.current_round = src.current_round
+    fork.diversity_scores = list(src.diversity_scores)
+    fork.diversity_monitor_status = list(src.diversity_monitor_status)
+    fork.devils_advocates = list(src.devils_advocates)
+    fork.diversity_monitor = src.diversity_monitor
+    fork.diversity_threshold = src.diversity_threshold
+    fork.devils_advocate_rotation = src.devils_advocate_rotation
+    fork.total_rounds = new_total
+
+    mod_id = (fork.moderator or {}).get("id", "moderator")
+    fork.history.append({
+        "round": fork.current_round, "phase": "directive", "id": mod_id,
+        "text": DIRECTIVE_INJECTION_TEMPLATE.format(directive=directive),
+        "latency_ms": 0, "status": "ok",
+    })
+    fork.result_markdown = None
+    dialogue_state.mark_phase(fork, "starting")
+    fork.event_writer = event_log.open_writer(fork.session_id, LOGS_DIR)
+    fork.event_writer.write("phase", {"phase": "starting", "forked_from": session_id})
+
+    runner = _build_resume_runner(fork, part_cfgs, mod_cfg, files_section, fork.web_search, fork.max_tokens)
+    task = asyncio.create_task(_dialogue_runner_guard(fork, runner))
+    dialogue_state.attach_task(fork, task)
     return {
-        "session_id": state.session_id,
-        "mode": state.mode,
-        "phase": state.phase,
-        "total_rounds": state.total_rounds,
-        "participants": list(state.participants),
-        "hint": "Poll dialogue_status(session_id). When phase=='done', call dialogue_result(session_id).",
+        "session_id": fork.session_id,
+        "forked_from": session_id,
+        "mode": fork.mode,
+        "phase": fork.phase,
+        "total_rounds": fork.total_rounds,
+        "participants": list(fork.participants),
+        "hint": (
+            "New branch session — original left intact. Poll dialogue_status on the "
+            "fork's session_id; compare transcripts via dialogue_result on both."
+        ),
     }
 
 

@@ -102,7 +102,24 @@ curl http://localhost:8765/v1/models
 ```bash
 curl http://localhost:8765/health
 # без токена: {"status": "ok"}
-# с токеном:  {"status": "ok", "model": "claude-opus-4-8", "uptime": 3600, "security": "authenticated", "cache": {...}}
+# с токеном:  {"status": "ok", "model": "claude-opus-4-8", "default_profile": "chat", "profiles": [...], "uptime": 3600, "security": "authenticated", "cache": {...}}
+```
+
+### `GET /ready` — readiness probe
+
+Отличается от `/health` (liveness): проверяет, что сервер реально готов обслуживать. Без токена (только булевы флаги, без путей). `200 {ready:true}` либо `503 {ready:false, checks:{...}}`.
+
+```bash
+curl http://localhost:8765/ready
+# {"ready": true, "checks": {"auth_token_configured": true, "cli_found": true, "not_overloaded": true}}
+```
+
+### `GET /metrics` — счётчики (JSON, не prometheus)
+
+Требует bearer. `total_requests`, `active` (in-flight), `rejected_overload`, `timeouts`, `killed_processes`, `cache_hits`/`cache_misses`, `uptime`, latency `median`/`p90` (ring buffer последних N).
+
+```bash
+curl -H "Authorization: Bearer $CLAUDE_AGENT_TOKEN" http://localhost:8765/metrics
 ```
 
 ## Конфигурация
@@ -119,8 +136,36 @@ curl http://localhost:8765/health
 | `CLAUDE_AGENT_CACHE_TTL` | `3600` | TTL записи в секундах |
 | `CLAUDE_AGENT_CACHE_BYTES` | `67108864` (64 MB) | Макс. суммарный размер значений кэша; больше → LRU eviction |
 | `CLAUDE_AGENT_MAX_BODY` | `10485760` (10 MB) | Макс. размер тела запроса; больше → `413` |
-| `CLAUDE_AGENT_MAX_CONCURRENCY` | `4` | Макс. параллельных claude-вызовов; сверх → `429` |
+| `CLAUDE_AGENT_MAX_CONCURRENCY` | `4` | Макс. параллельных claude-вызовов; сверх → bounded queue |
+| `CLAUDE_AGENT_QUEUE_WAIT` | `5` | Сек. ожидания свободного слота в bounded queue перед `429` (Idea 13) |
+| `CLAUDE_AGENT_MAX_QUEUE` | `2×concurrency` | Макс. ожидающих в очереди; переполнение → сразу `429 + Retry-After` |
 | `CLAUDE_AGENT_MAX_SYSTEM_PROMPT` | `7000` | Макс. длина system-prompt (символов). Он идёт в `--system-prompt=` argv; на Windows больше ~8191 символов cmdline упирается в лимит cmd.exe. Больше → `400`. Поднять, если подтверждён больший реальный лимит. |
+
+## Профили, structured output, стриминг и наблюдаемость
+
+### Capability profiles (`profile`)
+
+Явные именованные «позы» запроса поверх дефолтного chat-режима. Выбираются полем `profile` в body:
+
+| profile | claude | Что означает |
+|---|---|---|
+| `chat` (дефолт) | текущее поведение | чистая генерация, без tools/session persistence |
+| `research` | = chat + tool/web эмуляция | ярлык для единообразия с codex-agent-server; у claude нет реального FS-доступа, поэтому research ≡ chat + prompt-injection tools (не настоящий OS-доступ) |
+| `agent` | **`400`** | claude не поддерживает workspace-write; для agent-профиля используйте `codex-agent-server` |
+
+Активный профиль отражается в `usage.profile` ответа и в `/health` (`default_profile`, `profiles`). **Профиль — это ярлык, НЕ OS-песочница** (см. [Безопасность](#безопасность)).
+
+### Structured output (`response_format`)
+
+Поддержаны `{"type":"json_object"}` и `{"type":"json_schema","json_schema":{...}}`. Требование вернуть валидный JSON (и сама схема при json_schema) инжектируется в system-prompt; ответ валидируется (парсится как JSON; при json_schema — проверяются required-поля верхнего уровня и вложенных object-required, без внешних libs); при провале — **один** repair-retry с сообщением об ошибке. В ответе `usage.structured_output: true`. Tool-эмуляция теперь передаёт **полную** JSON Schema функции (nested objects/items/enum) в промпт, а после парсинга `<tool_call>` валидирует required-аргументы (тоже один repair-retry).
+
+### Настоящий стриминг + cancellation (`stream: true`)
+
+Для **чистого текста** (без tools и без response_format) сервер читает `claude --output-format stream-json` построчно и отдаёт реальные инкрементальные OpenAI SSE-deltas по мере поступления, с реальными `usage`/`stop_reason` (`estimate:false`). Если клиент отключается — запись в сокет падает, и дерево процессов `claude` немедленно убивается (client-disconnect → cancellation). Если формат stream-json не распознан — прозрачный fallback на буферный режим. Для `tools`/`response_format` стрим остаётся псевдо-стримом (нужно буферизовать весь ответ для парсинга/валидации), `usage` — оценка `len//4` (`estimate:true`).
+
+### Readiness, metrics, bounded queue
+
+`/ready` и `/metrics` — см. [Endpoints](#endpoints). При перегрузке вместо мгновенного `429` запрос ждёт свободный слот в bounded queue (до `CLAUDE_AGENT_QUEUE_WAIT` сек); не дождался или очередь переполнена → `429` с заголовком `Retry-After`.
 
 ## Использование
 
@@ -166,13 +211,12 @@ Tool calling эмулируется через prompt injection: описани�
 
 **Ограничение:** это не настоящий native tool use Anthropic API — точность ниже, чем у прямого вызова `claude` CLI с MCP-серверами. На штатных бенчмарках tool-calling работает примерно в 7 случаях из 12 (см. `test_server.py`).
 
-**Поддерживаемый subset схемы функций.** В system-prompt инжектируется только плоское
-описание: имя функции, описание и параметры первого уровня (`name: type [required] — description`).
-**Не** передаются вложенные `object`/`array` схемы (`properties.*.properties`, `items`),
-`enum`, `oneOf`/`anyOf`/`allOf`, `default`, `additionalProperties` и прочие JSON-Schema
-конструкции — модель их не увидит. Для сложных вложенных аргументов опишите структуру
-словами в `description`. `content` сообщений поддерживается как строка или массив
-`{"type":"text"}` частей (image/audio-части игнорируются).
+**Схема функций.** В system-prompt инжектируется плоское описание (`name: type [required] —
+description`) **плюс полная JSON Schema** параметров (`Full JSON Schema: {...}`) — вложенные
+`object`/`array`, `items`, `enum`, `oneOf`/`anyOf` теперь доходят до модели дословно. После
+парсинга `<tool_call>` наличие required-полей валидируется; при их отсутствии — один
+repair-retry. `content` сообщений поддерживается как строка или массив `{"type":"text"}`
+частей (image/audio-части игнорируются).
 
 ```python
 client.chat.completions.create(
@@ -201,13 +245,15 @@ client.chat.completions.create(
 |---|---|
 | `messages` | учитывается (роли system/user/assistant/tool) |
 | `model` | учитывается (whitelist; неизвестная → `400`) |
-| `stream` | учитывается — псевдо-стрим (CLI отдаёт ответ целиком, режется на SSE-чанки); `tool_calls` идут индексированными delta по OpenAI-спеке |
-| `tools` | эмулируется через prompt-injection (не native tool use) |
+| `stream` | учитывается — **настоящий** стрим для чистого текста (построчный `--output-format stream-json`, реальные deltas + реальный usage `estimate:false` + cancellation при disconnect); для `tools`/`response_format` — псевдо-стрим (буфер → SSE-чанки); `tool_calls` идут индексированными delta по OpenAI-спеке |
+| `tools` | эмулируется через prompt-injection (не native tool use); полная JSON Schema в промпте + валидация required-аргументов + один repair-retry |
+| `response_format` | учитывается — `json_object` и `json_schema` (инъекция + валидация + один repair-retry; `usage.structured_output:true`). См. [Structured output](#structured-output-response_format) |
+| `profile` | учитывается — `chat`\|`research` (`agent` → `400`). См. [Profiles](#capability-profiles-profile) |
 | `timeout` | учитывается, зажимается в `[10, 600]` секунд |
 | `tool_choice` | **игнорируется** — CLI не умеет форсить/запрещать конкретный вызов; модель решает сама |
-| `temperature`, `top_p`, `max_tokens`, `n`, `stop`, `response_format` | **игнорируются** — у `claude -p` нет соответствующих ключей (для JSON-режима используйте system-prompt) |
+| `temperature`, `top_p`, `max_tokens`, `n`, `stop` | **игнорируются** — у `claude -p` нет соответствующих ключей |
 
-`usage` — приблизительная оценка токенов (`len // 4`, помечена `estimate`), не реальные счётчики.
+`usage` — приблизительная оценка токенов (`len // 4`, `estimate:true`) в буферном режиме; в настоящем стриме чистого текста — **реальные** счётчики из stream-json (`estimate:false`). Поле `usage.profile` показывает активный профиль.
 
 ## Безопасность
 

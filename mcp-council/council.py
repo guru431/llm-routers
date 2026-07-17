@@ -16,7 +16,10 @@ import string
 import time
 from typing import Any, Awaitable, Callable
 
-from healthcheck import _classify_error
+import adaptive
+from budget import RunBudget
+from dlp import build_claim_ledger
+from healthcheck import _classify_error, healthcheck_models
 from models import CATALOG, effective_max_tokens, provider_domain, resolve_members
 from openai_client import call_openai_compat
 from prompts import (
@@ -27,6 +30,7 @@ from prompts import (
     STAGE3_WEB_SEARCH_NOTE,
     build_stage1_round_n_user,
     build_stage1_user,
+    build_stage2_repair_user,
     build_stage2_user,
     build_stage3_user,
 )
@@ -356,6 +360,65 @@ def _split_synthesis_and_analysis(content: str) -> tuple[str, dict | None]:
     return prose, _normalize_analysis(parsed)
 
 
+class _Stage2ParseError(ValueError):
+    """Ranking JSON was present but unusable (wrong shape, empty, all-invalid).
+    Distinguished from a raw json failure so the caller knows a repair-retry with
+    a strict-JSON demand is worth one attempt."""
+
+
+def _normalize_stage2(content: str | None, pseudonyms: dict[str, str]) -> tuple[list[dict], int | None]:
+    """Parse + normalize a ranker's raw content into (clean_rankings, confidence).
+
+    Raises _Stage2ParseError on any unusable result (no JSON object, rankings not
+    a list, empty, or every entry dropped by normalization). Pure — no I/O — so
+    both the first attempt and the repair-retry share exactly one parser."""
+    parsed = _extract_json(content or "")  # ValueError on no JSON object
+    rankings = parsed.get("rankings", [])
+    if not isinstance(rankings, list):
+        raise _Stage2ParseError("rankings is not a list")
+    if not rankings:
+        raise _Stage2ParseError("rankings is empty")
+
+    raw_conf = parsed.get("confidence")
+    confidence: int | None = None
+    try:
+        if raw_conf is not None:
+            cval = int(raw_conf)
+            if 1 <= cval <= 10:
+                confidence = cval
+    except (TypeError, ValueError):
+        confidence = None
+
+    letter_to_id = {v: k for k, v in pseudonyms.items()}
+    clean: list[dict] = []
+    seen_ranked: set[str] = set()
+    for r in rankings:
+        if not isinstance(r, dict):
+            continue
+        letter = str(r.get("member", "")).strip().upper()
+        if letter not in letter_to_id:
+            continue
+        ranked_id = letter_to_id[letter]
+        if ranked_id in seen_ranked:
+            continue
+        try:
+            score = int(r.get("score"))
+        except (TypeError, ValueError):
+            continue
+        if not (1 <= score <= 10):
+            continue
+        seen_ranked.add(ranked_id)
+        clean.append({
+            "ranked_id": ranked_id,
+            "pseudonym": letter,
+            "score": score,
+            "reasoning": str(r.get("reasoning", ""))[:1200],
+        })
+    if not clean:
+        raise _Stage2ParseError("no valid rankings after normalization")
+    return clean, confidence
+
+
 async def _run_member_stage2(
     ranker: dict,
     question: str,
@@ -401,15 +464,21 @@ async def _run_member_stage2(
     max_tokens = effective_max_tokens(max_response_tokens, ranker)
     extra = dict(ranker.get("extra") or {})
 
-    try:
-        result = await call_fn(
+    async def _rank_call(msgs: list[dict], *, force_json: bool) -> dict:
+        return await call_fn(
             base_url=ranker["base_url"],
             api_key=api_key,
             model=ranker["model"],
-            messages=messages,
+            messages=msgs,
             max_tokens=max_tokens,
             extra_payload=extra,
+            # Schema-enforced on the repair pass: providers that honour
+            # response_format emit strict JSON, tightening a wobbly first reply.
+            response_format={"type": "json_object"} if force_json else None,
         )
+
+    try:
+        result = await _rank_call(messages, force_json=False)
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -425,92 +494,56 @@ async def _run_member_stage2(
             "attempts": getattr(e, "attempts", None),
         }
 
-    try:
-        parsed = _extract_json(result["content"])
-        rankings = parsed.get("rankings", [])
-        if not isinstance(rankings, list):
-            raise ValueError("rankings is not a list")
-        # An empty rankings list almost always means the model returned
-        # something malformed (e.g. bare `{}`) that we accepted as "ok JSON".
-        # Treat it as an error so the operator sees the failed ranker in
-        # council_status instead of a silent degradation of council quality.
-        if not rankings:
-            raise ValueError("rankings is empty")
-    except (ValueError, KeyError, AttributeError, TypeError) as e:
-        return {
-            "ranker_id": ranker["id"],
-            "status": "error",
-            "error": f"invalid_json: {e}",
-            "rankings": [],
-            "confidence": None,
-            "pseudonyms": pseudonyms,
-            "latency_ms": int((time.monotonic() - start) * 1000),
-            "tokens_in": result.get("tokens_in"),
-            "tokens_out": result.get("tokens_out"),
-            "attempts": result.get("attempts"),
-        }
+    # Accumulate token/attempt usage across the (up to 2) parse attempts so a
+    # repaired ranker still counts the tokens both calls actually spent.
+    tin = result.get("tokens_in") or 0
+    tout = result.get("tokens_out") or 0
+    attempts = result.get("attempts")
+    repaired = False
 
-    # Confidence is optional; clamp to [1, 10] if present, else None.
-    raw_conf = parsed.get("confidence")
-    confidence: int | None = None
     try:
-        if raw_conf is not None:
-            cval = int(raw_conf)
-            if 1 <= cval <= 10:
-                confidence = cval
-    except (TypeError, ValueError):
-        confidence = None
-
-    # Normalize: keep only entries with valid pseudonym letter and integer score.
-    letter_to_id = {v: k for k, v in pseudonyms.items()}
-    clean: list[dict] = []
-    seen_ranked: set[str] = set()
-    for r in rankings:
-        if not isinstance(r, dict):
-            continue
-        letter = str(r.get("member", "")).strip().upper()
-        if letter not in letter_to_id:
-            continue
-        ranked_id = letter_to_id[letter]
-        # One ranker ranks each peer AT MOST once. A model repeating the same
-        # pseudonym would otherwise let a single ranker inflate a candidate's
-        # independent-vote count — drop the duplicate, keep the first.
-        if ranked_id in seen_ranked:
-            continue
+        clean, confidence = _normalize_stage2(result.get("content"), pseudonyms)
+    except (_Stage2ParseError, ValueError, KeyError, TypeError) as first_err:
+        # ONE repair retry: re-ask with the parse error + strict-JSON demand +
+        # response_format. Calibrated ranking is only as good as the JSON we can
+        # read; a single retry recovers the common "fenced/with-prose" failure
+        # without a runaway loop.
+        repair_messages = messages + [
+            {"role": "assistant", "content": result.get("content") or ""},
+            {"role": "user", "content": build_stage2_repair_user(str(first_err))},
+        ]
+        result2 = None
         try:
-            score = int(r.get("score"))
-        except (TypeError, ValueError):
-            continue
-        if not (1 <= score <= 10):
-            continue
-        seen_ranked.add(ranked_id)
-        clean.append(
-            {
-                "ranked_id": ranked_id,
-                "pseudonym": letter,
-                "score": score,
-                # 1200 chars ≈ 5-6 sentences with comparative reasoning headroom.
-                "reasoning": str(r.get("reasoning", ""))[:1200],
+            result2 = await _rank_call(repair_messages, force_json=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            result2 = None
+        if result2 is not None:
+            repaired = True
+            tin += result2.get("tokens_in") or 0
+            tout += result2.get("tokens_out") or 0
+            if result2.get("attempts") is not None:
+                attempts = (attempts or 0) + result2["attempts"]
+            try:
+                clean, confidence = _normalize_stage2(result2.get("content"), pseudonyms)
+            except (_Stage2ParseError, ValueError, KeyError, TypeError) as second_err:
+                return {
+                    "ranker_id": ranker["id"], "status": "error",
+                    "error": f"invalid_json: {second_err} (after repair retry)",
+                    "rankings": [], "confidence": None, "pseudonyms": pseudonyms,
+                    "latency_ms": int((time.monotonic() - start) * 1000),
+                    "tokens_in": tin, "tokens_out": tout, "attempts": attempts,
+                    "repaired": True,
+                }
+        else:
+            return {
+                "ranker_id": ranker["id"], "status": "error",
+                "error": f"invalid_json: {first_err}",
+                "rankings": [], "confidence": None, "pseudonyms": pseudonyms,
+                "latency_ms": int((time.monotonic() - start) * 1000),
+                "tokens_in": tin, "tokens_out": tout, "attempts": attempts,
             }
-        )
-
-    # The raw `rankings` list was non-empty, but normalization may have dropped
-    # every entry (unknown pseudonym letters, non-integer/out-of-range scores).
-    # An all-invalid ranking carries no signal — surface it as a failed ranker
-    # instead of silently degrading the aggregate with an empty contribution.
-    if not clean:
-        return {
-            "ranker_id": ranker["id"],
-            "status": "error",
-            "error": "invalid_json: no valid rankings after normalization",
-            "rankings": [],
-            "confidence": None,
-            "pseudonyms": pseudonyms,
-            "latency_ms": int((time.monotonic() - start) * 1000),
-            "tokens_in": result.get("tokens_in"),
-            "tokens_out": result.get("tokens_out"),
-            "attempts": result.get("attempts"),
-        }
 
     return {
         "ranker_id": ranker["id"],
@@ -520,9 +553,10 @@ async def _run_member_stage2(
         "confidence": confidence,
         "pseudonyms": pseudonyms,
         "latency_ms": int((time.monotonic() - start) * 1000),
-        "tokens_in": result.get("tokens_in"),
-        "tokens_out": result.get("tokens_out"),
-        "attempts": result.get("attempts"),
+        "tokens_in": tin,
+        "tokens_out": tout,
+        "attempts": attempts,
+        "repaired": repaired,
     }
 
 
@@ -743,6 +777,48 @@ def _aggregate(stage2_results: list[dict]) -> list[tuple[str, float, int]]:
     return agg
 
 
+def _aggregate_borda(stage2_results: list[dict]) -> list[tuple[str, int, int]]:
+    """Rank-based (Borda) aggregation as a calibration cross-check on the mean.
+
+    Absolute 1-10 means are sensitive to per-ranker scale bias (one ranker lives
+    in 6-8, another in 2-9). Borda is scale-free: each ranker's own scores are
+    converted to an ORDER, and a candidate earns (positions_below) points per
+    ranker — only the relative order matters, so it can't be skewed by a
+    compressed or inflated absolute scale. Ties share the average of the points
+    the tied block spans. Returns (member_id, borda_points, vote_count) sorted by
+    points desc. Reported ALONGSIDE the mean (never replacing it) so a
+    disagreement between the two is itself a signal the winner is fragile."""
+    points: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for s in stage2_results:
+        if s["status"] != "ok":
+            continue
+        ranked = [(r["ranked_id"], r["score"]) for r in s["rankings"]]
+        if not ranked:
+            continue
+        # Sort best→worst; a candidate gets (number of peers strictly below it).
+        # Tie handling: entries with equal score share the average of their block.
+        ranked.sort(key=lambda x: -x[1])
+        n = len(ranked)
+        i = 0
+        while i < n:
+            j = i
+            while j + 1 < n and ranked[j + 1][1] == ranked[i][1]:
+                j += 1
+            # Positions i..j are tied. Borda points for position p (0=best) are
+            # (n-1-p); the tied block shares the average of its positions' points.
+            block_points = sum((n - 1 - p) for p in range(i, j + 1)) / (j - i + 1)
+            for k in range(i, j + 1):
+                mid = ranked[k][0]
+                points[mid] = points.get(mid, 0.0) + block_points
+                counts[mid] = counts.get(mid, 0) + 1
+            i = j + 1
+    agg = [(mid, round(pts, 2), counts[mid]) for mid, pts in points.items()]
+    agg.sort(key=lambda x: x[1], reverse=True)
+    # round() can leave a float; expose ints where whole for clean output.
+    return [(mid, int(p) if float(p).is_integer() else p, c) for mid, p, c in agg]  # type: ignore[misc]
+
+
 def _compute_usage(
     rounds_detail: list[dict],
     stage3: dict | None,
@@ -886,12 +962,54 @@ def _council_failure_reason(error: str | None) -> str:
     return _classify_error(error)
 
 
+# Topics where a confidently-agreed-but-wrong answer is expensive: security,
+# destructive ops, money, irreversible infra changes. On these the verdict never
+# auto-"adopt"s on council agreement alone — agreement between correlated LLMs is
+# not evidence, and the blast radius of a wrong call is high.
+_HIGH_RISK_PATTERN = re.compile(
+    r"\b(security|vulnerab\w*|exploit|cve|credential\w*|password|secret|token|"
+    r"delete|drop\s+table|truncate|rm\s+-rf|migrat\w*|production|prod|deploy\w*|"
+    r"payment|money|financ\w*|billing|invoice|irreversible|data[\s-]*loss|"
+    r"encrypt\w*|auth\w*|permission\w*|privilege\w*|rotate\s+key)\b",
+    re.IGNORECASE,
+)
+
+
+def _classify_risk(question: str) -> str:
+    """Coarse risk class for the question. 'high' means a wrong-but-confident
+    answer is costly (security/destructive/money/irreversible) — auto-adopt is
+    then gated on external verification, not council agreement alone."""
+    if question and _HIGH_RISK_PATTERN.search(question):
+        return "high"
+    return "normal"
+
+
+def _evidence_strength(stage1: list[dict]) -> tuple[str, int]:
+    """Independent-source signal from web_search: total result sources gathered
+    by surviving members. 'none' (0), 'weak' (1-2), 'corroborated' (3+). This is
+    orthogonal to agreement — the council can agree with zero evidence, or bring
+    many sources yet still disagree."""
+    sources = 0
+    for s in stage1:
+        for e in s.get("tool_calls_log") or []:
+            if isinstance(e, dict) and e.get("name") == "web_search" and e.get("ok"):
+                sources += len(e.get("sources") or [])
+    if sources == 0:
+        return "none", 0
+    if sources < 3:
+        return "weak", sources
+    return "corroborated", sources
+
+
 def _build_summary(
     stage1: list[dict],
     stage2: list[dict],
     aggregate: list[tuple[str, float, int]],
     stage3: dict | None,
     rounds: int = 1,
+    *,
+    question: str = "",
+    borda: list[tuple[str, int, int]] | None = None,
 ) -> dict:
     """Machine-readable verdict for automation (n8n etc.): winner, confidence,
     failed models, top disagreements, recommended next action.
@@ -993,6 +1111,27 @@ def _build_summary(
 
     ok_stage1 = sum(1 for s in stage1 if s["status"] == "ok")
     synthesized_ok = bool(stage3 and stage3.get("status") == "ok")
+
+    # --- Evidence-aware signals (separate axes, not folded into agreement) ---
+    # agreement (confidence/quorum) is already computed above. These are ORTHOGONAL
+    # axes so a caller can gate risk-sensitive auto-adopt on evidence + risk, not
+    # on correlated-LLM agreement alone.
+    risk_class = _classify_risk(question)
+    evidence_level, evidence_sources = _evidence_strength(stage1)
+    # Borda (rank-based) cross-check: does the scale-free ranking agree with the
+    # mean on the winner? Disagreement = a fragile winner (scale bias flipped it).
+    borda_winner_id = borda[0][0] if borda else None
+    ranking_methods_agree = (
+        winner_id is not None and borda_winner_id is not None
+        and winner_id == borda_winner_id
+    )
+    # Human review is required when the stakes are high, the winner isn't
+    # independently corroborated, or the council barely agreed. This is a hard
+    # flag automation can branch on — distinct from the soft prose recommendation.
+    human_review_required = (
+        risk_class == "high" or not quorum_ok or confidence == "low"
+        or (borda is not None and not ranking_methods_agree)
+    )
     # A provider/health failure (auth/402/timeout/5xx/rate/network) is worth a
     # healthcheck; a purely parse-level failure (invalid_json / tool-exhaustion,
     # both classified "error") is not — healthcheck would come back green.
@@ -1030,6 +1169,25 @@ def _build_summary(
                 "Low agreement, and synthesis + max rounds already applied — treat "
                 "as genuinely contested; get human review."
             )
+    elif risk_class == "high":
+        # Corroborated + agreed, but a high-risk topic: agreement between
+        # correlated LLMs is not evidence of correctness, and the cost of a wrong
+        # call is high. Never plain-"adopt" here — require an external check.
+        ev = (
+            f"{evidence_sources} web source(s)" if evidence_sources
+            else "no external evidence gathered"
+        )
+        next_action = (
+            "Clear council winner on a HIGH-RISK topic (security/destructive/"
+            f"money/irreversible) — {ev}. Verify against an authoritative source "
+            "or human review before acting; do NOT auto-adopt on agreement alone."
+        )
+    elif borda is not None and not ranking_methods_agree:
+        next_action = (
+            "Mean and rank-based (Borda) aggregation disagree on the winner — the "
+            "lead is fragile / scale-biased. Prefer synthesis=True or human review "
+            "over adopting the top-ranked answer outright."
+        )
     else:
         next_action = "Clear winner — adopt the top-ranked answer."
 
@@ -1037,6 +1195,31 @@ def _build_summary(
         "winner_id": winner_id,
         "winner_model": winner_model,
         "winner_mean_score": winner_mean,
+        # Rank-based (Borda) winner + whether it agrees with the mean winner.
+        # A mismatch flags a winner that only leads on one aggregation method.
+        "borda_winner_id": borda_winner_id,
+        "ranking_methods_agree": ranking_methods_agree if borda is not None else None,
+        # Evidence-aware verdict: SEPARATE axes so risk-sensitive automation gates
+        # on evidence + risk, not on correlated-LLM agreement alone.
+        #   agreement       — the council concurrence signal (== confidence).
+        #   evidence        — external corroboration from web_search sources.
+        #   executable_test — reserved: the council does not run tests (always None).
+        #   source_quality  — coarse label derived from evidence volume.
+        #   human_review_required — hard flag (risk/quorum/agreement/ranking).
+        "verdict": {
+            "agreement": confidence,
+            "evidence": evidence_level,
+            "evidence_sources": evidence_sources,
+            "executable_test": None,
+            "source_quality": (
+                "multi-source" if evidence_sources >= 3
+                else ("single-source" if evidence_sources else "none")
+            ),
+            "risk_class": risk_class,
+            "human_review_required": human_review_required,
+        },
+        "risk_class": risk_class,
+        "human_review_required": human_review_required,
         # This signal is the AGREEMENT margin between correlated LLM rankers — it
         # measures how much the council concurred, NOT whether the answer is
         # correct (there's no evidence/test gate). `agreement_confidence` is the
@@ -1127,9 +1310,16 @@ async def run_council(
     web_search: bool = False,
     on_progress: ProgressFn | None = None,
     context_in_stage2: bool = True,
+    budget: RunBudget | None = None,
 ) -> dict:
     """End-to-end orchestration of stages 1+2 across N rounds, optionally
     stage 3 synthesis at the end.
+
+    `budget` (RunBudget | None): run-scoped ceilings (wall-time deadline, max
+    web searches, max LLM calls, dollar ceiling). Checked GRACEFULLY at round
+    boundaries and before synthesis — an in-flight round always finishes and its
+    answers are kept; crossing a ceiling stops further rounds/synthesis and adds
+    a note. `budget.max_web_searches` also lowers the per-run Exa search cap.
 
     `context_in_stage2=False`: drop the (potentially up-to-500KB) context files
     from stage 2 ranking and stage 3 synthesis prompts — stage 1 still gets the
@@ -1175,7 +1365,14 @@ async def run_council(
     # One shared search cache per run — members issue overlapping queries and
     # otherwise pay Exa per duplicate. Round-1 stage 1 and (when synthesis runs)
     # the stage-3 chairman share it; stage 2 and rounds 2+ stay search-free.
-    search_cache = RunSearchCache() if web_search else None
+    # A budget.max_web_searches lowers the per-run Exa cap below the default.
+    if web_search:
+        if budget is not None and budget.max_web_searches is not None:
+            search_cache = RunSearchCache(max_searches=budget.max_web_searches)
+        else:
+            search_cache = RunSearchCache()
+    else:
+        search_cache = None
 
     # --- Round 1 ---------------------------------------------------------
     progress("phase", {"phase": "stage1", "members": [m["id"] for m in members]})
@@ -1214,6 +1411,13 @@ async def run_council(
 
     # --- Round 2+ --------------------------------------------------------
     for round_idx in range(2, rounds + 1):
+        # Budget gate at the round boundary: an in-flight round always finished
+        # above (its answers are kept) — here we decide whether to start ANOTHER.
+        if budget is not None:
+            stop = budget.check(_compute_usage(rounds_detail, None, search_cache))
+            if stop:
+                notes.append(f"stopped before round {round_idx}: budget — {stop}")
+                break
         progress("phase", {"phase": f"round{round_idx}_stage1"})
         prior_stage1 = stage1  # immutable snapshot of previous round
         prior_aggregate = aggregate
@@ -1282,7 +1486,13 @@ async def run_council(
 
     # --- Stage 3 (optional) ---------------------------------------------
     stage3: dict | None = None
-    if synthesis:
+    budget_stop_synthesis = (
+        budget.check(_compute_usage(rounds_detail, None, search_cache))
+        if budget is not None else None
+    )
+    if synthesis and budget_stop_synthesis:
+        notes.append(f"stage3 synthesis skipped: budget — {budget_stop_synthesis}")
+    elif synthesis:
         chairman = _pick_chairman(
             aggregate, [s["id"] for s in ok_stage1], members_by_id
         )
@@ -1321,13 +1531,102 @@ async def run_council(
                 )
 
     progress("phase", {"phase": "done"})
+    borda = _aggregate_borda(stage2)
+    # Claim→source ledger from every member's + chairman's web_search sources.
+    ledger_records = list(stage1)
+    if stage3 is not None:
+        ledger_records = ledger_records + [stage3]
+    claim_ledger = build_claim_ledger(ledger_records)
     return {
         "stage1": stage1,
         "stage2": stage2,
         "aggregate": aggregate,
+        # Rank-based (Borda) aggregation — scale-free cross-check on the mean.
+        "borda": borda,
         "rounds_detail": rounds_detail,
         "stage3": stage3,
         "notes": notes,
+        # query→sources provenance from web_search (empty without web_search).
+        "claim_ledger": claim_ledger,
         "usage": _compute_usage(rounds_detail, stage3, search_cache),
-        "summary": _build_summary(stage1, stage2, aggregate, stage3, rounds=rounds),
+        "summary": _build_summary(
+            stage1, stage2, aggregate, stage3, rounds=rounds,
+            question=question, borda=borda,
+        ),
+        "budget": budget.as_dict() if budget is not None else None,
     }
+
+
+async def run_adaptive_council(
+    question: str,
+    *,
+    members: list[dict] | None = None,
+    call_fn: CallFn | None = None,
+    healthcheck: bool = True,
+    max_escalations: int = 1,
+    **run_kwargs: Any,
+) -> dict:
+    """Health-aware, start-small-escalate council.
+
+    1. (optional) pre-flight healthcheck → drop members a provider marks broken,
+       so a down model never silently takes a fan-out slot;
+    2. run a SMALL diverse starting subset (spanning ≥2 provider domains) — cheap
+       yet corroboratable;
+    3. if that pass didn't reach a corroborated confident verdict, ESCALATE by
+       adding the held-back members and re-running (bounded by max_escalations).
+
+    Returns the final run_council result with an extra `adaptive` section
+    (dropped members, subset used, escalation trail). `run_kwargs` are forwarded
+    to run_council (synthesis, rounds, web_search, budget, on_progress, …)."""
+    members = members if members is not None else resolve_members(None)
+    call_fn = call_fn or call_openai_compat
+    adaptive_notes: list[str] = []
+    dropped: list[tuple[str, str]] = []
+
+    if healthcheck:
+        rows = await healthcheck_models([m["id"] for m in members], call_fn=call_fn)
+        kept_ids, dropped = adaptive.filter_healthy([m["id"] for m in members], rows)
+        if dropped:
+            adaptive_notes.append(
+                "adaptive: dropped unhealthy members "
+                + ", ".join(f"{mid} ({st})" for mid, st in dropped)
+            )
+        kept = [m for m in members if m["id"] in kept_ids]
+        # Never shrink below the 2-member council floor on a flaky probe — if the
+        # health filter would leave <2, fall back to the full requested set.
+        members = kept if len(kept) >= 2 else members
+
+    start_ids = adaptive.pick_starting_subset(members)
+    used_ids = set(start_ids)
+    start_members = [m for m in members if m["id"] in start_ids]
+    adaptive_notes.append(f"adaptive: started with {sorted(used_ids)}")
+
+    result = await run_council(question, members=start_members, call_fn=call_fn, **run_kwargs)
+
+    escalation_trail: list[dict] = []
+    escalations = 0
+    while escalations < max_escalations:
+        esc, reason = adaptive.should_escalate(result.get("summary"))
+        reserves = [m for m in members if m["id"] not in used_ids]
+        if not esc or not reserves:
+            escalation_trail.append({"escalated": False, "reason": reason})
+            break
+        used_ids |= {m["id"] for m in reserves}
+        escalation_trail.append({"escalated": True, "reason": reason, "added": [m["id"] for m in reserves]})
+        adaptive_notes.append(f"adaptive: escalated ({reason}) → {sorted(used_ids)}")
+        result = await run_council(
+            question, members=[m for m in members if m["id"] in used_ids],
+            call_fn=call_fn, **run_kwargs,
+        )
+        escalations += 1
+
+    result.setdefault("notes", [])
+    result["notes"] = adaptive_notes + result["notes"]
+    result["adaptive"] = {
+        "healthcheck_ran": healthcheck,
+        "dropped_members": [{"id": mid, "status": st} for mid, st in dropped],
+        "starting_subset": sorted(start_ids),
+        "final_members": sorted(used_ids),
+        "escalations": escalation_trail,
+    }
+    return result

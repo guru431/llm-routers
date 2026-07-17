@@ -20,13 +20,29 @@
  * Falls back to Router.default if the model is a claude-* name (extension forgot
  * to apply env var) or if model is missing. An unknown model id is rejected
  * (thrown) rather than silently rerouted, so typos don't run on the wrong model.
+ *
+ * Traceability (Idea 21): every routing decision is logged as ONE structured
+ * JSON line `{"ccr_route":{provider,model,reason}}` to stdout. CCR's custom-router
+ * contract only hands us `(req, config)` and expects a "provider,model" string
+ * back (or null) — there is no response object to attach a trace header to — so
+ * a structured stdout log is the honest maximum. `reason` names WHY each route
+ * was chosen so a grep over CCR logs reconstructs the decision path.
+ *
+ * Single-provider by design: this deployment has exactly one upstream (opencode),
+ * so there is no real health/cost/latency multi-provider fallback to make. The
+ * only fallback is Router.default (CCR built-in) for claude-* / missing-model
+ * requests, traced with reason 'router_default_fallback'. See README
+ * ("Каталог моделей и трассировка") for how to keep the model list in sync.
  */
 
 // Fallback list of OpenCode Go models if config isn't passed to the router.
 // Normally we derive the set from config.Providers[opencode].models (below) so
-// the two stay in sync; this hardcode is only the safety net.
-// SOURCE OF TRUTH: config.example.json's Providers[opencode].models. This list is
-// a hand-maintained copy of it — keep both in sync when models change (no build step).
+// the two stay in sync; this hardcode is only the safety net and its use is
+// WARNED about at runtime (a silent hardcode fallback hid config drift before).
+// SOURCE OF TRUTH: config.example.json's Providers[opencode].models (which is
+// itself the hand-maintained mirror of mcp-council/models.py::CATALOG's OCG ids).
+// This list is a copy of it — keep all three in sync when models change (no build
+// step); see README "Каталог моделей и трассировка".
 const OPENCODE_MODELS_FALLBACK = new Set([
   'glm-5.2', 'glm-5',
   'kimi-k2.5', 'kimi-k2.7-code',
@@ -36,29 +52,54 @@ const OPENCODE_MODELS_FALLBACK = new Set([
   'deepseek-v4-pro', 'deepseek-v4-flash',
 ]);
 
+// Emit one structured trace line per routing decision. Kept to a single JSON
+// object so `grep ccr_route <log>` reconstructs every route + its reason.
+function trace(provider, model, reason) {
+  try {
+    console.log(JSON.stringify({ ccr_route: { provider, model, reason } }));
+  } catch (_e) {
+    // Never let logging break routing.
+  }
+}
+
 module.exports = async function router(req, config) {
   const model = req.body?.model;
 
   if (!model) {
-    // No model in request — let CCR's built-in scenario routing handle it
+    // No model in request — let CCR's built-in scenario routing handle it.
+    trace(null, null, 'no_model_builtin_routing');
     return null;
   }
 
   // Single source of truth: the opencode provider's model list from config.json.
-  // Falls back to the hardcoded set if config isn't available in this signature.
+  // Fail-closed intent: an EMPTY/absent list means the config is broken, not that
+  // there are zero models — fall back to the hardcoded net but WARN loudly so the
+  // drift is visible instead of silently masked.
   const configModels = config?.Providers?.find((p) => p.name === 'opencode')?.models;
-  const opencodeModels = new Set(
-    configModels?.length ? configModels : OPENCODE_MODELS_FALLBACK
-  );
+  let opencodeModels;
+  if (configModels?.length) {
+    opencodeModels = new Set(configModels);
+  } else {
+    console.warn(
+      '[custom_router] WARNING: config.Providers[opencode].models is empty or ' +
+      'missing — using the hardcoded OPENCODE_MODELS_FALLBACK. Fix ' +
+      'Providers[opencode].models in ~/.claude-code-router/config.json so routing ' +
+      'reflects the real catalog (see README).'
+    );
+    opencodeModels = OPENCODE_MODELS_FALLBACK;
+  }
 
-  // Per-project override: model id matches an OpenCode Go model → route through opencode
+  // Per-project override: model id matches an OpenCode Go model → route through opencode.
   if (opencodeModels.has(model)) {
+    trace('opencode', model, 'opencode_model_match');
     return `opencode,${model}`;
   }
 
   // Claude name (claude-opus-4-8, claude-sonnet-4-6, claude-haiku-4-5, etc.)
-  // → fall back to built-in routing (Router.default / .background / .think etc.)
+  // → fall back to built-in routing (Router.default / .background / .think etc.).
+  // Single-provider deployment: Router.default IS the only fallback by design.
   if (typeof model === 'string' && model.startsWith('claude-')) {
+    trace(null, model, 'router_default_fallback');
     return null;
   }
 
@@ -66,6 +107,7 @@ module.exports = async function router(req, config) {
   // here would silently run the request on Router.default (a DIFFERENT model)
   // and mask the mistake. Fail closed with an explicit, traceable error so the
   // bad model id surfaces to the caller instead of being silently rerouted.
+  trace(null, model, 'unknown_model_rejected');
   throw new Error(
     `[custom_router] unknown model "${model}": not an OpenCode Go model and not a ` +
     `claude-* name. Fix ANTHROPIC_MODEL, or add the id to Providers[opencode].models.`

@@ -130,6 +130,21 @@ def build_stage2_user(
     return "\n".join(parts)
 
 
+def build_stage2_repair_user(error: str) -> str:
+    """Follow-up user message asking a ranker to re-emit STRICT JSON after its
+    first attempt failed to parse/validate. Paired with response_format=
+    {"type":"json_object"} so the provider itself enforces JSON where supported."""
+    return (
+        "Your previous reply could not be parsed as the required ranking JSON "
+        f"(error: {error}).\n"
+        "Reply AGAIN with STRICT JSON ONLY — no markdown fence, no prose before "
+        "or after. Exactly this schema:\n"
+        '{"confidence": 1-10, "rankings": [{"member": "A", "score": 1-10, '
+        '"reasoning": "..."}, ...]}\n'
+        "Use the same Member letters you were shown. Integer scores 1-10."
+    )
+
+
 STAGE1_ROUND_N_SYSTEM = (
     "You already answered this question in the previous round, then anonymous "
     "experts peer-reviewed all answers. Below are: your previous answer, the "

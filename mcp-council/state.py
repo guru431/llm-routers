@@ -40,6 +40,11 @@ MAX_ACTIVE_JOBS = 16
 
 TERMINAL_PHASES = frozenset({"done", "error", "cancelled", "interrupted"})
 
+# Persisted job-snapshot schema version (versioned dumps). Bump when the snapshot
+# shape changes incompatibly so a loader can detect an older dump. The loader
+# tolerates unknown keys, so forward-compatible additions are safe.
+SNAPSHOT_SCHEMA_VERSION = 1
+
 # Best-effort on-disk persistence so an MCP-server restart can surface jobs that
 # were mid-flight ("interrupted, partial result available") instead of silently
 # losing them. One JSON snapshot per job; written on every phase transition and
@@ -394,6 +399,7 @@ def snapshot(state: JobState) -> dict:
         elapsed_ms = int((end - state.started_at) * 1000)
 
     return {
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
         "job_id": state.job_id,
         "question_preview": state.question_preview,
         "phase": state.phase,

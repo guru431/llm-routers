@@ -88,6 +88,34 @@ ccr:
 3. Конвертирует в OpenAI-формат и отправляет в upstream
 4. Конвертирует ответ обратно в Anthropic-формат
 
+## Каталог моделей и трассировка
+
+`custom_router.js` решает роут по `req.body.model`. Источник допустимых upstream-id — **`config.Providers[opencode].models`** из живого `~/.claude-code-router/config.json`; хардкод `OPENCODE_MODELS_FALLBACK` в `custom_router.js` — только safety-net.
+
+**Синхронизация каталога (три копии, нет build-step):**
+1. `mcp-council/models.py::CATALOG` — канон OCG-моделей для всего репо;
+2. `config.example.json` → `Providers[opencode].models` — ручное зеркало (template);
+3. `OPENCODE_MODELS_FALLBACK` в `custom_router.js` — ручное зеркало (fallback).
+
+При добавлении/удалении модели править все три. Реальный роут берёт список из вашего `config.json` (копия template), поэтому обычно достаточно обновить `config.json` + `ccr restart` — fallback используется только если список в конфиге **пуст/отсутствует** (сломанный конфиг), и тогда роутер печатает `WARNING: config.Providers[opencode].models is empty or missing` (fail-closed видимость дрейфа, а не молчаливый хардкод).
+
+**Трассировка решений.** CCR-контракт кастомного роутера даёт только `(req, config)` и ждёт назад строку `"provider,model"` (или `null`) — объекта ответа, куда можно повесить trace-заголовок, нет. Поэтому на **каждое** решение роутер печатает одну структурную строку в stdout:
+
+```json
+{"ccr_route":{"provider":"opencode","model":"glm-5.2","reason":"opencode_model_match"}}
+```
+
+`reason` — почему выбран роут:
+
+| reason | когда |
+|---|---|
+| `opencode_model_match` | `model` найден в каталоге opencode → `opencode,<model>` |
+| `router_default_fallback` | `claude-*` имя → fallback на `Router.default` (единственный fallback: провайдер один) |
+| `no_model_builtin_routing` | `model` отсутствует → встроенный scenario-routing CCR (`null`) |
+| `unknown_model_rejected` | неизвестный id → `throw` (не молча в Router.default) |
+
+Grep по логам CCR (`grep ccr_route`) восстанавливает путь каждого запроса. **Multi-provider health/cost/latency fallback отсутствует by design** — апстрим один (`opencode`); единственный fallback — `Router.default` для `claude-*`/missing-model.
+
 ## Ключи
 
 `config.json` хранится **только в `~/.claude-code-router/`** (вне git, не симлинк) и содержит:

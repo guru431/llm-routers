@@ -19,6 +19,24 @@ from typing import Callable
 
 from single_call import run_single
 
+# Persisted-dump schema version (idea: versioned dumps). Bump when the payload
+# shape in write_dump changes incompatibly.
+DUMP_SCHEMA_VERSION = 1
+
+
+def emit_event(state, event_type: str, payload: dict) -> None:
+    """Append one event to a dialogue session's append-only JSONL journal, if the
+    server attached an `event_writer` to the state (best-effort observability,
+    mirrors the council event log). No-op when no writer is attached (tests,
+    sync runs). Never raises into the dialogue loop."""
+    writer = getattr(state, "event_writer", None)
+    if writer is None:
+        return
+    try:
+        writer.write(event_type, payload)
+    except Exception:
+        pass
+
 
 @dataclass
 class TurnResult:
@@ -351,6 +369,11 @@ async def run_dialogue(
         if per_round_hook is not None:
             await per_round_hook(state, round_n)
 
+        emit_event(state, "round_complete", {
+            "round": round_n, "total_rounds": state.total_rounds,
+            "failures": _count_failures_in_round(state, round_n),
+        })
+
         # Mid-run persistence: snapshot after each completed round so a server
         # restart surfaces the session as 'interrupted' with partial history
         # instead of losing 5-50 minutes of paid work silently.
@@ -380,6 +403,11 @@ def _write_dump_locked(state: DialogueState, *, base_dir: Path) -> Path:
     # session then reported dump_path=None.
     state.dump_path = str(dump_path)
     payload = {
+        # Snapshot schema version — bumped when the persisted shape changes so a
+        # loader can detect (and, in future, migrate) an older dump instead of
+        # silently mis-reading it. load_persisted_dialogues tolerates unknown
+        # keys, so a forward-compatible add is safe; this marks the contract.
+        "schema_version": DUMP_SCHEMA_VERSION,
         "session_id": state.session_id,
         "mode": state.mode,
         "question_preview": state.question_preview,
@@ -392,6 +420,7 @@ def _write_dump_locked(state: DialogueState, *, base_dir: Path) -> Path:
         "moderator": state.moderator,
         "history": state.history,
         "diversity_scores": state.diversity_scores,
+        "diversity_monitor_status": state.diversity_monitor_status,
         "devils_advocates": state.devils_advocates,
         "created_at": state.created_at,
         "started_at": state.started_at,

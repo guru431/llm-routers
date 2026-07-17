@@ -18,6 +18,21 @@ HISTORY_TRUNCATE_ROUNDS = 10
 RECENT_FULL_ROUNDS = 2
 OLD_ROUND_ENTRY_CHAR_CAP = 1000
 
+# Token-aware ceiling on the rendered history. The round-window + per-entry char
+# caps above bound a single prompt, but a wide panel (7 participants × several
+# entries/round) can still assemble a very large history within the window. This
+# is a HARD token budget on the rendered section: oldest rounds beyond the recent
+# verbatim window are dropped (with a rolling-summary marker) until the estimate
+# fits. Set high so typical/short dialogues are unaffected — it only bites long,
+# wide panels that would otherwise overflow a model's context.
+HISTORY_TOKEN_BUDGET = 24000
+
+
+def estimate_tokens(text: str) -> int:
+    """Cheap token estimate (~4 chars/token). Dependency-free — good enough to
+    bound a prompt without pulling in a tokenizer."""
+    return (len(text) + 3) // 4
+
 
 def _cap_text(text: str, cap: int | None) -> str:
     if cap is None or len(text) <= cap:
@@ -30,6 +45,7 @@ def format_history_section(
     *,
     recent_full_rounds: int = RECENT_FULL_ROUNDS,
     old_entry_char_cap: int | None = OLD_ROUND_ENTRY_CHAR_CAP,
+    max_history_tokens: int | None = HISTORY_TOKEN_BUDGET,
 ) -> str:
     """Group history entries by round and render as readable text.
 
@@ -37,6 +53,12 @@ def format_history_section(
     window, the last `recent_full_rounds` rounds are verbatim; older rounds
     have each entry capped to `old_entry_char_cap` chars (None = no cap).
     Within a round, critiques come before responses (chronological).
+
+    `max_history_tokens` (None = unbounded): a HARD token budget on the rendered
+    section. When exceeded, the OLDEST rounds outside the recent verbatim window
+    are dropped and replaced by a one-line rolling-summary marker until the
+    estimate fits — the recent verbatim rounds are always kept so the live
+    argument is never truncated away.
     """
     if not history:
         return ""
@@ -51,9 +73,9 @@ def format_history_section(
     )
 
     phase_order = {"critique": 0, "response": 1, "question": 0, "answer": 1}
-    lines: list[str] = []
-    for rn in rounds_seen:
-        lines.append(f"ROUND {rn}:")
+
+    def _render_round(rn: int) -> list[str]:
+        out = [f"ROUND {rn}:"]
         round_items = [h for h in history if h["round"] == rn]
         round_items.sort(key=lambda h: (phase_order.get(h["phase"], 99), h["id"]))
         for h in round_items:
@@ -73,7 +95,40 @@ def format_history_section(
             elif h["phase"] == "moderator_note":
                 phase_marker = " (moderator note)"
             text = h["text"] if rn in full_rounds else _cap_text(h["text"], old_entry_char_cap)
-            lines.append(f"  [{h['id']}]{phase_marker}: {text}")
+            out.append(f"  [{h['id']}]{phase_marker}: {text}")
+        return out
+
+    per_round = {rn: _render_round(rn) for rn in rounds_seen}
+
+    # Token-aware trimming: keep from NEWEST backward while the estimate fits.
+    # Rounds inside the recent verbatim window are always kept (the live argument
+    # must survive); only older rounds are eligible to drop.
+    if max_history_tokens is not None:
+        kept_rounds: list[int] = []
+        running = 0
+        dropped_old = 0
+        for rn in reversed(rounds_seen):
+            block = "\n".join(per_round[rn])
+            cost = estimate_tokens(block)
+            if running + cost > max_history_tokens and rn not in full_rounds and kept_rounds:
+                dropped_old += 1
+                continue
+            running += cost
+            kept_rounds.append(rn)
+        kept_rounds.sort()
+        lines: list[str] = []
+        if dropped_old:
+            lines.append(
+                f"[rolling summary] {dropped_old} earlier round(s) omitted to fit "
+                "the history token budget; the most recent rounds are shown verbatim below."
+            )
+        for rn in kept_rounds:
+            lines.extend(per_round[rn])
+        return "\n".join(lines)
+
+    lines = []
+    for rn in rounds_seen:
+        lines.extend(per_round[rn])
     return "\n".join(lines)
 
 
@@ -230,8 +285,9 @@ def render_diversity_monitor_prompt(*, responses: dict[str, str]) -> str:
     lines.append("- 10 = essentially saying the same thing, just paraphrased")
     lines.append("")
     lines.append("Output a JSON object EXACTLY in this shape:")
-    lines.append('{"score": <int 0-10>, "agreers": [<participant_id>, ...], "reasoning": "<one sentence>"}')
+    lines.append('{"score": <int 0-10>, "agreers": [<participant_id>, ...], "uncertainty": <float 0-1>, "reasoning": "<one sentence>"}')
     lines.append('Where "agreers" is the list of participant ids that converged into the same view (empty if all distinct).')
+    lines.append('"uncertainty" (0-1) is how unsure YOU are about this similarity call — 0 = confident, 1 = guessing.')
     lines.append("")
     lines.append("=== RESPONSES ===")
     for pid, text in responses.items():

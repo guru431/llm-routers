@@ -7,9 +7,12 @@ HTTP-endpoint. Один API, два мира потребителей:
   - read-only — чистая генерация текста (mcp-council, claude-code-router, code-review).
 
 Endpoints:
-    POST /v1/chat/completions  — OpenAI-compatible (messages + tools + sandbox/workdir)
+    POST /v1/chat/completions  — OpenAI-compatible (messages + tools + sandbox/workdir/
+                                 profile + response_format + real streaming)
     GET  /v1/models            — список моделей (base + `-agent` варианты)
     GET  /health               — healthcheck (liveness only; config fields require read-token)
+    GET  /ready                — readiness probe (200 ready / 503 with per-check details)
+    GET  /metrics              — JSON counters (requests/active/overload/timeouts/latency)
 
 Режим sandbox разрешается по приоритету (первое сработавшее побеждает):
     1. есть `tools` в запросе          → read-only (клиентские tools несовместимы с агентным)
@@ -30,10 +33,13 @@ Env:
     CODEX_AGENT_READ_ROOT      — рабочая директория для read-only codex (default = WORKDIR_ROOT; если не задан — codex видит весь хост)
     CODEX_AGENT_REASONING      — model_reasoning_effort (default: medium)
     CODEX_AGENT_MAX_BODY       — макс. размер тела запроса в байтах (default: 10 MB; >лимит → 413)
-    CODEX_AGENT_MAX_CONCURRENCY— макс. параллельных codex-вызовов (default: 4; сверх → 429)
+    CODEX_AGENT_MAX_CONCURRENCY— макс. параллельных codex-вызовов (default: 4; сверх → bounded queue)
+    CODEX_AGENT_QUEUE_WAIT     — сек. ожидания слота перед 429 (default: 5)
+    CODEX_AGENT_MAX_QUEUE      — макс. ожидающих в очереди (default: 2×concurrency; переполнение → 429+Retry-After)
 
-Tool calling эмулируется через prompt-injection (только в read-only). `usage` —
-приблизительный (chars/4); Codex не отдаёт реальные счётчики токенов в `-o`.
+Tool calling эмулируется через prompt-injection (только в read-only). Буферный
+`usage` — приблизительный (chars/4); Codex не отдаёт реальные счётчики в `-o`. В
+настоящем стриме чистого текста usage реальный, когда codex --json его отдаёт.
 """
 
 import argparse
@@ -121,6 +127,16 @@ CODEX_BIN = shutil.which("codex") or "codex"
 AGENT_SUFFIX = "-agent"
 SANDBOX_MODES = ("read-only", "workspace-write")
 
+# Capability profiles (Idea 1): explicit named request postures layered over the
+# existing sandbox/`-agent`-suffix mechanism (both preserved for back-compat).
+#   chat     — pure generation, no filesystem writes/session persistence (read-only)
+#   research — read-only + tool/web emulation, still never writes (read-only)
+#   agent    — writes files / runs shell; needs the separate agent token + workdir
+#              containment (workspace-write). codex-only; claude rejects it (400).
+# A profile is a LABEL + a mode selector; it is NOT an OS sandbox (read-only codex
+# still has full host read — see README security section).
+PROFILES = ("chat", "research", "agent")
+
 DEFAULT_MODEL = os.getenv("CODEX_AGENT_MODEL", "gpt-5.5")
 BASE_MODELS = [m.strip() for m in os.getenv("CODEX_AGENT_MODELS", "gpt-5.5").split(",") if m.strip()]
 if DEFAULT_MODEL not in BASE_MODELS:
@@ -184,6 +200,111 @@ except ValueError:
     MAX_CONCURRENCY = 4
 _CODEX_SEM = threading.BoundedSemaphore(MAX_CONCURRENCY)
 
+# Bounded request queue (Idea 13): under load, instead of an instant 429, wait a
+# short bounded time for a free slot; refuse (429 + Retry-After) only if the queue
+# is already full or the wait times out. Keeps callers from hammering while the
+# waiting set stays bounded so we never pile up unboundedly.
+try:
+    QUEUE_WAIT_SECONDS = max(0.0, float(os.getenv("CODEX_AGENT_QUEUE_WAIT", "5")))
+except ValueError:
+    QUEUE_WAIT_SECONDS = 5.0
+try:
+    MAX_QUEUE = max(0, int(os.getenv("CODEX_AGENT_MAX_QUEUE", str(MAX_CONCURRENCY * 2))))
+except ValueError:
+    MAX_QUEUE = MAX_CONCURRENCY * 2
+_QUEUE_LOCK = threading.Lock()
+_QUEUE_WAITING = 0
+# Retry-After seconds advertised on an overload 429 (integer, ≥1).
+RETRY_AFTER = max(1, int(round(QUEUE_WAIT_SECONDS)) or 1)
+
+
+def _acquire_slot() -> bool:
+    """Bounded-queue slot acquisition. Fast path: take a free concurrency slot.
+    Under load: wait up to QUEUE_WAIT_SECONDS in a bounded queue; refuse if the
+    queue is already full (>MAX_QUEUE waiters) or the wait times out. Returns True
+    on success (caller must release _CODEX_SEM), else False (caller → 429)."""
+    global _QUEUE_WAITING
+    if _CODEX_SEM.acquire(blocking=False):
+        return True
+    with _QUEUE_LOCK:
+        if _QUEUE_WAITING >= MAX_QUEUE:
+            return False
+        _QUEUE_WAITING += 1
+    try:
+        return _CODEX_SEM.acquire(timeout=QUEUE_WAIT_SECONDS)
+    finally:
+        with _QUEUE_LOCK:
+            _QUEUE_WAITING -= 1
+
+
+class Metrics:
+    """Thread-safe in-process counters + a small latency ring buffer for /metrics
+    (Idea 13). Byte-identical with the other agent server; cache_* stay 0 where a
+    server has no response cache."""
+
+    def __init__(self, latency_window: int = 128):
+        self._lock = threading.Lock()
+        self._latency_window = latency_window
+        self.total_requests = 0
+        self.active = 0
+        self.rejected_overload = 0
+        self.timeouts = 0
+        self.killed_processes = 0
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self._latencies: list = []
+
+    def inc(self, field: str, n: int = 1):
+        with self._lock:
+            setattr(self, field, getattr(self, field) + n)
+
+    def enter(self):
+        with self._lock:
+            self.total_requests += 1
+            self.active += 1
+
+    def leave(self):
+        with self._lock:
+            if self.active > 0:
+                self.active -= 1
+
+    def record_latency(self, seconds: float):
+        with self._lock:
+            self._latencies.append(seconds)
+            excess = len(self._latencies) - self._latency_window
+            if excess > 0:
+                del self._latencies[0:excess]
+
+    @staticmethod
+    def _percentile(sorted_values: list, pct: float) -> float:
+        if not sorted_values:
+            return 0.0
+        k = int(round((pct / 100.0) * (len(sorted_values) - 1)))
+        k = max(0, min(len(sorted_values) - 1, k))
+        return sorted_values[k]
+
+    def snapshot(self, uptime: int) -> dict:
+        with self._lock:
+            lat = sorted(self._latencies)
+            return {
+                "uptime": uptime,
+                "total_requests": self.total_requests,
+                "active": self.active,
+                "rejected_overload": self.rejected_overload,
+                "timeouts": self.timeouts,
+                "killed_processes": self.killed_processes,
+                "cache_hits": self.cache_hits,
+                "cache_misses": self.cache_misses,
+                "latency_samples": len(lat),
+                "latency_median_s": round(self._percentile(lat, 50), 3),
+                "latency_p90_s": round(self._percentile(lat, 90), 3),
+                "max_concurrency": MAX_CONCURRENCY,
+                "max_queue": MAX_QUEUE,
+            }
+
+
+METRICS = Metrics()
+
 
 # ============================================================
 # Model + sandbox resolution
@@ -228,6 +349,30 @@ def resolve_sandbox(tools, body_sandbox: str | None, suffix_mode: str | None) ->
     if suffix_mode:
         return suffix_mode
     return DEFAULT_SANDBOX
+
+
+def resolve_profile_and_sandbox(tools, body_sandbox: str | None,
+                                body_profile: str | None, suffix_mode: str | None) -> tuple[str, str]:
+    """Resolve (profile, sandbox). An explicit `profile` in the body takes
+    precedence and maps: chat/research → read-only, agent → workspace-write.
+    Without a profile, fall back to the legacy sandbox resolution (tools /
+    `sandbox` field / `-agent` suffix / default) and derive a reporting profile
+    name from the effective sandbox. `tools` always force read-only (client tools
+    are incompatible with the agentic mode), so profile='agent' + tools is a
+    conflict → BadRequest."""
+    if body_profile is not None:
+        if body_profile not in PROFILES:
+            raise BadRequest(f"invalid profile: {body_profile!r}. Allowed: {list(PROFILES)}")
+        if body_profile == "agent":
+            if tools:
+                raise BadRequest(
+                    "profile 'agent' is incompatible with `tools` "
+                    "(client tools force read-only execution)")
+            return "agent", "workspace-write"
+        return body_profile, "read-only"  # chat | research → read-only
+    sandbox = resolve_sandbox(tools, body_sandbox, suffix_mode)
+    profile = "agent" if sandbox == "workspace-write" else "chat"
+    return profile, sandbox
 
 
 def resolve_workdir(req_workdir: str | None) -> str:
@@ -305,6 +450,12 @@ def build_tools_system_prompt(tools: list) -> str:
         lines.append(f"## {name}\n{desc}")
         if sig_parts:
             lines.append("Parameters:\n" + "\n".join(sig_parts))
+        # Full JSON Schema of the parameters (Idea 12): nested objects/arrays,
+        # `items`, `enum`, `oneOf` etc. that the flat signature above drops still
+        # reach the model verbatim. Serialized deterministically (sort_keys) so
+        # the injected prompt — and claude's cache key built from it — stays stable.
+        if isinstance(params, dict) and params:
+            lines.append("Full JSON Schema:\n" + json.dumps(params, ensure_ascii=False, sort_keys=True))
         lines.append("")
 
     lines.append("""# TOOL CALLING RULES — READ CAREFULLY
@@ -355,6 +506,137 @@ def parse_tool_calls(text: str) -> tuple[list[dict], str]:
         remaining = pattern.sub("", text).strip()
 
     return calls, remaining
+
+
+# ============================================================
+# Structured output + schema validation (Idea 12)
+#   byte-identical helpers with the other agent server — apply fixes to both.
+#   Dependency-free: no jsonschema. json_schema_errors is a STRUCTURAL gate
+#   (object type + required-keys, recursive into required object props), not a
+#   full validator — value types beyond object containment are not checked.
+# ============================================================
+
+_JSON_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL)
+
+
+def json_schema_errors(obj, schema) -> list:
+    """Minimal structural check of `obj` against a JSON-Schema subset. Returns a
+    list of human-readable error strings (empty = ok). Checks only: object schemas
+    (type=='object', or `properties`/`required` present) require a dict with all
+    `required` keys, recursing into required object-typed properties."""
+    errors: list = []
+    if not isinstance(schema, dict):
+        return errors
+    props = schema.get("properties")
+    required = schema.get("required") or []
+    if not isinstance(required, list):
+        required = []
+    is_object = schema.get("type") == "object" or isinstance(props, dict) or bool(required)
+    if is_object:
+        if not isinstance(obj, dict):
+            errors.append(f"expected a JSON object, got {type(obj).__name__}")
+            return errors
+        for key in required:
+            if key not in obj:
+                errors.append(f"missing required field: {key!r}")
+        if isinstance(props, dict):
+            for key in required:
+                sub = props.get(key)
+                if key in obj and isinstance(sub, dict):
+                    errors.extend(json_schema_errors(obj[key], sub))
+    return errors
+
+
+def response_format_schema(response_format):
+    """Return the JSON-Schema dict for a `{"type":"json_schema"}` response_format,
+    else None (json_object accepts any JSON; unsupported types are ignored)."""
+    if not isinstance(response_format, dict):
+        return None
+    if response_format.get("type") != "json_schema":
+        return None
+    js = response_format.get("json_schema") or {}
+    schema = js.get("schema") if isinstance(js, dict) else None
+    return schema if isinstance(schema, dict) else None
+
+
+def build_response_format_prompt(response_format):
+    """Build a system-prompt section enforcing structured JSON output for a
+    supported `response_format` (`json_object` | `json_schema`). Returns None for
+    anything unsupported, so the caller leaves the request unconstrained (old
+    behaviour preserved — response_format was previously ignored)."""
+    if not isinstance(response_format, dict):
+        return None
+    rf_type = response_format.get("type")
+    if rf_type == "json_object":
+        return (
+            "# OUTPUT FORMAT — STRICT\n"
+            "Respond with a SINGLE valid JSON value and NOTHING else: no prose, no "
+            "explanation, no markdown code fences. The entire response must parse as JSON."
+        )
+    if rf_type == "json_schema":
+        head = (
+            "# OUTPUT FORMAT — STRICT\n"
+            "Respond with a SINGLE valid JSON value and NOTHING else: no prose, no "
+            "explanation, no markdown code fences. The entire response must parse as JSON"
+        )
+        schema = response_format_schema(response_format)
+        if schema:
+            return head + " and MUST conform to this JSON Schema:\n" + json.dumps(
+                schema, ensure_ascii=False, sort_keys=True)
+        return head + " object."
+    return None
+
+
+def strip_json_fences(text: str) -> str:
+    """Return the inside of a single ```json ... ``` fence if the whole text is one
+    fenced block, else the stripped text unchanged."""
+    candidate = (text or "").strip()
+    m = _JSON_FENCE_RE.match(candidate)
+    return m.group(1).strip() if m else candidate
+
+
+def validate_structured_output(text: str, schema) -> tuple:
+    """Validate `text` is JSON (json_object) and — if `schema` is given
+    (json_schema) — satisfies json_schema_errors. Tolerates one ```json fence.
+    Returns (ok: bool, error_message: str)."""
+    candidate = strip_json_fences(text)
+    try:
+        parsed = json.loads(candidate)
+    except (json.JSONDecodeError, ValueError) as exc:
+        return False, f"response is not valid JSON: {exc}"
+    if schema is not None:
+        errs = json_schema_errors(parsed, schema)
+        if errs:
+            return False, "; ".join(errs)
+    return True, ""
+
+
+def tool_calls_schema_errors(tool_calls: list, tools: list) -> list:
+    """For each parsed tool call, check its arguments carry the required keys of
+    the matching tool's parameters schema. Returns a flat list of human-readable
+    errors (empty = ok). Calls whose name isn't in `tools`, or whose tool has no
+    object schema, are skipped."""
+    schemas: dict = {}
+    for t in tools or []:
+        if isinstance(t, dict):
+            fn = t.get("function", {})
+            if isinstance(fn, dict) and fn.get("name"):
+                schemas[fn["name"]] = fn.get("parameters") or {}
+    errors: list = []
+    for tc in tool_calls:
+        fn = tc.get("function", {})
+        name = fn.get("name", "")
+        schema = schemas.get(name)
+        if not isinstance(schema, dict) or not schema:
+            continue
+        raw = fn.get("arguments", "")
+        try:
+            args = json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, ValueError):
+            errors.append(f"tool {name!r}: arguments are not valid JSON")
+            continue
+        errors.extend(f"tool {name!r}: {e}" for e in json_schema_errors(args, schema))
+    return errors
 
 
 # ============================================================
@@ -523,6 +805,186 @@ def extract_content(content) -> str:
 
 
 # ============================================================
+# Real streaming (Idea 11) — line-by-line JSON events + cancellation
+# ============================================================
+
+class StreamUnsupported(Exception):
+    """Raised (before any SSE byte is sent) when the CLI's streaming JSON output
+    can't be used, so _handle_chat falls back to the buffered path."""
+
+
+def _codex_event_text(evt) -> tuple[str, bool]:
+    """Best-effort text extraction from a `codex exec --json` stream event.
+    Returns (text, is_delta). Handles a few known event shapes; unknown/control
+    events return ('', False). Codex's exact JSONL schema varies by version, so
+    this stays defensive — the authoritative final answer still comes from the
+    `-o` outfile, never from these events alone."""
+    if not isinstance(evt, dict):
+        return "", False
+    etype = evt.get("type")
+    if etype in ("agent_message_delta", "output_text.delta", "response.output_text.delta"):
+        t = evt.get("delta") or evt.get("text")
+        if isinstance(t, str):
+            return t, True
+    item = evt.get("item")
+    if isinstance(item, dict) and item.get("type") in ("agent_message", "assistant_message"):
+        t = item.get("text") or item.get("message")
+        if isinstance(t, str):
+            return t, False
+    msg = evt.get("msg")
+    if isinstance(msg, dict):
+        mt = msg.get("type")
+        if mt == "agent_message_delta":
+            t = msg.get("delta") or msg.get("message") or msg.get("text")
+            if isinstance(t, str):
+                return t, True
+        if mt in ("agent_message", "assistant_message"):
+            t = msg.get("message") or msg.get("text")
+            if isinstance(t, str):
+                return t, False
+    return "", False
+
+
+def _codex_event_usage(evt):
+    """Extract a real token-usage dict (estimate=False) from a codex event if one
+    carries input/output token counts, else None."""
+    if not isinstance(evt, dict):
+        return None
+    for key in ("usage", "token_count", "info"):
+        u = evt.get(key)
+        if isinstance(u, dict):
+            inp = u.get("input_tokens", u.get("prompt_tokens", u.get("total_input_tokens")))
+            out = u.get("output_tokens", u.get("completion_tokens", u.get("total_output_tokens")))
+            if isinstance(inp, int) or isinstance(out, int):
+                inp = inp if isinstance(inp, int) else 0
+                out = out if isinstance(out, int) else 0
+                return {"prompt_tokens": inp, "completion_tokens": out,
+                        "total_tokens": inp + out, "estimate": False}
+    msg = evt.get("msg")
+    if isinstance(msg, dict):
+        return _codex_event_usage(msg)
+    return None
+
+
+def run_codex_stream(prompt, *, model_base, sandbox, workdir=None, reasoning=None, timeout=300):
+    """Generator streaming a `codex exec --json` run. Yields ('text', delta) as
+    events arrive, then one ('meta', {usage, stop_reason, text}) at the end. The
+    `-o` outfile still captures the authoritative final message: if the JSONL
+    parser recognized no text, the file's contents are emitted as the final delta,
+    so correctness never depends on the version-variable event schema. Kills the
+    whole process tree on GeneratorExit (client disconnect) or timeout. Raises
+    StreamUnsupported before the first yield if `--json` produced no JSON at all
+    (caller falls back to buffered run_codex)."""
+    cmd = [
+        CODEX_BIN, "exec", "-",
+        "-m", model_base,
+        "--sandbox", sandbox,
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--color", "never",
+        "-c", "mcp_servers={}",
+        "--json",
+    ]
+    if reasoning:
+        cmd += ["-c", f"model_reasoning_effort={reasoning}"]
+    if sandbox == "workspace-write" and workdir:
+        cmd += ["-C", workdir]
+        cmd += ["-c", f"sandbox_workspace_write.writable_roots={json.dumps([workdir])}"]
+    elif sandbox == "read-only" and READ_ROOT:
+        cmd += ["-C", READ_ROOT]
+
+    fd, outfile = tempfile.mkstemp(suffix=".txt", prefix="codex-out-")
+    os.close(fd)
+    cmd += ["-o", outfile]
+
+    popen_kwargs = {"env": _child_env_without_secrets()}
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", **popen_kwargs,
+    )
+    watchdog = threading.Timer(timeout, _kill_process_tree, args=(proc,))
+    watchdog.daemon = True
+    watchdog.start()
+
+    def _feed():
+        try:
+            proc.stdin.write(prompt)
+            proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+
+    threading.Thread(target=_feed, daemon=True).start()
+
+    emitted = ""
+    usage_meta = None
+    stop_reason = "stop"
+    saw_json = False
+    try:
+        for raw in proc.stdout:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                if not saw_json:
+                    raise StreamUnsupported("first --json line is not JSON")
+                continue
+            saw_json = True
+            u = _codex_event_usage(evt)
+            if u:
+                usage_meta = u
+            txt, is_delta = _codex_event_text(evt)
+            if not txt:
+                continue
+            if is_delta:
+                emitted += txt
+                yield ("text", txt)
+            elif not emitted:
+                emitted += txt
+                yield ("text", txt)
+        if not saw_json:
+            raise StreamUnsupported("no --json output")
+        try:
+            with open(outfile, encoding="utf-8") as f:
+                final = f.read().strip()
+        except OSError:
+            final = ""
+        if final and not emitted:
+            emitted = final
+            yield ("text", final)
+        yield ("meta", {"usage": usage_meta, "stop_reason": stop_reason, "text": emitted})
+    finally:
+        watchdog.cancel()
+        _kill_process_tree(proc)
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        for _ in range(5):
+            try:
+                os.remove(outfile)
+                break
+            except FileNotFoundError:
+                break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            logger.warning("could not delete codex temp output file (leaked): %s", outfile)
+
+
+# ============================================================
 # HTTP Handler
 # ============================================================
 
@@ -588,6 +1050,24 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _send_ready(self):
+        """Readiness probe (Idea 13): 200 {ready:true,...} when the server can
+        actually serve, else 503 {ready:false, checks:{...}}. Unauthenticated
+        (like /health) and exposes only booleans, never paths. Checks: bearer
+        token configured, codex CLI resolvable, workdir root exists (when
+        configured), and the concurrency pool isn't saturated."""
+        snap = METRICS.snapshot(int(time.monotonic() - SERVER_START_MONO))
+        checks = {
+            "auth_token_configured": bool(AUTH_TOKEN),
+            "cli_found": shutil.which("codex") is not None,
+            # Only required when configured — an unset root just disables
+            # workspace-write, read-only keeps working, so treat unset as OK.
+            "workdir_root_exists": (WORKDIR_ROOT is None) or os.path.isdir(WORKDIR_ROOT),
+            "not_overloaded": snap["active"] < MAX_CONCURRENCY,
+        }
+        ready = all(checks.values())
+        self._send(200 if ready else 503, {"ready": ready, "checks": checks})
+
     def do_GET(self):
         if self.path == "/health":
             # Unauthenticated callers (LAN liveness probes) get only liveness.
@@ -600,9 +1080,17 @@ class Handler(BaseHTTPRequestHandler):
                 "status": "ok",
                 "model": DEFAULT_MODEL,
                 "default_sandbox": DEFAULT_SANDBOX,
+                "default_profile": "agent" if DEFAULT_SANDBOX == "workspace-write" else "chat",
+                "profiles": list(PROFILES),
                 "uptime": int(time.monotonic() - SERVER_START_MONO),
                 "security": "authenticated" if AUTH_TOKEN else "unauthenticated",
             })
+        elif self.path == "/ready":
+            self._send_ready()
+        elif self.path == "/metrics":
+            if not self._check_auth():
+                return
+            self._send(200, METRICS.snapshot(int(time.monotonic() - SERVER_START_MONO)))
         elif self.path == "/v1/models":
             if not self._check_auth():
                 return
@@ -630,150 +1118,218 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
 
     def _handle_chat(self, body: dict):
-        """OpenAI-compatible chat completions with sandbox/workdir routing."""
-        # Validate body shape before touching it: a non-dict body or non-list
-        # messages/tools would otherwise raise AttributeError/TypeError → a bare
-        # 500 (and via str(exc) could leak internals). Return 400 instead.
-        if not isinstance(body, dict):
-            self._send(400, {"error": {"message": "request body must be a JSON object", "type": "invalid_request_error"}})
-            return
-        messages = body.get("messages", [])
-        if not isinstance(messages, list):
-            self._send(400, {"error": {"message": "messages must be a list", "type": "invalid_request_error"}})
-            return
-        if not messages:
-            self._send(400, {"error": {"message": "messages is required", "type": "invalid_request_error"}})
-            return
-        if not all(isinstance(m, dict) for m in messages):
-            self._send(400, {"error": {"message": "each message must be an object", "type": "invalid_request_error"}})
-            return
-        tools = body.get("tools")
-        if tools is not None and not isinstance(tools, list):
-            self._send(400, {"error": {"message": "tools must be a list", "type": "invalid_request_error"}})
-            return
-        # Each tool must be an object with an object `function` (a `tools:[null]`
-        # or `function: 1` would otherwise reach build_tools_system_prompt and
-        # crash on .get(...) → worker exception. Client error → 400.
-        if isinstance(tools, list):
-            for t in tools:
-                if not isinstance(t, dict) or not isinstance(t.get("function", {}), dict):
-                    self._send(400, {"error": {
-                        "message": "each tool must be an object with a function object",
-                        "type": "invalid_request_error"}})
+        """OpenAI-compatible chat completions with profile/sandbox/workdir routing
+        (Idea 1), structured output (Idea 12) and real streaming (Idea 11)."""
+        METRICS.enter()
+        req_start = time.monotonic()
+        slot = False
+        try:
+            # Validate body shape before touching it: a non-dict body or non-list
+            # messages/tools would otherwise raise AttributeError/TypeError → a bare
+            # 500 (and via str(exc) could leak internals). Return 400 instead.
+            if not isinstance(body, dict):
+                self._send(400, {"error": {"message": "request body must be a JSON object", "type": "invalid_request_error"}})
+                return
+            messages = body.get("messages", [])
+            if not isinstance(messages, list):
+                self._send(400, {"error": {"message": "messages must be a list", "type": "invalid_request_error"}})
+                return
+            if not messages:
+                self._send(400, {"error": {"message": "messages is required", "type": "invalid_request_error"}})
+                return
+            if not all(isinstance(m, dict) for m in messages):
+                self._send(400, {"error": {"message": "each message must be an object", "type": "invalid_request_error"}})
+                return
+            tools = body.get("tools")
+            if tools is not None and not isinstance(tools, list):
+                self._send(400, {"error": {"message": "tools must be a list", "type": "invalid_request_error"}})
+                return
+            # Each tool must be an object with an object `function` (a `tools:[null]`
+            # or `function: 1` would otherwise reach build_tools_system_prompt and
+            # crash on .get(...) → worker exception. Client error → 400.
+            if isinstance(tools, list):
+                for t in tools:
+                    if not isinstance(t, dict) or not isinstance(t.get("function", {}), dict):
+                        self._send(400, {"error": {
+                            "message": "each tool must be an object with a function object",
+                            "type": "invalid_request_error"}})
+                        return
+
+            try:
+                timeout = int(body.get("timeout", 300))
+            except (TypeError, ValueError):
+                timeout = 300
+            timeout = max(10, min(timeout, 600))
+
+            # Per-request reasoning effort overrides the server default (REASONING).
+            # Token-sensitive consumers (code-review) can request 'low'/'minimal'
+            # без смены глобального дефолта для council/CCR. Невалидное → дефолт.
+            req_reasoning = body.get("reasoning")
+            if req_reasoning not in ("minimal", "low", "medium", "high"):
+                req_reasoning = None
+            effective_reasoning = req_reasoning or REASONING
+
+            stream = bool(body.get("stream"))
+
+            # Structured output (Idea 12): supported response_format types inject a
+            # strict-JSON instruction and enable validation + one repair-retry.
+            response_format = body.get("response_format")
+            rf_prompt = build_response_format_prompt(response_format) if response_format is not None else None
+            structured = rf_prompt is not None
+            structured_schema = response_format_schema(response_format) if structured else None
+
+            try:
+                model_base, suffix_mode = resolve_model(body.get("model"))
+                profile, sandbox = resolve_profile_and_sandbox(
+                    tools, body.get("sandbox"), body.get("profile"), suffix_mode)
+                workdir = resolve_workdir(body.get("workdir") or body.get("cwd")) \
+                    if sandbox == "workspace-write" else None
+            except BadRequest as exc:
+                self._send(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
+                return
+
+            # workspace-write requires the *separate* agent token: a leaked read-only
+            # token must not grant file-write/exec. Checked here (not in _check_auth)
+            # because the mode is only known after model/sandbox resolution. read-only
+            # already passed _check_auth against AUTH_TOKEN.
+            if sandbox == "workspace-write" and not self._check_agent_auth():
+                return
+
+            # Separate system prompt from conversation
+            system_parts = []
+            conversation = []
+            for msg in messages:
+                role = msg.get("role", "user")
+                content = extract_content(msg.get("content", ""))
+                if role == "system":
+                    system_parts.append(content)
+                elif role == "tool":
+                    tool_name = msg.get("name", "function")
+                    tool_call_id = msg.get("tool_call_id")
+                    header = f"[Tool {tool_name}"
+                    if tool_call_id:
+                        header += f" id={tool_call_id}"
+                    header += f"]: {content}"
+                    conversation.append(("tool", header))
+                elif role == "assistant" and msg.get("tool_calls"):
+                    # A pure tool-call assistant turn has empty content but carries
+                    # tool_calls. Render them (with their id) into the text so the
+                    # id referenced by the following tool result actually appears in
+                    # the prompt — otherwise multi-turn tool loops become incoherent
+                    # (result id points at a call absent from the conversation).
+                    # Kept in sync with claude-agent-server's identical branch.
+                    call_lines = []
+                    for tc in msg["tool_calls"]:
+                        fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                        call_lines.append(
+                            f"[Called tool {fn.get('name', '')} id={tc.get('id', '')} "
+                            f"with {fn.get('arguments', '')}]"
+                        )
+                    merged = "\n".join(call_lines)
+                    if content:
+                        merged = content + "\n" + merged
+                    conversation.append((role, merged))
+                else:
+                    conversation.append((role, content))
+
+            if tools:
+                system_parts.append(build_tools_system_prompt(tools))
+            if rf_prompt:
+                system_parts.append(rf_prompt)
+
+            # Codex has no --system-prompt flag → fold system into the prompt text.
+            parts = []
+            if system_parts:
+                parts.append("# System\n" + "\n\n".join(system_parts))
+            if len(conversation) == 1 and not system_parts:
+                parts.append(conversation[0][1])
+            else:
+                for role, content in conversation:
+                    if role == "user":
+                        parts.append(f"User: {content}")
+                    elif role == "assistant":
+                        parts.append(f"Assistant: {content}")
+                    elif role == "tool":
+                        parts.append(content)
+            prompt = "\n\n".join(parts)
+
+            logger.info("Chat: %d msgs (%d sys, %d conv), tools=%s, %d chars, model=%s, profile=%s, sandbox=%s",
+                         len(messages), len(system_parts), len(conversation),
+                         len(tools) if tools else 0, len(prompt), model_base, profile, sandbox)
+
+            completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+            created = int(time.time())
+            resp_model = body.get("model") or DEFAULT_MODEL
+
+            # Bounded queue (Idea 13): wait briefly for a slot, else 429+Retry-After.
+            if not _acquire_slot():
+                METRICS.inc("rejected_overload")
+                self._send(429, {"error": {
+                    "message": f"server busy: >{MAX_CONCURRENCY} concurrent codex requests, queue full",
+                    "type": "rate_limit_error"}},
+                    headers={"Retry-After": str(RETRY_AFTER)})
+                return
+            slot = True
+
+            # Real streaming (Idea 11) — only for plain text: tools and structured
+            # output must buffer the whole answer to parse/validate/repair it.
+            if stream and not tools and not structured:
+                base_usage = {
+                    "prompt_tokens": len(prompt) // 4,
+                    "completion_tokens": 0,
+                    "total_tokens": len(prompt) // 4,
+                    "estimate": True,
+                    "sandbox": sandbox,
+                    "profile": profile,
+                }
+                gen = run_codex_stream(prompt, model_base=model_base, sandbox=sandbox,
+                                       workdir=workdir, reasoning=effective_reasoning, timeout=timeout)
+                first_item = None
+                try:
+                    first_item = next(gen)
+                except StreamUnsupported:
+                    # No SSE byte sent yet — fall back to the buffered path below.
+                    logger.warning("codex --json streaming unsupported; falling back to buffered mode")
+                    try:
+                        gen.close()
+                    except Exception:
+                        pass
+                    gen = None
+                except StopIteration:
+                    gen = None
+                    first_item = None
+                if gen is not None:
+                    self._send_stream_live(gen, first_item, completion_id, created, resp_model, base_usage)
+                    METRICS.record_latency(time.monotonic() - req_start)
                     return
 
-        try:
-            timeout = int(body.get("timeout", 300))
-        except (TypeError, ValueError):
-            timeout = 300
-        timeout = max(10, min(timeout, 600))
-
-        # Per-request reasoning effort overrides the server default (REASONING).
-        # Token-sensitive consumers (code-review) can request 'low'/'minimal'
-        # без смены глобального дефолта для council/CCR. Невалидное → дефолт.
-        req_reasoning = body.get("reasoning")
-        if req_reasoning not in ("minimal", "low", "medium", "high"):
-            req_reasoning = None
-        effective_reasoning = req_reasoning or REASONING
-
-        # codex exec is non-streaming (final message only via -o), so we can't
-        # stream incrementally. Honour stream=true with a minimal SSE wrap: the
-        # complete response is emitted as one chunk followed by [DONE], so OpenAI
-        # SSE clients work instead of silently getting a non-stream JSON body.
-        stream = bool(body.get("stream"))
-
-        try:
-            model_base, suffix_mode = resolve_model(body.get("model"))
-            sandbox = resolve_sandbox(tools, body.get("sandbox"), suffix_mode)
-            workdir = resolve_workdir(body.get("workdir") or body.get("cwd")) \
-                if sandbox == "workspace-write" else None
-        except BadRequest as exc:
-            self._send(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
-            return
-
-        # workspace-write requires the *separate* agent token: a leaked read-only
-        # token must not grant file-write/exec. Checked here (not in _check_auth)
-        # because the mode is only known after model/sandbox resolution. read-only
-        # already passed _check_auth against AUTH_TOKEN.
-        if sandbox == "workspace-write" and not self._check_agent_auth():
-            return
-
-        # Separate system prompt from conversation
-        system_parts = []
-        conversation = []
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = extract_content(msg.get("content", ""))
-            if role == "system":
-                system_parts.append(content)
-            elif role == "tool":
-                tool_name = msg.get("name", "function")
-                tool_call_id = msg.get("tool_call_id")
-                header = f"[Tool {tool_name}"
-                if tool_call_id:
-                    header += f" id={tool_call_id}"
-                header += f"]: {content}"
-                conversation.append(("tool", header))
-            elif role == "assistant" and msg.get("tool_calls"):
-                # A pure tool-call assistant turn has empty content but carries
-                # tool_calls. Render them (with their id) into the text so the
-                # id referenced by the following tool result actually appears in
-                # the prompt — otherwise multi-turn tool loops become incoherent
-                # (result id points at a call absent from the conversation).
-                # Kept in sync with claude-agent-server's identical branch.
-                call_lines = []
-                for tc in msg["tool_calls"]:
-                    fn = tc.get("function", {}) if isinstance(tc, dict) else {}
-                    call_lines.append(
-                        f"[Called tool {fn.get('name', '')} id={tc.get('id', '')} "
-                        f"with {fn.get('arguments', '')}]"
-                    )
-                merged = "\n".join(call_lines)
-                if content:
-                    merged = content + "\n" + merged
-                conversation.append((role, merged))
-            else:
-                conversation.append((role, content))
-
-        if tools:
-            system_parts.append(build_tools_system_prompt(tools))
-
-        # Codex has no --system-prompt flag → fold system into the prompt text.
-        parts = []
-        if system_parts:
-            parts.append("# System\n" + "\n\n".join(system_parts))
-        if len(conversation) == 1 and not system_parts:
-            parts.append(conversation[0][1])
-        else:
-            for role, content in conversation:
-                if role == "user":
-                    parts.append(f"User: {content}")
-                elif role == "assistant":
-                    parts.append(f"Assistant: {content}")
-                elif role == "tool":
-                    parts.append(content)
-        prompt = "\n\n".join(parts)
-
-        logger.info("Chat: %d msgs (%d sys, %d conv), tools=%s, %d chars, model=%s, sandbox=%s",
-                     len(messages), len(system_parts), len(conversation),
-                     len(tools) if tools else 0, len(prompt), model_base, sandbox)
-
-        # Cap concurrent codex subprocesses: reject (429) rather than pile up
-        # threads/processes and burn the subscription under parallel load.
-        if not _CODEX_SEM.acquire(blocking=False):
-            self._send(429, {"error": {
-                "message": f"server busy: >{MAX_CONCURRENCY} concurrent codex requests",
-                "type": "rate_limit_error"}})
-            return
-
-        try:
+            # Buffered path (tools, structured output, or streaming fallback).
             result = run_codex(prompt, model_base=model_base, sandbox=sandbox,
                                workdir=workdir, reasoning=effective_reasoning, timeout=timeout)
+
+            # Structured output: validate + ONE repair-retry (Idea 12).
+            if structured and result:
+                ok, err = validate_structured_output(result, structured_schema)
+                if not ok:
+                    logger.info("structured output invalid (%s); one repair-retry", err)
+                    repair = (prompt + "\n\n# REPAIR — YOUR PREVIOUS RESPONSE WAS INVALID\n"
+                              + err + "\nReturn ONLY the corrected JSON value, nothing else.")
+                    result = run_codex(repair, model_base=model_base, sandbox=sandbox,
+                                       workdir=workdir, reasoning=effective_reasoning, timeout=timeout)
 
             tool_calls = []
             content = result
             if tools and result:
                 tool_calls, content = parse_tool_calls(result)
+                # Validate required args are present + ONE repair-retry (Idea 12).
+                errs = tool_calls_schema_errors(tool_calls, tools)
+                if errs:
+                    logger.info("tool call missing required args (%s); one repair-retry", "; ".join(errs))
+                    repair = (prompt + "\n\n# REPAIR — YOUR PREVIOUS TOOL CALL WAS INVALID\n"
+                              + "; ".join(errs) + "\nReissue the <tool_call> block with ALL required fields set.")
+                    result = run_codex(repair, model_base=model_base, sandbox=sandbox,
+                                       workdir=workdir, reasoning=effective_reasoning, timeout=timeout)
+                    tool_calls, content = parse_tool_calls(result)
 
             resp_message = {"role": "assistant"}
             if tool_calls:
@@ -782,13 +1338,11 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 resp_message["content"] = content
 
-            completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-            created = int(time.time())
-            resp_model = body.get("model") or DEFAULT_MODEL
             finish_reason = "tool_calls" if tool_calls else "stop"
             usage = {
-                # Rough estimate (chars/4). Codex doesn't expose real token
-                # counts in -o output; for ru/CJK this undercounts.
+                # Rough estimate (chars/4). Codex's -o output doesn't expose real
+                # token counts, so buffered responses stay estimate=True; the live
+                # streaming path surfaces real counts when codex --json provides them.
                 "prompt_tokens": len(prompt) // 4,
                 "completion_tokens": len(result) // 4,
                 "total_tokens": (len(prompt) + len(result)) // 4,
@@ -799,7 +1353,10 @@ class Handler(BaseHTTPRequestHandler):
                 # echoing the agent id. Surfaced here (carried into the stream
                 # finish chunk too) so routers/logs see the real execution mode.
                 "sandbox": sandbox,
+                "profile": profile,
             }
+            if structured:
+                usage["structured_output"] = True
 
             if stream:
                 self._send_stream(completion_id, created, resp_model,
@@ -817,7 +1374,10 @@ class Handler(BaseHTTPRequestHandler):
                     }],
                     "usage": usage,
                 })
+            METRICS.record_latency(time.monotonic() - req_start)
         except subprocess.TimeoutExpired:
+            METRICS.inc("timeouts")
+            METRICS.inc("killed_processes")
             self._send(504, {"error": {"message": "codex timeout", "type": "timeout"}})
         except Exception:
             # Full traceback (incl. any workspace paths / codex output) goes to the
@@ -826,7 +1386,9 @@ class Handler(BaseHTTPRequestHandler):
             logger.exception("codex error")
             self._send(500, {"error": {"message": "internal server error", "type": "server_error"}})
         finally:
-            _CODEX_SEM.release()
+            if slot:
+                _CODEX_SEM.release()
+            METRICS.leave()
 
     def _read_body(self) -> dict | None:
         try:
@@ -855,11 +1417,16 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             return None
 
-    def _send(self, code: int, data: dict):
+    def _send(self, code: int, data: dict, headers: dict | None = None):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        # Extra response headers (e.g. Retry-After on an overload 429). Byte-
+        # identical with the other agent server.
+        if headers:
+            for hk, hv in headers.items():
+                self.send_header(hk, str(hv))
         self.end_headers()
         # A client that disconnected (common after a long codex run) makes
         # wfile.write raise ConnectionError/BrokenPipe. Swallow it so it doesn't
@@ -869,6 +1436,66 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         except (ConnectionError, BrokenPipeError):
             return
+
+    def _send_stream_live(self, gen, first_item, resp_id, created, model, base_usage):
+        """Stream ('text', delta) items from generator `gen` as OpenAI SSE content
+        deltas in real time (Idea 11), then a finish chunk carrying real usage /
+        stop_reason. On a client write failure (disconnect) close the generator —
+        its finally kills the CLI process tree, which is the disconnect→cancellation
+        link. `base_usage` seeds usage; the generator's ('meta') real token counts
+        override it (estimate=False). Byte-identical with the other agent server."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        def emit(delta, finish=None, usage=None):
+            chunk = {
+                "id": resp_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            }
+            if usage is not None:
+                chunk["usage"] = usage
+            self.wfile.write(("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8"))
+
+        finish_reason = "stop"
+        usage = dict(base_usage)
+        disconnected = False
+        try:
+            emit({"role": "assistant"})
+            item = first_item
+            while item is not None:
+                kind, payload = item
+                if kind == "text":
+                    if payload:
+                        emit({"content": payload})
+                elif kind == "meta":
+                    meta = payload or {}
+                    finish_reason = meta.get("stop_reason") or "stop"
+                    real = meta.get("usage")
+                    if real:
+                        usage.update(real)
+                try:
+                    item = next(gen)
+                except StopIteration:
+                    item = None
+            emit({}, finish=finish_reason, usage=usage)
+            self.wfile.write(b"data: [DONE]\n\n")
+        except (ConnectionError, BrokenPipeError):
+            disconnected = True
+        finally:
+            # Cancellation: closing the generator throws GeneratorExit into it, so
+            # its finally kills the CLI tree. Harmless if it already finished.
+            try:
+                gen.close()
+            except Exception:
+                pass
+            if disconnected:
+                METRICS.inc("killed_processes")
 
     def _send_stream(self, resp_id: str, created: int, model: str,
                      resp_message: dict, finish_reason: str, usage: dict):
@@ -1027,7 +1654,10 @@ def main():
         logger.info("workspace-write: enabled (separate agent token)")
     else:
         logger.info("workspace-write: DISABLED (set CODEX_AGENT_AGENT_TOKEN to enable agentic mode)")
-    logger.info("Endpoints: POST /v1/chat/completions, GET /v1/models, GET /health")
+    logger.info("Profiles: %s (default %s)", list(PROFILES),
+                "agent" if DEFAULT_SANDBOX == "workspace-write" else "chat")
+    logger.info("Concurrency: %d, queue wait %.1fs, max queue %d", MAX_CONCURRENCY, QUEUE_WAIT_SECONDS, MAX_QUEUE)
+    logger.info("Endpoints: POST /v1/chat/completions, GET /v1/models, GET /health, GET /ready, GET /metrics")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

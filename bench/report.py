@@ -11,11 +11,15 @@ Writes:
 """
 from __future__ import annotations
 
+import argparse
 import json
+import random
 import re
 import statistics
 from collections import defaultdict
 from pathlib import Path
+
+import _store
 
 ROOT = Path(__file__).resolve().parent
 MODELS_JSON = ROOT / "models.json"
@@ -23,6 +27,12 @@ TASKS_JSON = ROOT / "prompts" / "tasks.json"
 RESULTS = ROOT / "results"
 JUDGE_FILE = RESULTS / "_judge.jsonl"
 OUT = ROOT.parent / "LLM_MODELS_BENCH_2026-05-15.md"
+
+# Regression thresholds vs a baseline run (ideas 16 & 18).
+LATENCY_REGRESSION_PCT = 25      # median latency grew by more than this % → flag
+QUALITY_REGRESSION_DELTA = 0.5   # quality dropped by more than this (0-5) → flag
+BOOTSTRAP_RESAMPLES = 1000
+BOOTSTRAP_SEED = 0
 
 # Markers wrapping the hand-written TL;DR. On re-run, if OUT already exists we
 # splice the existing block between these markers back in, so manual edits survive.
@@ -58,6 +68,45 @@ def fmt_s_unit(v):
     if v is None:
         return "—"
     return f"{v:.2f}s"
+
+
+def bootstrap_ci(samples: list[float], repeats: int,
+                 lo: float = 2.5, hi: float = 97.5,
+                 seed: int = BOOTSTRAP_SEED,
+                 resamples: int = BOOTSTRAP_RESAMPLES) -> tuple[float, float] | None:
+    """Percentile bootstrap CI for the MEDIAN of `samples` (pure stdlib).
+
+    Returns (lo, hi) or None when there isn't enough signal. Per idea 16 a CI is
+    only produced when the protocol was repeated (repeats>=2) or there are enough
+    samples (>=5); with fewer than 2 points there's nothing to resample.
+    """
+    n = len(samples)
+    if n < 2:
+        return None
+    if not (repeats >= 2 or n >= 5):
+        return None
+    rng = random.Random(seed)
+    meds: list[float] = []
+    for _ in range(resamples):
+        resample = [samples[rng.randrange(n)] for _ in range(n)]
+        meds.append(statistics.median(resample))
+    meds.sort()
+
+    def pct(p: float) -> float:
+        idx = int(round(p / 100 * (len(meds) - 1)))
+        return meds[max(0, min(len(meds) - 1, idx))]
+
+    return (pct(lo), pct(hi))
+
+
+def fmt_ci(median_val, ci, unit: str = "") -> str:
+    """`1.50s [1.20–1.80]` when a CI is available, else plain `fmt_s_unit`."""
+    if median_val is None:
+        return "—"
+    base = f"{median_val:.2f}{unit}"
+    if ci is None:
+        return base
+    return f"{base} [{ci[0]:.2f}–{ci[1]:.2f}]"
 
 
 def heuristic(task_id: str, text: str) -> str:
@@ -99,7 +148,53 @@ def heuristic(task_id: str, text: str) -> str:
     return ""
 
 
+def load_run(run_arg: str | None = None):
+    """Load one immutable run (or the flat legacy layout when run_arg/latest is
+    absent). Returns (records_by_model, last_by_cell, judges, manifest, run_dir).
+
+    records_by_model keeps EVERY record (all repeats) for bootstrap CIs;
+    last_by_cell keeps the last record per (model,task) for per-task tables.
+    """
+    run_dir = _store.resolve_run_dir(run_arg)
+    records_by_model: dict[str, list[dict]] = defaultdict(list)
+    last_by_cell: dict[tuple[str, str], dict] = {}
+    for jl in _store.result_files(run_dir):
+        mid = jl.stem
+        for line in jl.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            tid = r.get("task_id")
+            if tid is None:
+                continue
+            records_by_model[mid].append(r)
+            last_by_cell[(mid, tid)] = r
+    judges: dict[tuple[str, str], dict] = {}
+    jf = _store.judge_file(run_dir)
+    if jf.exists():
+        for line in jf.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                d = json.loads(line)
+                judges[(d["model_id"], d["task_id"])] = d
+            except Exception:
+                pass
+    manifest = _store.load_manifest(run_dir)
+    return records_by_model, last_by_cell, judges, manifest, run_dir
+
+
 def main():
+    ap = argparse.ArgumentParser(description="Generate the markdown benchmark report.")
+    ap.add_argument("--run", help="run id / run dir / manifest.json to report (default: latest run)")
+    ap.add_argument("--baseline", help="run id / run dir / manifest.json to flag regressions against")
+    ap.add_argument("--out", help="output markdown path (default: repo-root LLM_MODELS_BENCH_2026-05-15.md)")
+    args = ap.parse_args()
+    out_path = Path(args.out) if args.out else OUT
+
     models = json.loads(MODELS_JSON.read_text(encoding="utf-8"))["models"]
     tasks_data = json.loads(TASKS_JSON.read_text(encoding="utf-8"))
     tasks = tasks_data["tasks"]
@@ -109,20 +204,25 @@ def main():
     # Ollama uses num_predict = MAX_TOKENS * 2 in run.py.
     max_output_tokens = tasks_data.get("_meta", {}).get("max_output_tokens", 2048)
 
-    # Load all results: results[(model_id, task_id)] = record
-    results: dict[tuple[str, str], dict] = {}
-    for jl in sorted(RESULTS.glob("*.jsonl")):
-        if jl.name.startswith("_"):
-            continue
-        mid = jl.stem
-        for line in jl.read_text(encoding="utf-8", errors="replace").splitlines():
-            if not line.strip():
-                continue
-            try:
-                r = json.loads(line)
-                results[(mid, r["task_id"])] = r
-            except Exception:
-                pass
+    # Load the run being reported (latest, or --run) and the optional baseline.
+    records_by_model, results, judges, manifest, run_dir = load_run(args.run)
+    repeats = int(manifest.get("repeats", 1)) if manifest else 1
+
+    baseline_q: dict[str, float] = {}
+    baseline_total: dict[str, float] = {}
+    baseline_dir = None
+    if args.baseline:
+        b_recs, _b_last, b_judges, _b_manifest, baseline_dir = load_run(args.baseline)
+        for m in models:
+            mid = m["id"]
+            b_tot = [r["total_s"] for r in b_recs.get(mid, [])
+                     if not r.get("error") and (r.get("text") or "").strip() and r.get("total_s") is not None]
+            if b_tot:
+                baseline_total[mid] = statistics.median(b_tot)
+            b_sc = [j["score"] for (jm, jt), j in b_judges.items()
+                    if jm == mid and j.get("score") is not None]
+            if b_sc:
+                baseline_q[mid] = statistics.mean(b_sc)
 
     # Actual run-date span of the loaded raw records (ts = "YYYY-MM-DDT..."). The
     # report title/filename is a fixed 2026-05-15 snapshot, so surface when the
@@ -130,21 +230,10 @@ def main():
     run_dates = sorted({r["ts"][:10] for r in results.values()
                         if isinstance(r.get("ts"), str) and len(r["ts"]) >= 10})
 
-    # Load judge scores
-    judges: dict[tuple[str, str], dict] = {}
-    if JUDGE_FILE.exists():
-        for line in JUDGE_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
-            if not line.strip():
-                continue
-            try:
-                d = json.loads(line)
-                judges[(d["model_id"], d["task_id"])] = d
-            except Exception:
-                pass
-
     model_by_id = {m["id"]: m for m in models}
 
     # === Aggregates per model ===
+    regressions: list[str] = []
     rows = []
     for m in models:
         mid = m["id"]
@@ -154,7 +243,19 @@ def main():
                 "skip": m["skip_reason"], "ok": 0, "n": 0,
             })
             continue
-        ttfts, ttfts_r, totals, scores = [], [], [], []
+        # Latency samples span ALL repeats (records_by_model), so the bootstrap CI
+        # reflects cold/warm spread; ok/empty/errors stay per-task (last record).
+        ttfts, ttfts_r, totals = [], [], []
+        for r in records_by_model.get(mid, []):
+            if r.get("error") or not (r.get("text") or "").strip():
+                continue
+            if r.get("ttft_s") is not None:
+                ttfts.append(r["ttft_s"])
+            if r.get("ttft_reasoning_s") is not None:
+                ttfts_r.append(r["ttft_reasoning_s"])
+            if r.get("total_s") is not None:
+                totals.append(r["total_s"])
+        scores: list[float] = []
         ok = 0
         empty_text = 0
         errors = []
@@ -169,15 +270,25 @@ def main():
                 empty_text += 1
                 continue
             ok += 1
-            if r.get("ttft_s") is not None:
-                ttfts.append(r["ttft_s"])
-            if r.get("ttft_reasoning_s") is not None:
-                ttfts_r.append(r["ttft_reasoning_s"])
-            if r.get("total_s") is not None:
-                totals.append(r["total_s"])
             j = judges.get((mid, tid))
             if j and j.get("score") is not None:
                 scores.append(j["score"])
+        total_p50 = statistics.median(totals) if totals else None
+        quality_avg = statistics.mean(scores) if scores else None
+        # Regression flags vs baseline (idea 16/18).
+        regressed = False
+        if mid in baseline_total and total_p50 is not None and baseline_total[mid] > 0:
+            grew = (total_p50 - baseline_total[mid]) / baseline_total[mid] * 100
+            if grew > LATENCY_REGRESSION_PCT:
+                regressed = True
+                regressions.append(
+                    f"`{mid}` — Total p50 {baseline_total[mid]:.2f}s → {total_p50:.2f}s (+{grew:.0f}%)")
+        if mid in baseline_q and quality_avg is not None:
+            drop = baseline_q[mid] - quality_avg
+            if drop > QUALITY_REGRESSION_DELTA:
+                regressed = True
+                regressions.append(
+                    f"`{mid}` — Q {baseline_q[mid]:.2f} → {quality_avg:.2f} (−{drop:.2f})")
         rows.append({
             "id": mid,
             "provider": m["provider"],
@@ -186,6 +297,7 @@ def main():
             "ok": ok,
             "empty_text": empty_text,
             "ttft_p50": statistics.median(ttfts) if ttfts else None,
+            "ttft_ci": bootstrap_ci(ttfts, repeats),
             # p90 needs ≥5 samples to be meaningful; below that we return None
             # (renders as '—') instead of falling back to max(), which would
             # be misleadingly labeled p90.
@@ -194,9 +306,11 @@ def main():
             # default "exclusive" diverges on the small bench samples.
             "ttft_p90": statistics.quantiles(ttfts, n=10, method="inclusive")[8] if len(ttfts) >= 5 else None,
             "ttft_r_p50": statistics.median(ttfts_r) if ttfts_r else None,
-            "total_p50": statistics.median(totals) if totals else None,
+            "total_p50": total_p50,
+            "total_ci": bootstrap_ci(totals, repeats),
             "total_p90": statistics.quantiles(totals, n=10, method="inclusive")[8] if len(totals) >= 5 else None,
-            "quality_avg": statistics.mean(scores) if scores else None,
+            "quality_avg": quality_avg,
+            "quality_ci": bootstrap_ci(scores, repeats),
             "quality_n": len(scores),
             # Coverage-penalized quality: a model that answered 2/8 tasks at Q5
             # should NOT outrank a stable 8/8 model at Q4.6. Used for ranking;
@@ -209,6 +323,7 @@ def main():
             # self-assessed and prone to self-preference bias. Flagged with '†'.
             "self_judged": m["provider"] == "claude_agent",
             "errors": errors,
+            "regressed": regressed,
         })
 
     # === Build markdown ===
@@ -219,6 +334,14 @@ def main():
     lines.append(f"**Моделей:** {len(rows)} ({sum(1 for r in rows if not r.get('skip'))} активных)")
     lines.append(f"**Задач:** {len(tasks)} (RU-edit, YT-summary EN/RU, JSON-extract, RU→EN translate, classify, bash one-liner, Python function)")
     lines.append(f"**Judge:** claude-opus-4-8 (через agent server, температура 0)")
+    if manifest:
+        lines.append(
+            f"**Run:** `{manifest.get('run_id', '?')}` · started {manifest.get('started_at', '?')} · "
+            f"git `{(manifest.get('git_sha') or '—')[:12]}` · repeats={manifest.get('repeats', 1)} · "
+            f"seed={manifest.get('seed', 0)}"
+        )
+    elif run_dir is None:
+        lines.append("**Run:** legacy flat `results/*.jsonl` (no manifest)")
     if run_dates:
         if len(run_dates) == 1:
             lines.append(f"**Даты прогонов (из raw-данных):** {run_dates[0]}")
@@ -272,6 +395,10 @@ def main():
     lines.append("- **Total** — wall-clock полного ответа")
     lines.append("- **Quality (0-5)** — LLM-as-judge по рубрикам категории (rubric на каждую категорию см. `bench/judge.py::RUBRIC`)")
     lines.append("- **OK** — задач с непустым финальным `text` (reasoning-only ответы считаются empty)")
+    lines.append(
+        "- **CI** — `median [lo–hi]` = 95%-перцентильный bootstrap CI медианы "
+        f"(1000 ресемплов, seed {BOOTSTRAP_SEED}); показывается только при repeats≥2 или ≥5 семплах"
+    )
     lines.append(f"- Параметры запросов: `temperature=0.2`, `max_tokens={max_output_tokens}` (Ollama: `num_predict={max_output_tokens * 2}`)")
     lines.append("- Запуск последовательный (не параллельный — чтобы не искажать TTFT rate-limit'ами)")
     lines.append("- Источники: `bench/run.py` (раннер), `bench/judge.py` (judge), `bench/results/*.jsonl` (сырые данные)")
@@ -293,7 +420,10 @@ def main():
         r["ttft_p50"] if r["ttft_p50"] is not None else 9999,
     ))
     for r in active:
-        q = f"{r['quality_avg']:.2f}" if r["quality_avg"] is not None else "—"
+        if r["quality_avg"] is not None:
+            q = fmt_ci(r["quality_avg"], r.get("quality_ci"))
+        else:
+            q = "—"
         if r["quality_avg"] is not None and r["quality_n"] < r["n"]:
             q += "*"  # partial coverage
         if r.get("self_judged"):
@@ -301,14 +431,31 @@ def main():
         ok_str = f"{r['ok']}/{r['n']}"
         if r.get("empty_text"):
             ok_str += f" (+{r['empty_text']} empty)"
+        id_cell = f"`{r['id']}`" + (" ⚠️REGRESSION" if r.get("regressed") else "")
         lines.append(
-            f"| `{r['id']}` | {r['provider']} | "
-            f"{fmt_s_unit(r['ttft_p50'])} | {fmt_s_unit(r['ttft_p90'])} | "
+            f"| {id_cell} | {r['provider']} | "
+            f"{fmt_ci(r['ttft_p50'], r.get('ttft_ci'), 's')} | {fmt_s_unit(r['ttft_p90'])} | "
             f"{fmt_s_unit(r.get('ttft_r_p50'))} | "
-            f"{fmt_s_unit(r['total_p50'])} | {fmt_s_unit(r['total_p90'])} | "
+            f"{fmt_ci(r['total_p50'], r.get('total_ci'), 's')} | {fmt_s_unit(r['total_p90'])} | "
             f"{q} | {ok_str} |"
         )
     lines.append("")
+
+    # Regression summary vs baseline (top of report body, per idea 18).
+    if baseline_dir is not None:
+        lines.append("## ⚠️ Регрессии vs baseline")
+        lines.append("")
+        lines.append(
+            f"Baseline: `{baseline_dir.name}`. Пороги: latency +{LATENCY_REGRESSION_PCT}%, "
+            f"quality −{QUALITY_REGRESSION_DELTA}."
+        )
+        lines.append("")
+        if regressions:
+            for reg in regressions:
+                lines.append(f"- {reg}")
+        else:
+            lines.append("_Регрессий не обнаружено._")
+        lines.append("")
 
     skipped = [r for r in rows if r.get("skip")]
     if skipped:
@@ -415,7 +562,7 @@ def main():
 
     # Preserve a hand-edited TL;DR from a previous run: replace the freshly
     # generated default block with the existing one between the markers.
-    preserved = _extract_manual_tldr(OUT)
+    preserved = _extract_manual_tldr(out_path)
     if preserved is not None:
         try:
             i = lines.index(TLDR_BEGIN)
@@ -424,8 +571,8 @@ def main():
         except ValueError:
             pass
 
-    OUT.write_text("\n".join(lines), encoding="utf-8")
-    print(f"Report written: {OUT} ({len(lines)} lines, {OUT.stat().st_size} bytes)")
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"Report written: {out_path} ({len(lines)} lines, {out_path.stat().st_size} bytes)")
 
 
 if __name__ == "__main__":

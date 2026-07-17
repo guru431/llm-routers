@@ -74,6 +74,11 @@ class DialogueState:
     moderator: dict | None = None
     history: list[dict] = field(default_factory=list)
     diversity_scores: list[int] = field(default_factory=list)
+    # Structured per-round diversity-monitor outcomes (diversity monitor 2.0):
+    # each entry {round, status: ok|failed, score, uncertainty, agreers,
+    # post_reprompt_score, delta}. `status="failed"` distinguishes a monitor
+    # call/parse failure from a genuine score=0 (both used to look identical).
+    diversity_monitor_status: list[dict] = field(default_factory=list)
     devils_advocates: list[str] = field(default_factory=list)
 
     started_at: float | None = None
@@ -100,6 +105,10 @@ class DialogueState:
     devils_advocate_rotation: bool = True
 
     _task: asyncio.Task | None = field(default=None, repr=False)
+    # Optional append-only event-journal writer (event_log.EventWriter), attached
+    # by the server so the dialogue emits per-round events a Monitor consumer can
+    # tail. Non-persisted (rebound per run); None in tests / sync runs.
+    event_writer: object | None = field(default=None, repr=False)
     # Serializes dialogue_continue on THIS session: two concurrent continues used
     # to both pass the terminal-phase gate and each spawn a runner (double LLM
     # spend, doubled total_rounds, corrupted history). Lazily binds to the loop on
@@ -148,6 +157,7 @@ def _state_from_dump(data: dict) -> DialogueState:
     s.moderator = data.get("moderator")
     s.history = data.get("history") or []
     s.diversity_scores = data.get("diversity_scores") or []
+    s.diversity_monitor_status = data.get("diversity_monitor_status") or []
     s.devils_advocates = data.get("devils_advocates") or []
     s.started_at = data.get("started_at")
     s.finished_at = data.get("finished_at")
@@ -370,6 +380,7 @@ def snapshot(state: DialogueState) -> dict:
         "has_result": state.result_markdown is not None,
         "dump_path": state.dump_path,
         "diversity_scores": list(state.diversity_scores),
+        "diversity_monitor_status": list(state.diversity_monitor_status),
         "devils_advocates": list(state.devils_advocates),
     }
 

@@ -1,0 +1,71 @@
+name: CI
+
+# Safety + docs contracts that a local pre-commit hook can't guarantee:
+# canonical quick tests, a secret scan, a markdown link check, and a pre-commit
+# hook-fixture check. Runs on every push / PR.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Quick test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e "mcp-council[dev]"
+          pip install httpx
+      - name: Run canonical quick tests
+        run: python run_tests.py --quick
+
+  compileall:
+    name: Compile all packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Byte-compile every package
+        run: |
+          python -m compileall -q mcp-council bench claude-agent-server codex-agent-server
+
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+          GITLEAKS_ENABLE_SUMMARY: "true"
+
+  markdown-links:
+    name: Markdown link check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check relative markdown links resolve
+        run: python scripts/check_markdown_links.py
+
+  hook-fixtures:
+    name: Pre-commit hook fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Hook blocks a planted secret and passes clean content
+        run: bash scripts/test_pre_commit_hook.sh

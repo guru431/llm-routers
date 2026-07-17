@@ -17,14 +17,22 @@ Writes:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import platform
+import random
+import subprocess
 import sys
 import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+import _store
 
 ROOT = Path(__file__).resolve().parent
 # Default: <repo>/secrets/vault.env (assumes bench/ sits at repo root).
@@ -59,7 +67,7 @@ def load_vault() -> dict[str, str]:
 # Per-API streaming implementations. All return (ttft_s, total_s, text, tok_out, err)
 # ============================================================================
 
-def call_openai(endpoint: str, model: str, system: str, user: str, api_key: str | None) -> dict:
+def call_openai(client: httpx.Client, endpoint: str, model: str, system: str, user: str, api_key: str | None) -> dict:
     """OpenAI-compatible streaming via SSE. Falls back to non-stream JSON if server ignores stream:true."""
     url = f"{endpoint.rstrip('/')}/chat/completions"
     headers = {"Content-Type": "application/json"}
@@ -83,7 +91,7 @@ def call_openai(endpoint: str, model: str, system: str, user: str, api_key: str 
     tok_out: int | None = None
     http_status: int = 0
     try:
-        with httpx.stream(
+        with client.stream(
             "POST", url, headers=headers, json=body,
             timeout=httpx.Timeout(TIMEOUT_READ, connect=TIMEOUT_CONNECT),
         ) as r:
@@ -193,7 +201,7 @@ def call_openai(endpoint: str, model: str, system: str, user: str, api_key: str 
         }
 
 
-def call_gemini(endpoint: str, model: str, system: str, user: str, api_key: str) -> dict:
+def call_gemini(client: httpx.Client, endpoint: str, model: str, system: str, user: str, api_key: str) -> dict:
     """Google Gemini streamGenerateContent with SSE."""
     # Pass API key via header to keep it out of URL/access logs.
     url = f"{endpoint.rstrip('/')}/models/{model}:streamGenerateContent?alt=sse"
@@ -215,7 +223,7 @@ def call_gemini(endpoint: str, model: str, system: str, user: str, api_key: str)
     tok_out: int | None = None
     http_status: int = 0
     try:
-        with httpx.stream(
+        with client.stream(
             "POST", url, headers=headers, json=body,
             timeout=httpx.Timeout(TIMEOUT_READ, connect=TIMEOUT_CONNECT),
         ) as r:
@@ -280,7 +288,7 @@ def call_gemini(endpoint: str, model: str, system: str, user: str, api_key: str)
         }
 
 
-def call_ollama(endpoint: str, model: str, system: str, user: str) -> dict:
+def call_ollama(client: httpx.Client, endpoint: str, model: str, system: str, user: str) -> dict:
     """Ollama /api/chat streaming (NDJSON)."""
     url = f"{endpoint.rstrip('/')}/api/chat"
     body = {
@@ -300,7 +308,7 @@ def call_ollama(endpoint: str, model: str, system: str, user: str) -> dict:
     tok_out: int | None = None
     http_status: int = 0
     try:
-        with httpx.stream(
+        with client.stream(
             "POST", url, headers={"Content-Type": "application/json"}, json=body,
             timeout=httpx.Timeout(TIMEOUT_READ, connect=TIMEOUT_CONNECT),
         ) as r:
@@ -364,23 +372,46 @@ def call_ollama(endpoint: str, model: str, system: str, user: str) -> dict:
         }
 
 
-def run_one(model_cfg: dict, task: dict, env: dict[str, str]) -> dict:
+def run_one(client: httpx.Client, model_cfg: dict, task: dict, env: dict[str, str]) -> dict:
     api = model_cfg.get("api", "openai")
     auth_env = model_cfg.get("auth_env")
     api_key = env.get(auth_env) if auth_env else None
     if api == "openai":
-        return call_openai(model_cfg["endpoint"], model_cfg["model"], task["system"], task["user"], api_key)
+        return call_openai(client, model_cfg["endpoint"], model_cfg["model"], task["system"], task["user"], api_key)
     if api == "gemini":
         if not api_key:
             return {"ttft_s": None, "ttft_reasoning_s": None, "total_s": 0,
                     "text": "", "reasoning_text": "", "tok_out": None,
                     "http_status": 0, "streaming": False, "error": "no api key"}
-        return call_gemini(model_cfg["endpoint"], model_cfg["model"], task["system"], task["user"], api_key)
+        return call_gemini(client, model_cfg["endpoint"], model_cfg["model"], task["system"], task["user"], api_key)
     if api == "ollama":
-        return call_ollama(model_cfg["endpoint"], model_cfg["model"], task["system"], task["user"])
+        return call_ollama(client, model_cfg["endpoint"], model_cfg["model"], task["system"], task["user"])
     return {"ttft_s": None, "ttft_reasoning_s": None, "total_s": 0,
             "text": "", "reasoning_text": "", "tok_out": None,
             "http_status": 0, "streaming": False, "error": f"unknown api {api}"}
+
+
+# ============================================================================
+# Immutable-run bookkeeping (idea 15)
+# ============================================================================
+
+def _git_sha() -> str | None:
+    """Current HEAD SHA of the repo, or None if git is unavailable / not a repo."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0:
+            return r.stdout.strip() or None
+    except Exception:
+        return None
+    return None
+
+
+def _sha16(data: bytes) -> str:
+    """First 16 hex chars of sha256 — enough to fingerprint config file content."""
+    return hashlib.sha256(data).hexdigest()[:16]
 
 
 def main():
@@ -391,7 +422,15 @@ def main():
     ap.add_argument("--providers", help="comma-separated provider filter")
     ap.add_argument("--skip-existing", action="store_true", help="skip (model,task) if already in results")
     ap.add_argument("--include-broken", action="store_true", help="include models with skip_reason set")
+    ap.add_argument("--repeats", type=int, default=1,
+                    help="run each (model,task) N times (statistical protocol, idea 16)")
+    ap.add_argument("--warmup", action="store_true",
+                    help="one discarded call per model before scored cells (warms connection/model)")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="RNG seed for randomized (model,task,repeat) interleaving")
     args = ap.parse_args()
+    if args.repeats < 1:
+        ap.error("--repeats must be >= 1")
 
     env = load_vault()
     models_data = json.loads(MODELS_JSON.read_text(encoding="utf-8"))
@@ -445,18 +484,52 @@ def main():
     if args.task:
         tasks = [t for t in tasks if t["id"] == args.task]
 
-    total_cells = len(models) * len(tasks)
-    cell = 0
-    for m in models:
-        out_file = RESULTS / f"{m['id']}.jsonl"
-        existing: set[str] = set()
-        if args.skip_existing and out_file.exists():
-            # Decide skip by the LATEST record per task, not by "any historical
-            # success". Records are appended in run order, so the last line for a
-            # task_id is its current state. A cell that later regressed to an error
-            # must be re-run (a stale older success must not keep it skipped).
+    # === Immutable run directory + manifest (idea 15) ===
+    run_id = uuid.uuid4().hex
+    started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    run_dir = _store.RUNS_DIR / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "run_id": run_id,
+        "started_at": started_at,
+        "git_sha": _git_sha(),
+        "models_json_sha": _sha16(MODELS_JSON.read_bytes()),
+        "tasks_json_sha": _sha16(TASKS_JSON.read_bytes()),
+        "cli_args": vars(args),
+        "temperature": TEMPERATURE,
+        "max_tokens": MAX_TOKENS,
+        "repeats": args.repeats,
+        "seed": args.seed,
+        "python_version": platform.python_version(),
+    }
+    (run_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    # Point latest.txt at this run up front, so report.py/judge.py can pick up a
+    # partial (still-valid, immutable) run even if it is interrupted mid-way.
+    _store.LATEST_TXT.write_text(run_id, encoding="utf-8")
+    sys.stderr.write(f"RUN {run_id} → {run_dir}\n")
+
+    # === Statistical protocol: randomized (model,task,repeat) interleaving (idea 16) ===
+    # Spreading repeats and models across time (rather than looping model-by-model)
+    # keeps a transient provider hiccup from biasing one model's whole row.
+    cells = [(m, t, rep) for m in models for t in tasks for rep in range(args.repeats)]
+    rng = random.Random(args.seed)
+    rng.shuffle(cells)
+    order = ", ".join(f"{m['id']}/{t['id']}#{rep}" for m, t, rep in cells)
+    sys.stderr.write(f"ORDER (seed={args.seed}, {len(cells)} cells): {order}\n")
+
+    # Skip-existing works within the (fresh) run dir: on a normal invocation the
+    # run dir starts empty so nothing is skipped; if the same run dir is re-run
+    # (resume), a task with a prior non-error record for a model is skipped.
+    existing: dict[str, set[str]] = {}
+    if args.skip_existing:
+        for m in models:
+            f = run_dir / f"{m['id']}.jsonl"
+            if not f.exists():
+                continue
             latest: dict[str, dict] = {}
-            for line in out_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
                 try:
                     r = json.loads(line)
                 except Exception:
@@ -464,63 +537,74 @@ def main():
                 tid = r.get("task_id")
                 if tid is not None:
                     latest[tid] = r
-            existing = {tid for tid, r in latest.items() if not r.get("error")}
-        # Open the per-model jsonl once for the whole task loop. Reduces I/O
-        # overhead and removes the open/close-per-task window during which a
-        # second run.py for the same model could race the existence check.
-        # Concurrent runs of run.py for the SAME model are still unsupported
-        # (would need filelock) — single-runner is the only supported mode.
-        with out_file.open("a+", encoding="utf-8") as out_f:
-            # If a previous run was killed mid-write, the file may end with a
-            # partial line lacking a newline. Terminate it so the next append
-            # starts on its own line (the partial stays a single malformed line
-            # that the skip-existing/report readers already tolerate) instead of
-            # being concatenated onto the next good record and corrupting it.
-            # Check the tail on the SAME handle's binary buffer (seek to end +
-            # read one byte) — no second open and no full read into memory. Bytes,
-            # not text, sidesteps text-mode seek/decode pitfalls; writes still go
-            # through the text wrapper (append mode → always lands at EOF).
-            buf = out_f.buffer
-            end = buf.seek(0, os.SEEK_END)
-            if end:
-                buf.seek(end - 1)
-                if buf.read(1) != b"\n":
-                    out_f.write("\n")
-                    out_f.flush()
-            for t in tasks:
-                cell += 1
-                if t["id"] in existing:
-                    sys.stderr.write(f"[{cell}/{total_cells}] SKIP {m['id']} / {t['id']} (exists)\n")
-                    continue
-                sys.stderr.write(f"[{cell}/{total_cells}] {m['id']} / {t['id']}... ")
+            existing[m["id"]] = {tid for tid, r in latest.items() if not r.get("error")}
+
+    # One reusable HTTP client for every call — persistent connection pool instead
+    # of a fresh TCP/TLS handshake per request (idea 16).
+    client = httpx.Client(timeout=httpx.Timeout(TIMEOUT_READ, connect=TIMEOUT_CONNECT))
+    # Open every per-model handle up front; write as cells complete (interleaved),
+    # close all in finally.
+    handles: dict[str, Any] = {}
+    total_cells = len(cells)
+    cell = 0
+    try:
+        # Warmup: one discarded call per model to warm the connection / model
+        # weights before the scored cells (idea 16). Not written to results.
+        if args.warmup and tasks:
+            for m in models:
+                sys.stderr.write(f"WARMUP {m['id']} (discarded)... ")
                 sys.stderr.flush()
-                res = run_one(m, t, env)
-                ttft = f"{res['ttft_s']:.2f}s" if res["ttft_s"] is not None else "—"
-                ttftr = f"{res.get('ttft_reasoning_s'):.2f}s" if res.get("ttft_reasoning_s") is not None else "—"
-                total = f"{res['total_s']:.2f}s"
-                rlen = len(res.get("reasoning_text") or "")
-                tlen = len(res.get("text") or "")
-                err = res["error"] or "ok"
-                sys.stderr.write(
-                    f"ttft={ttft} ttftR={ttftr} total={total} "
-                    f"txt={tlen}b rsn={rlen}b status={res['http_status']} {err[:50]}\n"
-                )
-                record = {
-                    "model_id": m["id"],
-                    "task_id": t["id"],
-                    "ttft_s": res["ttft_s"],
-                    "ttft_reasoning_s": res.get("ttft_reasoning_s"),
-                    "total_s": res["total_s"],
-                    "tok_out": res["tok_out"],
-                    "http_status": res["http_status"],
-                    "streaming": res["streaming"],
-                    "error": res["error"],
-                    "text": res["text"],
-                    "reasoning_text": res.get("reasoning_text", ""),
-                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                }
-                out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
-                out_f.flush()
+                wr = run_one(client, m, tasks[0], env)
+                sys.stderr.write(f"{'ok' if not wr['error'] else wr['error'][:40]}\n")
+
+        for m, t, rep in cells:
+            cell += 1
+            mid = m["id"]
+            if args.skip_existing and t["id"] in existing.get(mid, set()):
+                sys.stderr.write(f"[{cell}/{total_cells}] SKIP {mid} / {t['id']} (exists)\n")
+                continue
+            sys.stderr.write(f"[{cell}/{total_cells}] {mid} / {t['id']} #{rep}... ")
+            sys.stderr.flush()
+            res = run_one(client, m, t, env)
+            ttft = f"{res['ttft_s']:.2f}s" if res["ttft_s"] is not None else "—"
+            ttftr = f"{res.get('ttft_reasoning_s'):.2f}s" if res.get("ttft_reasoning_s") is not None else "—"
+            total = f"{res['total_s']:.2f}s"
+            rlen = len(res.get("reasoning_text") or "")
+            tlen = len(res.get("text") or "")
+            err = res["error"] or "ok"
+            sys.stderr.write(
+                f"ttft={ttft} ttftR={ttftr} total={total} "
+                f"txt={tlen}b rsn={rlen}b status={res['http_status']} {err[:50]}\n"
+            )
+            record = {
+                "run_id": run_id,
+                "model_id": mid,
+                "task_id": t["id"],
+                "repeat_idx": rep,
+                # First repeat of a (model,task) is the cold call (no warm cache /
+                # connection reuse for that pair); the rest are warm.
+                "cold": rep == 0,
+                "ttft_s": res["ttft_s"],
+                "ttft_reasoning_s": res.get("ttft_reasoning_s"),
+                "total_s": res["total_s"],
+                "tok_out": res["tok_out"],
+                "http_status": res["http_status"],
+                "streaming": res["streaming"],
+                "error": res["error"],
+                "text": res["text"],
+                "reasoning_text": res.get("reasoning_text", ""),
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+            fh = handles.get(mid)
+            if fh is None:
+                fh = (run_dir / f"{mid}.jsonl").open("a", encoding="utf-8")
+                handles[mid] = fh
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            fh.flush()
+    finally:
+        for fh in handles.values():
+            fh.close()
+        client.close()
 
 
 if __name__ == "__main__":

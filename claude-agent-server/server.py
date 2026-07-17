@@ -2,9 +2,12 @@
 Claude Agent Server — универсальный HTTP-прокси для Claude CLI.
 
 Endpoints:
-    POST /v1/chat/completions  — OpenAI-compatible (messages + tools)
+    POST /v1/chat/completions  — OpenAI-compatible (messages + tools + profile +
+                                 response_format + real streaming)
     GET  /v1/models            — Model list (OpenAI-compatible)
     GET  /health               — Healthcheck (включает cache stats, security mode)
+    GET  /ready                — readiness probe (200 ready / 503 with per-check details)
+    GET  /metrics              — JSON counters (requests/active/overload/timeouts/cache/latency)
     DELETE /cache              — Очистить response cache
 
 Env:
@@ -19,7 +22,9 @@ Env:
     CLAUDE_AGENT_CACHE_BYTES — макс. суммарный размер значений кэша в байтах
                               (default: 67108864 = 64 MB; LRU eviction)
     CLAUDE_AGENT_MAX_BODY   — макс. размер тела запроса в байтах (default: 10 MB; >лимит → 413)
-    CLAUDE_AGENT_MAX_CONCURRENCY — макс. параллельных claude-вызовов (default: 4; сверх → 429)
+    CLAUDE_AGENT_MAX_CONCURRENCY — макс. параллельных claude-вызовов (default: 4; сверх → bounded queue)
+    CLAUDE_AGENT_QUEUE_WAIT — сек. ожидания слота перед 429 (default: 5)
+    CLAUDE_AGENT_MAX_QUEUE  — макс. ожидающих в очереди (default: 2×concurrency; переполнение → 429+Retry-After)
 
 Caching:
     Сервер кэширует ответы по ключу (model, system_prompt, prompt). Запросы с
@@ -109,6 +114,18 @@ MODELS = [
     "claude-haiku-4-5-20251001",
 ]
 
+# Capability profiles (Idea 1). claude-agent-server has NO real filesystem access
+# (every call runs `--tools ""` — see run_claude), so:
+#   chat     — default; plain generation, no tools/session persistence.
+#   research — chat + web-search TOOL EMULATION (prompt-injected tools that never
+#              actually touch the host FS). Functionally chat+tools here, since
+#              claude has no real read/write surface to gate — it is a LABEL that
+#              lets callers express intent uniformly across both agent servers.
+#   agent    — NOT supported (no workspace-write mode): rejected with 400. Use
+#              codex-agent-server for the agent profile.
+# A profile is a label, NOT an OS sandbox (see README security section).
+CLAUDE_PROFILES = ("chat", "research")
+
 # Suppress console windows on Windows when calling claude CLI (.cmd shim)
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -159,6 +176,111 @@ except ValueError:
     MAX_CONCURRENCY = 4
 _CLAUDE_SEM = threading.BoundedSemaphore(MAX_CONCURRENCY)
 
+# Bounded request queue (Idea 13): under load, instead of an instant 429, wait a
+# short bounded time for a free slot; refuse (429 + Retry-After) only if the queue
+# is already full or the wait times out. Keeps callers from hammering while the
+# waiting set stays bounded so we never pile up unboundedly.
+try:
+    QUEUE_WAIT_SECONDS = max(0.0, float(os.getenv("CLAUDE_AGENT_QUEUE_WAIT", "5")))
+except ValueError:
+    QUEUE_WAIT_SECONDS = 5.0
+try:
+    MAX_QUEUE = max(0, int(os.getenv("CLAUDE_AGENT_MAX_QUEUE", str(MAX_CONCURRENCY * 2))))
+except ValueError:
+    MAX_QUEUE = MAX_CONCURRENCY * 2
+_QUEUE_LOCK = threading.Lock()
+_QUEUE_WAITING = 0
+# Retry-After seconds advertised on an overload 429 (integer, ≥1).
+RETRY_AFTER = max(1, int(round(QUEUE_WAIT_SECONDS)) or 1)
+
+
+def _acquire_slot() -> bool:
+    """Bounded-queue slot acquisition. Fast path: take a free concurrency slot.
+    Under load: wait up to QUEUE_WAIT_SECONDS in a bounded queue; refuse if the
+    queue is already full (>MAX_QUEUE waiters) or the wait times out. Returns True
+    on success (caller must release _CLAUDE_SEM), else False (caller → 429)."""
+    global _QUEUE_WAITING
+    if _CLAUDE_SEM.acquire(blocking=False):
+        return True
+    with _QUEUE_LOCK:
+        if _QUEUE_WAITING >= MAX_QUEUE:
+            return False
+        _QUEUE_WAITING += 1
+    try:
+        return _CLAUDE_SEM.acquire(timeout=QUEUE_WAIT_SECONDS)
+    finally:
+        with _QUEUE_LOCK:
+            _QUEUE_WAITING -= 1
+
+
+class Metrics:
+    """Thread-safe in-process counters + a small latency ring buffer for /metrics
+    (Idea 13). Byte-identical with the other agent server; cache_* stay 0 where a
+    server has no response cache."""
+
+    def __init__(self, latency_window: int = 128):
+        self._lock = threading.Lock()
+        self._latency_window = latency_window
+        self.total_requests = 0
+        self.active = 0
+        self.rejected_overload = 0
+        self.timeouts = 0
+        self.killed_processes = 0
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self._latencies: list = []
+
+    def inc(self, field: str, n: int = 1):
+        with self._lock:
+            setattr(self, field, getattr(self, field) + n)
+
+    def enter(self):
+        with self._lock:
+            self.total_requests += 1
+            self.active += 1
+
+    def leave(self):
+        with self._lock:
+            if self.active > 0:
+                self.active -= 1
+
+    def record_latency(self, seconds: float):
+        with self._lock:
+            self._latencies.append(seconds)
+            excess = len(self._latencies) - self._latency_window
+            if excess > 0:
+                del self._latencies[0:excess]
+
+    @staticmethod
+    def _percentile(sorted_values: list, pct: float) -> float:
+        if not sorted_values:
+            return 0.0
+        k = int(round((pct / 100.0) * (len(sorted_values) - 1)))
+        k = max(0, min(len(sorted_values) - 1, k))
+        return sorted_values[k]
+
+    def snapshot(self, uptime: int) -> dict:
+        with self._lock:
+            lat = sorted(self._latencies)
+            return {
+                "uptime": uptime,
+                "total_requests": self.total_requests,
+                "active": self.active,
+                "rejected_overload": self.rejected_overload,
+                "timeouts": self.timeouts,
+                "killed_processes": self.killed_processes,
+                "cache_hits": self.cache_hits,
+                "cache_misses": self.cache_misses,
+                "latency_samples": len(lat),
+                "latency_median_s": round(self._percentile(lat, 50), 3),
+                "latency_p90_s": round(self._percentile(lat, 90), 3),
+                "max_concurrency": MAX_CONCURRENCY,
+                "max_queue": MAX_QUEUE,
+            }
+
+
+METRICS = Metrics()
+
 # The system prompt (all system messages + injected tool descriptions) is passed
 # as a single `--system-prompt=<value>` argv. CLAUDE_BIN resolves to the npm
 # `claude.CMD` shim, so subprocess routes it through cmd.exe, whose command-line
@@ -198,6 +320,12 @@ def build_tools_system_prompt(tools: list) -> str:
         lines.append(f"## {name}\n{desc}")
         if sig_parts:
             lines.append("Parameters:\n" + "\n".join(sig_parts))
+        # Full JSON Schema of the parameters (Idea 12): nested objects/arrays,
+        # `items`, `enum`, `oneOf` etc. that the flat signature above drops still
+        # reach the model verbatim. Serialized deterministically (sort_keys) so
+        # the injected prompt — and claude's cache key built from it — stays stable.
+        if isinstance(params, dict) and params:
+            lines.append("Full JSON Schema:\n" + json.dumps(params, ensure_ascii=False, sort_keys=True))
         lines.append("")
 
     lines.append("""# TOOL CALLING RULES — READ CAREFULLY
@@ -248,6 +376,137 @@ def parse_tool_calls(text: str) -> tuple[list[dict], str]:
         remaining = pattern.sub("", text).strip()
 
     return calls, remaining
+
+
+# ============================================================
+# Structured output + schema validation (Idea 12)
+#   byte-identical helpers with the other agent server — apply fixes to both.
+#   Dependency-free: no jsonschema. json_schema_errors is a STRUCTURAL gate
+#   (object type + required-keys, recursive into required object props), not a
+#   full validator — value types beyond object containment are not checked.
+# ============================================================
+
+_JSON_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL)
+
+
+def json_schema_errors(obj, schema) -> list:
+    """Minimal structural check of `obj` against a JSON-Schema subset. Returns a
+    list of human-readable error strings (empty = ok). Checks only: object schemas
+    (type=='object', or `properties`/`required` present) require a dict with all
+    `required` keys, recursing into required object-typed properties."""
+    errors: list = []
+    if not isinstance(schema, dict):
+        return errors
+    props = schema.get("properties")
+    required = schema.get("required") or []
+    if not isinstance(required, list):
+        required = []
+    is_object = schema.get("type") == "object" or isinstance(props, dict) or bool(required)
+    if is_object:
+        if not isinstance(obj, dict):
+            errors.append(f"expected a JSON object, got {type(obj).__name__}")
+            return errors
+        for key in required:
+            if key not in obj:
+                errors.append(f"missing required field: {key!r}")
+        if isinstance(props, dict):
+            for key in required:
+                sub = props.get(key)
+                if key in obj and isinstance(sub, dict):
+                    errors.extend(json_schema_errors(obj[key], sub))
+    return errors
+
+
+def response_format_schema(response_format):
+    """Return the JSON-Schema dict for a `{"type":"json_schema"}` response_format,
+    else None (json_object accepts any JSON; unsupported types are ignored)."""
+    if not isinstance(response_format, dict):
+        return None
+    if response_format.get("type") != "json_schema":
+        return None
+    js = response_format.get("json_schema") or {}
+    schema = js.get("schema") if isinstance(js, dict) else None
+    return schema if isinstance(schema, dict) else None
+
+
+def build_response_format_prompt(response_format):
+    """Build a system-prompt section enforcing structured JSON output for a
+    supported `response_format` (`json_object` | `json_schema`). Returns None for
+    anything unsupported, so the caller leaves the request unconstrained (old
+    behaviour preserved — response_format was previously ignored)."""
+    if not isinstance(response_format, dict):
+        return None
+    rf_type = response_format.get("type")
+    if rf_type == "json_object":
+        return (
+            "# OUTPUT FORMAT — STRICT\n"
+            "Respond with a SINGLE valid JSON value and NOTHING else: no prose, no "
+            "explanation, no markdown code fences. The entire response must parse as JSON."
+        )
+    if rf_type == "json_schema":
+        head = (
+            "# OUTPUT FORMAT — STRICT\n"
+            "Respond with a SINGLE valid JSON value and NOTHING else: no prose, no "
+            "explanation, no markdown code fences. The entire response must parse as JSON"
+        )
+        schema = response_format_schema(response_format)
+        if schema:
+            return head + " and MUST conform to this JSON Schema:\n" + json.dumps(
+                schema, ensure_ascii=False, sort_keys=True)
+        return head + " object."
+    return None
+
+
+def strip_json_fences(text: str) -> str:
+    """Return the inside of a single ```json ... ``` fence if the whole text is one
+    fenced block, else the stripped text unchanged."""
+    candidate = (text or "").strip()
+    m = _JSON_FENCE_RE.match(candidate)
+    return m.group(1).strip() if m else candidate
+
+
+def validate_structured_output(text: str, schema) -> tuple:
+    """Validate `text` is JSON (json_object) and — if `schema` is given
+    (json_schema) — satisfies json_schema_errors. Tolerates one ```json fence.
+    Returns (ok: bool, error_message: str)."""
+    candidate = strip_json_fences(text)
+    try:
+        parsed = json.loads(candidate)
+    except (json.JSONDecodeError, ValueError) as exc:
+        return False, f"response is not valid JSON: {exc}"
+    if schema is not None:
+        errs = json_schema_errors(parsed, schema)
+        if errs:
+            return False, "; ".join(errs)
+    return True, ""
+
+
+def tool_calls_schema_errors(tool_calls: list, tools: list) -> list:
+    """For each parsed tool call, check its arguments carry the required keys of
+    the matching tool's parameters schema. Returns a flat list of human-readable
+    errors (empty = ok). Calls whose name isn't in `tools`, or whose tool has no
+    object schema, are skipped."""
+    schemas: dict = {}
+    for t in tools or []:
+        if isinstance(t, dict):
+            fn = t.get("function", {})
+            if isinstance(fn, dict) and fn.get("name"):
+                schemas[fn["name"]] = fn.get("parameters") or {}
+    errors: list = []
+    for tc in tool_calls:
+        fn = tc.get("function", {})
+        name = fn.get("name", "")
+        schema = schemas.get(name)
+        if not isinstance(schema, dict) or not schema:
+            continue
+        raw = fn.get("arguments", "")
+        try:
+            args = json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, ValueError):
+            errors.append(f"tool {name!r}: arguments are not valid JSON")
+            continue
+        errors.extend(f"tool {name!r}: {e}" for e in json_schema_errors(args, schema))
+    return errors
 
 
 # ============================================================
@@ -400,6 +659,210 @@ def extract_content(content) -> str:
 
 
 # ============================================================
+# Real streaming (Idea 11) — line-by-line JSON events + cancellation
+# ============================================================
+
+def _kill_process_tree(proc: "subprocess.Popen") -> None:
+    """Terminate a claude subprocess and its descendants (the `.cmd` shim spawns
+    a detached `node`). On Windows: `taskkill /T /F`; on POSIX: kill the session
+    process group. Best-effort — never raises. Byte-identical with the other
+    agent server (used by the streaming runner's watchdog / cancellation)."""
+    if proc.poll() is not None:
+        return
+    if sys.platform == "win32":
+        try:
+            r = subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                creationflags=CREATE_NO_WINDOW,
+                timeout=15,
+            )
+            # taskkill can fail (race, elevation) WITHOUT raising — verify the
+            # process actually died and hard-kill the shim if not, so a live
+            # orphaned node can't keep burning the subscription / holding outfile.
+            if r.returncode != 0 and proc.poll() is None:
+                proc.kill()
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+class StreamUnsupported(Exception):
+    """Raised (before any SSE byte is sent) when the CLI's streaming JSON output
+    can't be used, so _handle_chat falls back to the buffered path."""
+
+
+def _map_stop_reason(sr) -> str:
+    """Map an Anthropic stop_reason to an OpenAI finish_reason."""
+    return {
+        "end_turn": "stop",
+        "stop_sequence": "stop",
+        "max_tokens": "length",
+        "tool_use": "tool_calls",
+    }.get(sr, "stop")
+
+
+def _claude_text_from_blocks(content) -> str:
+    """Join text from an Anthropic message content block list."""
+    if not isinstance(content, list):
+        return ""
+    return "".join(
+        b.get("text", "") for b in content
+        if isinstance(b, dict) and b.get("type") == "text"
+    )
+
+
+def _claude_usage(u):
+    """Build an OpenAI-style usage dict (real, estimate=False) from an Anthropic
+    usage block, or None if no token counts are present. cache read/creation input
+    tokens (also real input) are folded into prompt_tokens."""
+    if not isinstance(u, dict):
+        return None
+    inp = u.get("input_tokens")
+    out = u.get("output_tokens")
+    if not isinstance(inp, int) and not isinstance(out, int):
+        return None
+    inp = inp if isinstance(inp, int) else 0
+    out = out if isinstance(out, int) else 0
+    inp += u.get("cache_read_input_tokens", 0) or 0
+    inp += u.get("cache_creation_input_tokens", 0) or 0
+    return {"prompt_tokens": inp, "completion_tokens": out,
+            "total_tokens": inp + out, "estimate": False}
+
+
+def run_claude_stream(prompt, *, system_prompt=None, model=None, timeout=300):
+    """Generator streaming a `claude -p --output-format stream-json` run. Yields
+    ('text', delta) as text arrives (partial content_block_delta events when the
+    CLI emits them, else whole assistant-message text), then one ('meta', {usage,
+    stop_reason, text}) with REAL usage/stop_reason (estimate=False) when the
+    result/assistant events carry them. Reads stdout line-by-line so deltas
+    surface as emitted. Kills the whole process tree on GeneratorExit (client
+    disconnect) or timeout. Raises StreamUnsupported before the first yield if the
+    CLI produced no JSON (e.g. stream-json unsupported) so _handle_chat falls back
+    to buffered run_claude."""
+    m = model or MODEL
+    if m not in MODELS:
+        raise ValueError(f"model not in whitelist: {m!r}")
+    cmd = [
+        CLAUDE_BIN, "--model", m, "-p", "-",
+        "--output-format", "stream-json", "--verbose",
+        "--tools", "", "--strict-mcp-config", "--no-session-persistence",
+    ]
+    sysprompt_file = None
+    if system_prompt:
+        fd, sysprompt_file = tempfile.mkstemp(suffix=".txt", prefix="claude-sys-")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(system_prompt)
+        cmd += ["--system-prompt-file", sysprompt_file]
+    child_env = _child_env_without_secrets(CLAUDE_AGENT_SERVER="1")
+    popen_kwargs = dict(
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", env=child_env,
+    )
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+    watchdog = threading.Timer(timeout, _kill_process_tree, args=(proc,))
+    watchdog.daemon = True
+    watchdog.start()
+
+    def _feed():
+        try:
+            proc.stdin.write(prompt)
+            proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+
+    threading.Thread(target=_feed, daemon=True).start()
+
+    emitted = ""
+    usage_meta = None
+    stop_reason = "stop"
+    saw_json = False
+    try:
+        for raw in proc.stdout:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                if not saw_json:
+                    raise StreamUnsupported("first stream-json line is not JSON")
+                continue
+            saw_json = True
+            if not isinstance(evt, dict):
+                continue
+            etype = evt.get("type")
+            if etype == "content_block_delta":
+                delta = evt.get("delta") or {}
+                txt = delta.get("text")
+                if isinstance(txt, str) and txt:
+                    emitted += txt
+                    yield ("text", txt)
+            elif etype == "assistant":
+                msg = evt.get("message") or {}
+                sr = msg.get("stop_reason")
+                if sr:
+                    stop_reason = _map_stop_reason(sr)
+                mu = _claude_usage(msg.get("usage"))
+                if mu:
+                    usage_meta = mu
+                if not emitted:
+                    txt = _claude_text_from_blocks(msg.get("content"))
+                    if txt:
+                        emitted += txt
+                        yield ("text", txt)
+            elif etype == "result":
+                ru = _claude_usage(evt.get("usage"))
+                if ru:
+                    usage_meta = ru
+                if not emitted:
+                    rtxt = evt.get("result")
+                    if isinstance(rtxt, str) and rtxt:
+                        emitted += rtxt
+                        yield ("text", rtxt)
+        if not saw_json:
+            raise StreamUnsupported("no stream-json output")
+        yield ("meta", {"usage": usage_meta, "stop_reason": stop_reason, "text": emitted})
+    finally:
+        watchdog.cancel()
+        _kill_process_tree(proc)
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        if sysprompt_file:
+            for _ in range(5):
+                try:
+                    os.remove(sysprompt_file)
+                    break
+                except FileNotFoundError:
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            else:
+                logger.warning("could not delete claude system-prompt temp file (leaked): %s", sysprompt_file)
+
+
+# ============================================================
 # HTTP Handler
 # ============================================================
 
@@ -441,6 +904,21 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _send_ready(self):
+        """Readiness probe (Idea 13): 200 {ready:true,...} when the server can
+        actually serve, else 503 {ready:false, checks:{...}}. Unauthenticated
+        (like /health) and exposes only booleans, never paths. Checks: bearer
+        token configured, claude CLI resolvable, and the concurrency pool isn't
+        saturated."""
+        snap = METRICS.snapshot(int(time.monotonic() - SERVER_START_MONO))
+        checks = {
+            "auth_token_configured": bool(AUTH_TOKEN),
+            "cli_found": shutil.which("claude") is not None,
+            "not_overloaded": snap["active"] < MAX_CONCURRENCY,
+        }
+        ready = all(checks.values())
+        self._send(200 if ready else 503, {"ready": ready, "checks": checks})
+
     def do_GET(self):
         if self.path == "/health":
             # Liveness probe must work without a token (200 + minimal body).
@@ -453,6 +931,8 @@ class Handler(BaseHTTPRequestHandler):
             payload = {
                 "status": "ok",
                 "model": MODEL,
+                "default_profile": "chat",
+                "profiles": list(CLAUDE_PROFILES),
                 "uptime": int(time.monotonic() - SERVER_START_MONO),
                 "security": "authenticated" if AUTH_TOKEN else "unauthenticated",
             }
@@ -461,6 +941,12 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 payload["cache"] = {"enabled": False}
             self._send(200, payload)
+        elif self.path == "/ready":
+            self._send_ready()
+        elif self.path == "/metrics":
+            if not self._check_auth():
+                return
+            self._send(200, METRICS.snapshot(int(time.monotonic() - SERVER_START_MONO)))
         elif self.path == "/v1/models":
             if not self._check_auth():
                 return
@@ -500,178 +986,289 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
 
     def _handle_chat(self, body: dict):
-        """OpenAI-compatible chat completions with tool calling support."""
-        # Validate body shape before touching it: a non-dict body or non-list
-        # messages/tools would otherwise raise AttributeError/TypeError before
-        # the try below → a bare worker crash with no HTTP response. Return 400
-        # instead. Mirrors codex-agent-server.
-        if not isinstance(body, dict):
-            self._send(400, {"error": {"message": "request body must be a JSON object", "type": "invalid_request_error"}})
-            return
-        messages = body.get("messages", [])
-        if not isinstance(messages, list):
-            self._send(400, {"error": {"message": "messages must be a list", "type": "invalid_request_error"}})
-            return
-        if not messages:
-            self._send(400, {"error": {"message": "messages is required", "type": "invalid_request_error"}})
-            return
-        if not all(isinstance(m, dict) for m in messages):
-            self._send(400, {"error": {"message": "each message must be an object", "type": "invalid_request_error"}})
-            return
-        tools_raw = body.get("tools")
-        if tools_raw is not None and not isinstance(tools_raw, list):
-            self._send(400, {"error": {"message": "tools must be a list", "type": "invalid_request_error"}})
-            return
-        # Each tool must be an object with an object `function` (a `tools:[null]`
-        # or `function: 1` would otherwise reach build_tools_system_prompt and
-        # crash on .get(...) → worker exception → RemoteDisconnected. Client error → 400.
-        if isinstance(tools_raw, list):
-            for t in tools_raw:
-                if not isinstance(t, dict) or not isinstance(t.get("function", {}), dict):
-                    self._send(400, {"error": {
-                        "message": "each tool must be an object with a function object",
-                        "type": "invalid_request_error"}})
-                    return
-
-        model = body.get("model")
-        # Reject an unknown model with 400 invalid_request_error rather than
-        # letting run_claude raise ValueError → broad except → 500 server_error.
-        # `model` omitted falls back to the (validated-at-startup) default MODEL.
-        if model is not None and model not in MODELS:
-            self._send(400, {"error": {
-                "message": f"model not in whitelist: {model!r}",
-                "type": "invalid_request_error"}})
-            return
-        # Clamp client-provided timeout to [10s, 600s] to prevent DoS via
-        # `timeout: 0` (instant fail) or `timeout: 999999` (hung worker).
+        """OpenAI-compatible chat completions with profiles (Idea 1), structured
+        output (Idea 12), real streaming (Idea 11) and tool-calling emulation."""
+        METRICS.enter()
+        req_start = time.monotonic()
+        slot = False
         try:
-            timeout = int(body.get("timeout", 300))
-        except (TypeError, ValueError):
-            timeout = 300
-        timeout = max(10, min(timeout, 600))
-        tools = body.get("tools")
-        stream = bool(body.get("stream"))
+            # Validate body shape before touching it: a non-dict body or non-list
+            # messages/tools would otherwise raise AttributeError/TypeError before
+            # the try below → a bare worker crash with no HTTP response. Return 400
+            # instead. Mirrors codex-agent-server.
+            if not isinstance(body, dict):
+                self._send(400, {"error": {"message": "request body must be a JSON object", "type": "invalid_request_error"}})
+                return
+            messages = body.get("messages", [])
+            if not isinstance(messages, list):
+                self._send(400, {"error": {"message": "messages must be a list", "type": "invalid_request_error"}})
+                return
+            if not messages:
+                self._send(400, {"error": {"message": "messages is required", "type": "invalid_request_error"}})
+                return
+            if not all(isinstance(m, dict) for m in messages):
+                self._send(400, {"error": {"message": "each message must be an object", "type": "invalid_request_error"}})
+                return
+            tools_raw = body.get("tools")
+            if tools_raw is not None and not isinstance(tools_raw, list):
+                self._send(400, {"error": {"message": "tools must be a list", "type": "invalid_request_error"}})
+                return
+            # Each tool must be an object with an object `function` (a `tools:[null]`
+            # or `function: 1` would otherwise reach build_tools_system_prompt and
+            # crash on .get(...) → worker exception → RemoteDisconnected. Client error → 400.
+            if isinstance(tools_raw, list):
+                for t in tools_raw:
+                    if not isinstance(t, dict) or not isinstance(t.get("function", {}), dict):
+                        self._send(400, {"error": {
+                            "message": "each tool must be an object with a function object",
+                            "type": "invalid_request_error"}})
+                        return
 
-        # Separate system prompt from conversation
-        system_parts = []
-        conversation = []
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = extract_content(msg.get("content", ""))
-            if role == "system":
-                system_parts.append(content)
-            elif role == "tool":
-                # Carry tool_call_id so multi-turn loops can match each result
-                # back to the assistant tool_call that produced it. Without
-                # this the LLM has to guess pairing when >1 tool was called
-                # in the same assistant turn.
-                tool_name = msg.get("name", "function")
-                tool_call_id = msg.get("tool_call_id")
-                header = f"[Tool {tool_name}"
-                if tool_call_id:
-                    header += f" id={tool_call_id}"
-                header += f"]: {content}"
-                conversation.append(("tool", header))
-            elif role == "assistant" and msg.get("tool_calls"):
-                # A pure tool-call assistant turn has empty content but carries
-                # tool_calls. Render them (with their id) into the text so the
-                # id referenced by the following tool result actually appears in
-                # the prompt — otherwise multi-turn tool loops become incoherent
-                # (result id points at a call absent from the conversation).
-                call_lines = []
-                for tc in msg["tool_calls"]:
-                    fn = tc.get("function", {}) if isinstance(tc, dict) else {}
-                    call_lines.append(
-                        f"[Called tool {fn.get('name', '')} id={tc.get('id', '')} "
-                        f"with {fn.get('arguments', '')}]"
-                    )
-                merged = "\n".join(call_lines)
-                if content:
-                    merged = content + "\n" + merged
-                conversation.append((role, merged))
-            else:
-                conversation.append((role, content))
+            model = body.get("model")
+            # Reject an unknown model with 400 invalid_request_error rather than
+            # letting run_claude raise ValueError → broad except → 500 server_error.
+            # `model` omitted falls back to the (validated-at-startup) default MODEL.
+            if model is not None and model not in MODELS:
+                self._send(400, {"error": {
+                    "message": f"model not in whitelist: {model!r}",
+                    "type": "invalid_request_error"}})
+                return
 
-        # Inject tool descriptions into system prompt
-        if tools:
-            system_parts.append(build_tools_system_prompt(tools))
+            # Capability profile (Idea 1). claude has no real filesystem/agentic
+            # mode, so only chat|research are valid; agent is an explicit 400 that
+            # points at codex-agent-server.
+            profile = body.get("profile")
+            if profile is None:
+                profile = "chat"
+            elif profile == "agent":
+                self._send(400, {"error": {
+                    "message": ("profile 'agent' is not supported by claude-agent-server "
+                                "(no workspace-write/agentic mode); use codex-agent-server "
+                                "for the agent profile"),
+                    "type": "invalid_request_error"}})
+                return
+            elif profile not in CLAUDE_PROFILES:
+                self._send(400, {"error": {
+                    "message": f"invalid profile: {profile!r}. Allowed: {list(CLAUDE_PROFILES)} "
+                               f"(agent → use codex-agent-server)",
+                    "type": "invalid_request_error"}})
+                return
 
-        system_prompt = "\n\n".join(system_parts) if system_parts else None
+            # Clamp client-provided timeout to [10s, 600s] to prevent DoS via
+            # `timeout: 0` (instant fail) or `timeout: 999999` (hung worker).
+            try:
+                timeout = int(body.get("timeout", 300))
+            except (TypeError, ValueError):
+                timeout = 300
+            timeout = max(10, min(timeout, 600))
+            tools = body.get("tools")
+            stream = bool(body.get("stream"))
 
-        # Guard the CLI argv length (see SYSTEM_PROMPT_ARGV_LIMIT): a system
-        # prompt too large for `--system-prompt=` on Windows would otherwise fail
-        # opaquely as a 500. A 400 is honest and actionable.
-        if system_prompt and len(system_prompt) > SYSTEM_PROMPT_ARGV_LIMIT:
-            self._send(400, {"error": {
-                "message": (
-                    f"system prompt too large for CLI argv "
-                    f"({len(system_prompt)} > {SYSTEM_PROMPT_ARGV_LIMIT} chars); "
-                    f"reduce system messages or number/size of tools"),
-                "type": "invalid_request_error"}})
-            return
+            # Structured output (Idea 12): supported response_format types inject a
+            # strict-JSON instruction and enable validation + one repair-retry.
+            response_format = body.get("response_format")
+            rf_prompt = build_response_format_prompt(response_format) if response_format is not None else None
+            structured = rf_prompt is not None
+            structured_schema = response_format_schema(response_format) if structured else None
 
-        # Build conversation prompt
-        if len(conversation) == 1:
-            prompt = conversation[0][1]
-        elif len(conversation) == 0:
-            prompt = ""
-        else:
-            parts = []
-            for role, content in conversation:
-                if role == "user":
-                    parts.append(f"User: {content}")
-                elif role == "assistant":
-                    parts.append(f"Assistant: {content}")
+            # Separate system prompt from conversation
+            system_parts = []
+            conversation = []
+            for msg in messages:
+                role = msg.get("role", "user")
+                content = extract_content(msg.get("content", ""))
+                if role == "system":
+                    system_parts.append(content)
                 elif role == "tool":
-                    parts.append(content)
-            prompt = "\n\n".join(parts)
+                    # Carry tool_call_id so multi-turn loops can match each result
+                    # back to the assistant tool_call that produced it. Without
+                    # this the LLM has to guess pairing when >1 tool was called
+                    # in the same assistant turn.
+                    tool_name = msg.get("name", "function")
+                    tool_call_id = msg.get("tool_call_id")
+                    header = f"[Tool {tool_name}"
+                    if tool_call_id:
+                        header += f" id={tool_call_id}"
+                    header += f"]: {content}"
+                    conversation.append(("tool", header))
+                elif role == "assistant" and msg.get("tool_calls"):
+                    # A pure tool-call assistant turn has empty content but carries
+                    # tool_calls. Render them (with their id) into the text so the
+                    # id referenced by the following tool result actually appears in
+                    # the prompt — otherwise multi-turn tool loops become incoherent
+                    # (result id points at a call absent from the conversation).
+                    call_lines = []
+                    for tc in msg["tool_calls"]:
+                        fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                        call_lines.append(
+                            f"[Called tool {fn.get('name', '')} id={tc.get('id', '')} "
+                            f"with {fn.get('arguments', '')}]"
+                        )
+                    merged = "\n".join(call_lines)
+                    if content:
+                        merged = content + "\n" + merged
+                    conversation.append((role, merged))
+                else:
+                    conversation.append((role, content))
 
-        # Reject empty input (e.g. messages with only a system role) BEFORE taking
-        # a concurrency slot: an empty stdin makes the claude CLI spawn for nothing
-        # and waste a _CLAUDE_SEM slot. Fail fast with 400 instead.
-        if not prompt.strip():
-            self._send(400, {"error": {
-                "message": "no user content to send to claude (prompt is empty)",
-                "type": "invalid_request_error"}})
-            return
+            # Inject tool descriptions + response_format into the system prompt
+            if tools:
+                system_parts.append(build_tools_system_prompt(tools))
+            if rf_prompt:
+                system_parts.append(rf_prompt)
 
-        # Cache lookup: skip если есть tools (нестабильные ответы) или явный bypass
-        cache_bypass = body.get("cache") is False
-        cache_eligible = CACHE is not None and not tools and not cache_bypass
-        cached = None
-        if cache_eligible:
-            cached = CACHE.get(model or MODEL, system_prompt, prompt)
+            system_prompt = "\n\n".join(system_parts) if system_parts else None
 
-        logger.info("Chat: %d msgs (%d sys, %d conv), tools=%s, %d chars, model=%s, cache=%s",
-                     len(messages), len(system_parts), len(conversation),
-                     len(tools) if tools else 0, len(prompt), model or MODEL,
-                     "hit" if cached is not None else ("miss" if cache_eligible else "skip"))
+            # Guard the CLI argv length (see SYSTEM_PROMPT_ARGV_LIMIT): a system
+            # prompt too large for `--system-prompt=` on Windows would otherwise fail
+            # opaquely as a 500. A 400 is honest and actionable.
+            if system_prompt and len(system_prompt) > SYSTEM_PROMPT_ARGV_LIMIT:
+                self._send(400, {"error": {
+                    "message": (
+                        f"system prompt too large for CLI argv "
+                        f"({len(system_prompt)} > {SYSTEM_PROMPT_ARGV_LIMIT} chars); "
+                        f"reduce system messages or number/size of tools"),
+                    "type": "invalid_request_error"}})
+                return
 
-        try:
-            if cached is not None:
-                result = cached
+            # Build conversation prompt
+            if len(conversation) == 1:
+                prompt = conversation[0][1]
+            elif len(conversation) == 0:
+                prompt = ""
             else:
-                # Cap concurrent claude subprocesses: reject (429) rather than
-                # pile up processes and burn the Max quota under parallel load.
-                # Cache hits skip this — they don't spawn a subprocess.
-                if not _CLAUDE_SEM.acquire(blocking=False):
-                    self._send(429, {"error": {
-                        "message": f"server busy: >{MAX_CONCURRENCY} concurrent claude requests",
-                        "type": "rate_limit_error"}})
-                    return
+                parts = []
+                for role, content in conversation:
+                    if role == "user":
+                        parts.append(f"User: {content}")
+                    elif role == "assistant":
+                        parts.append(f"Assistant: {content}")
+                    elif role == "tool":
+                        parts.append(content)
+                prompt = "\n\n".join(parts)
+
+            # Reject empty input (e.g. messages with only a system role) BEFORE taking
+            # a concurrency slot: an empty stdin makes the claude CLI spawn for nothing
+            # and waste a slot. Fail fast with 400 instead.
+            if not prompt.strip():
+                self._send(400, {"error": {
+                    "message": "no user content to send to claude (prompt is empty)",
+                    "type": "invalid_request_error"}})
+                return
+
+            # Cache lookup: skip если есть tools / structured output / явный bypass
+            cache_bypass = body.get("cache") is False
+            cache_eligible = CACHE is not None and not tools and not structured and not cache_bypass
+            cached = None
+            if cache_eligible:
+                cached = CACHE.get(model or MODEL, system_prompt, prompt)
+
+            logger.info("Chat: %d msgs (%d sys, %d conv), tools=%s, %d chars, model=%s, profile=%s, cache=%s",
+                         len(messages), len(system_parts), len(conversation),
+                         len(tools) if tools else 0, len(prompt), model or MODEL, profile,
+                         "hit" if cached is not None else ("miss" if cache_eligible else "skip"))
+
+            resp_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+            created = int(time.time())
+            resp_model = model or MODEL
+
+            # Cache hit → serve immediately (no slot, no subprocess). cache is only
+            # eligible without tools/structured, so no tool parse is needed here.
+            if cached is not None:
+                METRICS.inc("cache_hits")
+                usage = {
+                    "prompt_tokens": len(prompt) // 4,
+                    "completion_tokens": len(cached) // 4,
+                    "total_tokens": (len(prompt) + len(cached)) // 4,
+                    "estimate": True,
+                    "cached": True,
+                    "profile": profile,
+                }
+                resp_message = {"role": "assistant", "content": cached}
+                if stream:
+                    self._send_stream(resp_id, created, resp_model, resp_message, "stop", usage)
+                else:
+                    self._send(200, {
+                        "id": resp_id, "object": "chat.completion", "created": created,
+                        "model": resp_model,
+                        "choices": [{"index": 0, "message": resp_message, "finish_reason": "stop"}],
+                        "usage": usage,
+                    })
+                METRICS.record_latency(time.monotonic() - req_start)
+                return
+            if cache_eligible:
+                METRICS.inc("cache_misses")
+
+            # Bounded queue (Idea 13): wait briefly for a slot, else 429+Retry-After.
+            if not _acquire_slot():
+                METRICS.inc("rejected_overload")
+                self._send(429, {"error": {
+                    "message": f"server busy: >{MAX_CONCURRENCY} concurrent claude requests, queue full",
+                    "type": "rate_limit_error"}},
+                    headers={"Retry-After": str(RETRY_AFTER)})
+                return
+            slot = True
+
+            # Real streaming (Idea 11) — only for plain text: tools and structured
+            # output must buffer the whole answer to parse/validate/repair it. A
+            # streamed plain-text response is not written to the cache (the text is
+            # consumed incrementally); cache still serves subsequent identical asks.
+            if stream and not tools and not structured:
+                base_usage = {
+                    "prompt_tokens": len(prompt) // 4,
+                    "completion_tokens": 0,
+                    "total_tokens": len(prompt) // 4,
+                    "estimate": True,
+                    "cached": False,
+                    "profile": profile,
+                }
+                gen = run_claude_stream(prompt, system_prompt=system_prompt, model=model, timeout=timeout)
+                first_item = None
                 try:
-                    result = run_claude(prompt, system_prompt=system_prompt,
-                                        model=model, timeout=timeout)
-                finally:
-                    _CLAUDE_SEM.release()
-                if cache_eligible and result:
-                    CACHE.put(model or MODEL, system_prompt, prompt, result)
+                    first_item = next(gen)
+                except StreamUnsupported:
+                    logger.warning("claude stream-json unsupported; falling back to buffered mode")
+                    try:
+                        gen.close()
+                    except Exception:
+                        pass
+                    gen = None
+                except StopIteration:
+                    gen = None
+                    first_item = None
+                if gen is not None:
+                    self._send_stream_live(gen, first_item, resp_id, created, resp_model, base_usage)
+                    METRICS.record_latency(time.monotonic() - req_start)
+                    return
+
+            # Buffered path (tools, structured output, or streaming fallback).
+            result = run_claude(prompt, system_prompt=system_prompt, model=model, timeout=timeout)
+
+            # Structured output: validate + ONE repair-retry (Idea 12).
+            if structured and result:
+                ok, err = validate_structured_output(result, structured_schema)
+                if not ok:
+                    logger.info("structured output invalid (%s); one repair-retry", err)
+                    repair = (prompt + "\n\n# REPAIR — YOUR PREVIOUS RESPONSE WAS INVALID\n"
+                              + err + "\nReturn ONLY the corrected JSON value, nothing else.")
+                    result = run_claude(repair, system_prompt=system_prompt, model=model, timeout=timeout)
 
             # Parse tool calls if tools were provided
             tool_calls = []
             content = result
             if tools and result:
                 tool_calls, content = parse_tool_calls(result)
+                # Validate required args are present + ONE repair-retry (Idea 12).
+                errs = tool_calls_schema_errors(tool_calls, tools)
+                if errs:
+                    logger.info("tool call missing required args (%s); one repair-retry", "; ".join(errs))
+                    repair = (prompt + "\n\n# REPAIR — YOUR PREVIOUS TOOL CALL WAS INVALID\n"
+                              + "; ".join(errs) + "\nReissue the <tool_call> block with ALL required fields set.")
+                    result = run_claude(repair, system_prompt=system_prompt, model=model, timeout=timeout)
+                    tool_calls, content = parse_tool_calls(result)
+
+            if cache_eligible and result:
+                CACHE.put(model or MODEL, system_prompt, prompt, result)
 
             # Build response
             resp_message = {"role": "assistant"}
@@ -681,29 +1278,27 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 resp_message["content"] = content
 
-            resp_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-            created = int(time.time())
-            resp_model = model or MODEL
             finish_reason = "tool_calls" if tool_calls else "stop"
             # Rough estimate (chars/4). Accurate only for ASCII English; for
-            # ru/CJK 1 char ≈ 2-3 tokens, so these undercount badly. claude CLI
-            # doesn't expose real token counts in -p output. Same usage object is
-            # emitted on both transports (non-stream body and the stream finish
-            # chunk) so streaming clients also get token counters.
+            # ru/CJK 1 char ≈ 2-3 tokens, so these undercount badly. Buffered
+            # `claude -p` output doesn't expose real token counts; the live
+            # streaming path surfaces real counts from stream-json usage events.
             usage = {
                 "prompt_tokens": len(prompt) // 4,
                 "completion_tokens": len(result) // 4,
                 "total_tokens": (len(prompt) + len(result)) // 4,
                 "estimate": True,
-                "cached": cached is not None,
+                "cached": False,
+                "profile": profile,
             }
+            if structured:
+                usage["structured_output"] = True
 
             if stream:
-                # The CLI gives us the full answer at once, so we can't truly
-                # stream. We DO buffer the whole result, then emit it as SSE
-                # chunks so OpenAI-streaming clients (Open WebUI) don't break on
-                # a single JSON blob. Same id/created/model as the non-stream body.
+                # Buffered pseudo-stream (tools/structured/fallback): whole result
+                # sliced into SSE chunks so OpenAI-streaming clients don't break.
                 self._send_stream(resp_id, created, resp_model, resp_message, finish_reason, usage)
+                METRICS.record_latency(time.monotonic() - req_start)
                 return
 
             self._send(200, {
@@ -718,7 +1313,10 @@ class Handler(BaseHTTPRequestHandler):
                 }],
                 "usage": usage,
             })
+            METRICS.record_latency(time.monotonic() - req_start)
         except subprocess.TimeoutExpired:
+            METRICS.inc("timeouts")
+            METRICS.inc("killed_processes")
             self._send(504, {"error": {"message": "claude timeout", "type": "timeout"}})
         except Exception:
             # Full traceback (incl. claude CLI stderr: local paths, home dir /
@@ -727,6 +1325,10 @@ class Handler(BaseHTTPRequestHandler):
             # internals from the 500 body. Mirrors codex-agent-server.
             logger.exception("claude error")
             self._send(500, {"error": {"message": "internal server error", "type": "server_error"}})
+        finally:
+            if slot:
+                _CLAUDE_SEM.release()
+            METRICS.leave()
 
     def _read_body(self) -> dict | None:
         try:
@@ -748,11 +1350,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"error": {"message": "invalid JSON body", "type": "invalid_request_error"}})
             return None
 
-    def _send(self, code: int, data: dict):
+    def _send(self, code: int, data: dict, headers: dict | None = None):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        # Extra response headers (e.g. Retry-After on an overload 429). Byte-
+        # identical with the other agent server.
+        if headers:
+            for hk, hv in headers.items():
+                self.send_header(hk, str(hv))
         self.end_headers()
         # A client that disconnected (common after a timeout) makes wfile.write
         # raise ConnectionError/BrokenPipe. Swallow it so it doesn't bubble to
@@ -762,6 +1369,66 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         except (ConnectionError, BrokenPipeError):
             return
+
+    def _send_stream_live(self, gen, first_item, resp_id, created, model, base_usage):
+        """Stream ('text', delta) items from generator `gen` as OpenAI SSE content
+        deltas in real time (Idea 11), then a finish chunk carrying real usage /
+        stop_reason. On a client write failure (disconnect) close the generator —
+        its finally kills the CLI process tree, which is the disconnect→cancellation
+        link. `base_usage` seeds usage; the generator's ('meta') real token counts
+        override it (estimate=False). Byte-identical with the other agent server."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        def emit(delta, finish=None, usage=None):
+            chunk = {
+                "id": resp_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            }
+            if usage is not None:
+                chunk["usage"] = usage
+            self.wfile.write(("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8"))
+
+        finish_reason = "stop"
+        usage = dict(base_usage)
+        disconnected = False
+        try:
+            emit({"role": "assistant"})
+            item = first_item
+            while item is not None:
+                kind, payload = item
+                if kind == "text":
+                    if payload:
+                        emit({"content": payload})
+                elif kind == "meta":
+                    meta = payload or {}
+                    finish_reason = meta.get("stop_reason") or "stop"
+                    real = meta.get("usage")
+                    if real:
+                        usage.update(real)
+                try:
+                    item = next(gen)
+                except StopIteration:
+                    item = None
+            emit({}, finish=finish_reason, usage=usage)
+            self.wfile.write(b"data: [DONE]\n\n")
+        except (ConnectionError, BrokenPipeError):
+            disconnected = True
+        finally:
+            # Cancellation: closing the generator throws GeneratorExit into it, so
+            # its finally kills the CLI tree. Harmless if it already finished.
+            try:
+                gen.close()
+            except Exception:
+                pass
+            if disconnected:
+                METRICS.inc("killed_processes")
 
     def _send_stream(self, resp_id: str, created: int, model: str,
                      resp_message: dict, finish_reason: str, usage: dict):
@@ -906,7 +1573,9 @@ def main():
     else:
         logger.info("Cache: disabled (CLAUDE_AGENT_CACHE=0)")
     logger.info("Auth: bearer token required on /v1/* and DELETE /cache")
-    logger.info("Endpoints: POST /v1/chat/completions, GET /v1/models, GET /health, DELETE /cache")
+    logger.info("Profiles: %s (default chat)", list(CLAUDE_PROFILES))
+    logger.info("Concurrency: %d, queue wait %.1fs, max queue %d", MAX_CONCURRENCY, QUEUE_WAIT_SECONDS, MAX_QUEUE)
+    logger.info("Endpoints: POST /v1/chat/completions, GET /v1/models, GET /health, GET /ready, GET /metrics, DELETE /cache")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
