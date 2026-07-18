@@ -23,6 +23,12 @@ from models import resolve_member, resolve_members, resolve_preset
 from council import _aggregate as _aggregate_helper  # noqa: F401 — re-exported for tests
 from council import run_council, run_adaptive_council
 from council import MAX_ROUNDS as COUNCIL_MAX_ROUNDS
+from critique import (
+    MAX_VERIFIERS_PER_FINDING,
+    format_critique_markdown,
+    run_critique,
+)
+from lenses import assign_lenses, resolve_lenses
 from single_call import run_single
 from openai_client import CouncilHTTPError
 from logger import _new_call_id, log_call, write_full_dump
@@ -1113,6 +1119,300 @@ async def council_estimate(
     )
     est["members"] = [m["id"] for m in members]
     return est
+
+
+# ---------------------------------------------------------------------------
+# council_critique: independent lensed critics → dedup → adversarial verification
+# ---------------------------------------------------------------------------
+
+
+async def _do_critique_async(
+    subject: str,
+    context_paths: list[str],
+    max_response_tokens: int,
+    members: list[dict],
+    lens_ids: list[str],
+    verifiers_per_finding: int,
+    max_verified_findings: int,
+    web_search: bool,
+    *,
+    on_progress=None,
+    deadline_seconds: float | None = None,
+    max_cost_usd: float | None = None,
+    max_web_searches: int | None = None,
+) -> str:
+    """Validate paths, read files, run the critique, log, return markdown.
+
+    Shared by the blocking tool and the background job so both go through exactly
+    one sandbox + audit path.
+    """
+    start = time.monotonic()
+    call_id = _new_call_id()
+    prompt_size = 0
+    budget = _make_budget(deadline_seconds, max_cost_usd, max_web_searches, None)
+
+    try:
+        max_tokens = _clamp_tokens(max_response_tokens)
+        files_section: str | None = None
+        if context_paths:
+            # Blocking disk I/O — offload so it doesn't stall the event loop.
+            validated = await asyncio.to_thread(resolve_and_validate, context_paths)
+            files = await asyncio.to_thread(read_files_with_limit, validated)
+            files_section = _build_files_section(files)
+        prompt_size = len(((files_section or "") + subject).encode("utf-8"))
+
+        result = await run_critique(
+            subject=subject, members=members, lens_ids=lens_ids,
+            files_section=files_section, max_response_tokens=max_tokens,
+            verifiers_per_finding=verifiers_per_finding,
+            max_verified_findings=max_verified_findings,
+            web_search=web_search, on_progress=on_progress, budget=budget,
+        )
+        summary = result["summary"]
+        dump_path = write_full_dump(call_id, {
+            "call_id": call_id, "mode": "critique", "subject": subject,
+            "context_paths": list(context_paths), "lenses": lens_ids,
+            "critics": result["critics"], "verifiers": result["verifiers"],
+            "findings": result["findings"],
+            "unverified_findings": result["unverified_findings"],
+            "notes": result["notes"], "usage": result["usage"], "summary": summary,
+        })
+        log_call(
+            call_id=call_id, members_total=len(lens_ids),
+            members_ok_stage1=summary["critics_ok"],
+            members_ok_stage2=summary["findings_kept"],
+            prompt_size_bytes=prompt_size,
+            total_latency_ms=int((time.monotonic() - start) * 1000),
+            status="ok", log_dump=str(dump_path.relative_to(Path(__file__).parent)),
+        )
+        return format_critique_markdown(subject, result)
+    except SandboxError as e:
+        log_call(
+            call_id=call_id, members_total=len(lens_ids), members_ok_stage1=0,
+            members_ok_stage2=0, prompt_size_bytes=prompt_size,
+            total_latency_ms=int((time.monotonic() - start) * 1000),
+            status=f"error: sandbox — {e}", log_dump=None,
+        )
+        raise RuntimeError(f"sandbox: {e}") from e
+    except RuntimeError as e:
+        log_call(
+            call_id=call_id, members_total=len(lens_ids), members_ok_stage1=0,
+            members_ok_stage2=0, prompt_size_bytes=prompt_size,
+            total_latency_ms=int((time.monotonic() - start) * 1000),
+            status=f"error: {e}", log_dump=None,
+        )
+        raise
+
+
+def _resolve_critique_args(
+    models: list[str] | None,
+    models_preset: str | None,
+    lenses_arg: list[str] | None,
+    lenses_preset: str | None,
+    verifiers_per_finding: int,
+) -> tuple[list[dict], list[str]]:
+    """Resolve + validate members and lenses. Raises before any work starts."""
+    resolved_models = _resolve_models_arg(models, models_preset)
+    if resolved_models is not None and len(set(resolved_models)) < 2:
+        raise RuntimeError(
+            "council_critique requires at least 2 distinct models — with one model "
+            "the verification stage would only ever be self-review"
+        )
+    if not (0 <= verifiers_per_finding <= MAX_VERIFIERS_PER_FINDING):
+        raise RuntimeError(
+            f"verifiers_per_finding must be in [0, {MAX_VERIFIERS_PER_FINDING}], "
+            f"got {verifiers_per_finding}"
+        )
+    return resolve_members(resolved_models), resolve_lenses(lenses_arg, lenses_preset)
+
+
+@mcp.tool()
+async def council_critique(
+    subject: str,
+    context_paths: list[str] | None = None,
+    lenses: list[str] | None = None,
+    lenses_preset: str | None = None,
+    models: list[str] | None = None,
+    models_preset: str | None = None,
+    verifiers_per_finding: int = 2,
+    max_verified_findings: int = 24,
+    max_response_tokens: int = 8192,
+    web_search: bool = False,
+    deadline_seconds: float | None = None,
+    max_cost_usd: float | None = None,
+    max_web_searches: int | None = None,
+) -> str:
+    """Независимая адверсариальная критика: N критиков с РАЗНЫМИ линзами ищут
+    дефекты вслепую → кросс-линзовый дедуп → каждую находку атакуют верификаторы,
+    чья задача — ОПРОВЕРГНУТЬ её. Возвращает markdown-отчёт.
+
+    Отличие от `council_ask`: там N моделей отвечают на один вопрос с ОДНИМ
+    мандатом и ранжируют друг друга («какой ответ лучше?»). Здесь у каждого
+    критика СВОЙ мандат с явным out_of_scope («что здесь сломано и какие из этих
+    claim'ов переживут проверку?»). Два разных инструмента, не замена друг другу.
+
+    Используй когда: ревью значимого диффа/модуля, security-аудит, разбор дизайна
+    перед реализацией, «что мы упустили». НЕ для рутины — 3-10 минут и десятки
+    вызовов.
+
+    Parameters:
+      subject — что ревьюим: диф, описание архитектуры, вопрос. Сам код обычно
+        удобнее подать через `context_paths` (sandbox), а сюда — что именно
+        оценивать («ревью изменений в critique.py на предмет гонок»).
+      lenses — list[str] | None. Линзы из lenses.LENSES: correctness, security,
+        concurrency, failure-modes, performance, data-integrity, api-contract,
+        simplicity, testing, observability. Минимум 2.
+      lenses_preset — str | None. Вместо ручного списка: "code-review" (дефолт,
+        6 линз), "security-audit", "design-review", "reliability", "fast-3".
+        Взаимоисключимо с `lenses`.
+      models — подмножество CATALOG (≥2). None → все 7 default-членов. Линзы
+        раскладываются по моделям с чередованием provider-доменов, чтобы панель
+        не оказалась одним коррелированным источником.
+      verifiers_per_finding — 0..5 (дефолт 2). Сколько моделей атакуют каждую
+        находку, каждая под своим углом (does-not-reproduce / already-handled /
+        misreads-the-code / not-reachable / wrong-severity). Верификаторы
+        выбираются из моделей, которые находку НЕ поднимали. 0 = пропустить
+        верификацию (дёшево, но список нефильтрованный).
+      max_verified_findings — потолок находок, уходящих на верификацию (дефолт
+        24, по убыванию severity). Всё сверх — в отчёте отдельной секцией как
+        unverified, молча не отбрасывается.
+      web_search — дать критикам Exa-поиск для проверки внешних фактов (API,
+        CVE, дефолты библиотек). Заметно дороже и медленнее.
+      deadline_seconds / max_cost_usd / max_web_searches — run-budget; при
+        пересечении потолка верификация пропускается, находки критиков остаются.
+
+    Verdict в summary: findings_kept/findings_refuted, by_severity, by_status,
+    cross_lens_corroborated, panel_quorum_ok (панель ≥2 provider-доменов),
+    human_review_required (всегда True — верификация фильтрует шум моделей, а не
+    доказывает корректность).
+
+    Note: блокирующий вызов (3-10 мин). Для неблокирующего —
+    `council_critique_async` + council_status/council_result.
+    """
+    members, lens_ids = _resolve_critique_args(
+        models, models_preset, lenses, lenses_preset, verifiers_per_finding
+    )
+    return await _do_critique_async(
+        subject, context_paths or [], max_response_tokens, members, lens_ids,
+        verifiers_per_finding, max_verified_findings, web_search,
+        deadline_seconds=deadline_seconds, max_cost_usd=max_cost_usd,
+        max_web_searches=max_web_searches,
+    )
+
+
+async def _run_critique_job(
+    state: job_state.JobState,
+    subject: str,
+    context_paths: list[str],
+    max_response_tokens: int,
+    members: list[dict],
+    lens_ids: list[str],
+    verifiers_per_finding: int,
+    max_verified_findings: int,
+    web_search: bool,
+) -> None:
+    """Background entry point for council_critique_async.
+
+    Mirrors _run_job's terminal-state discipline: this function owns every
+    terminal transition, and it makes them only after the in-memory result is
+    built — so a disk failure can never leave a job 'done' with no result.
+    """
+    on_progress = None
+    try:
+        on_progress = _make_progress_callback(state)
+        try:
+            markdown = await _do_critique_async(
+                subject, context_paths, max_response_tokens, members, lens_ids,
+                verifiers_per_finding, max_verified_findings, web_search,
+                on_progress=on_progress,
+            )
+        except asyncio.CancelledError:
+            job_state.mark_phase(state, "cancelled")
+            on_progress("result_ready", {"status": "cancelled"})
+            raise
+        except RuntimeError as e:
+            state.error = str(e)
+            job_state.mark_phase(state, "error")
+            on_progress("result_ready", {"status": "error", "error": state.error})
+            return
+        state.result_markdown = markdown
+        job_state.mark_phase(state, "done")
+        try:
+            on_progress("result_ready", {"status": "ok"})
+        except Exception as e:
+            print(
+                f"[mcp-council] critique job {state.job_id} succeeded but post-done "
+                f"bookkeeping failed ({type(e).__name__}: {e}); result is intact",
+                file=sys.stderr,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        # Catch-all so an unexpected error never strands the job in a
+        # non-terminal phase holding one of the MAX_ACTIVE_JOBS slots.
+        if state.phase not in job_state.TERMINAL_PHASES:
+            state.error = state.error or f"{type(e).__name__}: {e}"
+            job_state.mark_phase(state, "error")
+            try:
+                on_progress("result_ready", {"status": "error", "error": state.error})
+            except Exception:
+                pass
+    finally:
+        event_log.close_writer(state.job_id)
+
+
+@mcp.tool()
+async def council_critique_async(
+    subject: str,
+    context_paths: list[str] | None = None,
+    lenses: list[str] | None = None,
+    lenses_preset: str | None = None,
+    models: list[str] | None = None,
+    models_preset: str | None = None,
+    verifiers_per_finding: int = 2,
+    max_verified_findings: int = 24,
+    max_response_tokens: int = 8192,
+    web_search: bool = False,
+) -> dict:
+    """Запустить `council_critique` в фоне и сразу вернуть job_id.
+
+    Прогресс — `council_status(job_id)` (критики видны как stage1, верификаторы
+    как stage2), результат — `council_result(job_id)` при phase == "done".
+    Отмена — `council_cancel(job_id)`. Тот же job-store, что у council_ask_async.
+    """
+    members, lens_ids = _resolve_critique_args(
+        models, models_preset, lenses, lenses_preset, verifiers_per_finding
+    )
+    state = await job_state.create_job(
+        question_preview=subject, synthesis=False, rounds=1,
+    )
+    task = asyncio.create_task(
+        _run_critique_job(
+            state, subject, context_paths or [], max_response_tokens, members,
+            lens_ids, verifiers_per_finding, max_verified_findings, web_search,
+        )
+    )
+    job_state.attach_task(state, task)
+    # Fan-out ceiling the caller can see before committing: one call per lens,
+    # plus verifiers_per_finding per finding — the finding count is unknown up
+    # front, so the verification half is bounded, not predicted.
+    return {
+        "job_id": state.job_id,
+        "phase": state.phase,
+        "lenses": lens_ids,
+        "critics": [f"{a['lens']}@{a['member']['id']}" for a in assign_lenses(lens_ids, members)],
+        "critic_calls": len(lens_ids),
+        "max_verifier_calls": max_verified_findings * verifiers_per_finding,
+        "event_log": str(
+            Path(__file__).parent / "logs" / "events" / f"{state.job_id}.jsonl"
+        ),
+        "hint": (
+            "Poll council_status(job_id); when phase=='done' call "
+            "council_result(job_id). Verifier calls scale with how many findings "
+            "the critics actually raise — max_verifier_calls is the ceiling, not "
+            "the estimate."
+        ),
+    }
 
 
 @mcp.tool()

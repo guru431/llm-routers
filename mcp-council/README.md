@@ -1,6 +1,6 @@
 # mcp-council
 
-MCP-сервер: Karpathy 3-stage council из 7 LLM с опциональной auto-synthesis, multi-round debate, confidence-weighted aggregation и per-model web search через Exa.ai.
+MCP-сервер: Karpathy 3-stage council из 7 LLM с опциональной auto-synthesis, multi-round debate, confidence-weighted aggregation и per-model web search через Exa.ai. Плюс `council_critique` — независимая адверсариальная критика: N критиков с разными линзами → кросс-линзовый дедуп → попытка опровержения каждой находки.
 
 ## Workflow
 
@@ -57,6 +57,38 @@ council_ask_async(question, context_paths=None, max_response_tokens=8192,
 
 Оба `council_ask`/`council_ask_async` принимают `models=[...]` (подмножество CATALOG, ≥2) или `models_preset` (`"full"` / `"diverse-3"` / `"fast-2-single-provider"` — описательные имена, НЕ рейтинг качества; легаси `best`/`balanced`/`cheap` — алиасы), взаимоисключимо.
 
+### `council_critique` — независимая адверсариальная критика (3-10 мин)
+
+```python
+council_critique(
+    subject: str,
+    context_paths: list[str] | None = None,
+    lenses: list[str] | None = None,          # ≥2 из lenses.LENSES
+    lenses_preset: str | None = None,         # code-review | security-audit | design-review | reliability | fast-3
+    models: list[str] | None = None,          # ≥2; None → все 7
+    models_preset: str | None = None,
+    verifiers_per_finding: int = 2,           # 0..5; 0 = пропустить верификацию
+    max_verified_findings: int = 24,
+    max_response_tokens: int = 8192,
+    web_search: bool = False,
+    deadline_seconds / max_cost_usd / max_web_searches = None,
+) -> str   # markdown-отчёт
+```
+
+Три стадии:
+
+1. **Lensed critics (independent)** — каждому критику выдаётся СВОЙ мандат из `lenses.py::LENSES` с явным `out_of_scope`. Именно `out_of_scope` не даёт N критикам сойтись в один общий список «вот пара багов, и добавьте тестов»: без него разные модели с одним промптом дают одно мнение за N latency. Критики не видят друг друга. Линзы раскладываются по моделям с **чередованием provider-доменов**, так что уже 2 линзы садятся на 2 независимых домена.
+2. **Кросс-линзовый дедуп (pure Python, без LLM)** — находки схлопываются по token-overlap + нормализованному location. Дедупер намеренно консервативный: слить два разных бага хуже, чем показать почти-дубль. LLM-дедупер тут не годится — он сам требовал бы верификации.
+3. **Adversarial verification** — каждую находку атакуют `verifiers_per_finding` моделей, которые её **не поднимали**, каждая под своим углом: `does-not-reproduce` / `already-handled` / `misreads-the-code` / `not-reachable` / `wrong-severity`. Инструкция явно асимметричная — «при сомнении ставь `refuted: true`», потому что ложная находка стоит человеку сессии отладки. Опровержение половиной и больше → находка выпадает из основного отчёта, но **остаётся видимой в секции Refuted**: ошибочно опровергнутый реальный баг — главный failure mode этого режима.
+
+Доступные линзы: `correctness`, `security`, `concurrency`, `failure-modes`, `performance`, `data-integrity`, `api-contract`, `simplicity`, `testing`, `observability`.
+
+Что в `summary`: `findings_kept`/`findings_refuted`, `by_severity`, `by_status`, `cross_lens_corroborated` (находки, до которых дошли ≥2 линзы — самый сильный сигнал режима), `lenses_with_findings` vs `lenses_with_surviving_findings`, `panel_quorum_ok` (панель охватила ≥2 provider-домена; иначе отчёт помечается как один коррелированный источник, а не ревью), `verification_quorum_ok` на каждой находке, и `human_review_required` — **всегда True**. Верификация фильтрует шум моделей; корректность она не доказывает.
+
+`council_critique_async` — то же в фоне: возвращает `job_id`, дальше `council_status`/`council_result`/`council_cancel` (тот же job-store, что у `council_ask_async`; критики видны как stage1, верификаторы как stage2).
+
+**Чем отличается от `council_ask`:** там N моделей отвечают на один вопрос с ОДНИМ мандатом и ранжируют друг друга — «какой ответ лучше». Здесь у каждого критика свой мандат, и вместо ранжирования идёт попытка опровержения — «что здесь сломано и что из этого выживет». Это разные инструменты, а не замена друг другу.
+
 ### `model_ask` — один прямой вызов конкретной модели
 
 ```python
@@ -88,7 +120,7 @@ model_healthcheck(models: list[str] | None = None) -> dict
 
 ### Real-time event stream (Monitor-friendly)
 
-Каждый `council_ask_async` создаёт `logs/events/<job_id>.jsonl` (один JSON-event на строку, line-buffered). `council_ask_async` возвращает путь в поле `event_log`. Внешний наблюдатель — например Claude в основной сессии с tool `Monitor` — может `tail -F <event_log>` и реагировать на события в реальном времени без polling'а `council_status`.
+Каждый `council_ask_async` / `council_critique_async` создаёт `logs/events/<job_id>.jsonl` (один JSON-event на строку, line-buffered). `council_ask_async` возвращает путь в поле `event_log`. Внешний наблюдатель — например Claude в основной сессии с tool `Monitor` — может `tail -F <event_log>` и реагировать на события в реальном времени без polling'а `council_status`.
 
 Event types:
 - `phase` — `{"phase": queued|stage1|stage2|stage3|done|error|cancelled, ...}`
@@ -97,6 +129,8 @@ Event types:
 - `stage3` — то же для chairman synthesis
 - `tool_call` — `{"member_id": ..., "name": "web_search", "query": str, "status": "ok"|"error", "num_results": int|None}` — испускается каждый раз когда модель сделала web_search во время своего stage 1
 - `result_ready` — `{"status": "ok"|"error"|"cancelled", "dump_path": str|None}` — финальный event, файл затем закрывается
+
+Для `council_critique_async` те же типы переиспользованы: `phase` даёт `critique|dedup|verify|done`, критики приходят как `stage1_member` (id = `<lens>@<model>`), верификаторы как `stage2_ranker` (id = `verify<N>:<angle>@<model>`, плюс поле `refuted`).
 
 ### Web search per-model (`web_search=True`)
 
@@ -108,7 +142,11 @@ Trade-off: каждая модель тратит +30-90s на 1-3 search iterat
 
 ## Когда применять
 
-Архитектурное решение, спорный технический вопрос, важный code review, разбор сложного бага. **НЕ** используй для рутины (быстрых вопросов, шаблонной генерации) — дорого и медленно.
+`council_ask` — архитектурное решение, спорный технический вопрос, разбор сложного бага: когда нужен **лучший ответ** на открытый вопрос.
+
+`council_critique` — ревью значимого диффа/модуля, security-аудит, проверка дизайна перед реализацией, «что мы упустили»: когда нужно **найти дефекты и отсеять выдуманные**.
+
+**НЕ** используй ни то, ни другое для рутины (быстрых вопросов, шаблонной генерации) — дорого и медленно.
 
 Дополнительно:
 - `rounds=2` примерно удваивает время и токены — оправдано когда answers сильно расходятся в round 1, и хочется чтобы модели увидели критику и улучшили ответы.
