@@ -15,6 +15,17 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+# Flat module layout: the server is a set of top-level modules (server.py,
+# council.py, critique.py, …) plus the dialogue/ package — there is no
+# `mcp_council/` directory, so hatchling's default heuristics cannot infer what
+# to ship and the build fails outright ("Unable to determine which files to ship
+# inside the wheel"). That took `pip install -e "mcp-council[dev]"` down, which is
+# how both the README and CI install this package. Declare the selection instead.
+# Tests and runtime logs are deliberately not part of the distribution.
+[tool.hatch.build.targets.wheel]
+include = ["*.py", "dialogue"]
+exclude = ["tests", "logs"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
