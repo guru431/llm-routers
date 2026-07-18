@@ -105,6 +105,11 @@ class DialogueState:
     devils_advocate_rotation: bool = True
 
     _task: asyncio.Task | None = field(default=None, repr=False)
+    # Set by cancel_session once a cancel has been requested, so a second
+    # concurrent call (the runner hasn't reached its terminal phase yet, so the
+    # phase pre-check still passes) reports False instead of claiming it
+    # cancelled a run that was already cancelling. Non-persisted.
+    _cancel_requested: bool = field(default=False, repr=False)
     # Optional append-only event-journal writer (event_log.EventWriter), attached
     # by the server so the dialogue emits per-round events a Monitor consumer can
     # tail. Non-persisted (rebound per run); None in tests / sync runs.
@@ -326,7 +331,10 @@ async def cancel_session(session_id: str) -> bool:
             return False
         if s.phase in TERMINAL_PHASES:
             return False
+        if s._cancel_requested:
+            return False
         task = s._task
+        s._cancel_requested = True
         if task is None:
             # No background runner attached — no handler to delegate to, so
             # we transition synchronously here. Mirrors mark_phase('cancelled').

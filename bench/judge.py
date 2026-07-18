@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from pathlib import Path
@@ -186,9 +187,14 @@ def _strip_fences(text: str, langs: str = "") -> str:
 
 
 def _exec_parse_duration(code: str) -> bool | None:
-    """Run the T8 reference cases in an isolated, time-boxed subprocess.
+    """Run the T8 reference cases in a time-boxed subprocess.
     True = all pass, False = ran but wrong / raised, None = couldn't run decisively.
-    Executes untrusted model code — gated behind --exec-code by the caller."""
+
+    NOT a sandbox. This executes untrusted model output as this user: the child
+    is time-boxed (5s) and started in an empty temp cwd with a minimal env, but
+    nothing stops it reading files, opening sockets, or writing outside that cwd.
+    Gated behind --exec-code, which is opt-in for exactly this reason; run it
+    only on benchmark output you are willing to execute."""
     harness = code + "\n\n" + textwrap.dedent("""
         import sys
         try:
@@ -205,11 +211,17 @@ def _exec_parse_duration(code: str) -> bool | None:
         except Exception:
             sys.exit(4)
     """)
+    # Empty cwd + minimal env: a stray open("out.txt","w") lands in a throwaway
+    # dir instead of the bench tree, and the child inherits no API keys from the
+    # runner's environment. Damage-limitation only — see the docstring.
     try:
-        r = subprocess.run(
-            [sys.executable, "-c", harness],
-            capture_output=True, text=True, timeout=5,
-        )
+        with tempfile.TemporaryDirectory(prefix="bench-t8-") as tmp:
+            r = subprocess.run(
+                [sys.executable, "-I", "-c", harness],
+                capture_output=True, text=True, timeout=5,
+                cwd=tmp,
+                env={"PATH": os.environ.get("PATH", ""), "SYSTEMROOT": os.environ.get("SYSTEMROOT", "")},
+            )
     except Exception:
         return None
     if r.returncode == 0 and "PASS" in r.stdout:
@@ -382,7 +394,9 @@ def main():
     ap.add_argument("--run", help="run id / run dir / manifest.json to score (default: latest run)")
     ap.add_argument("--judges", help="comma-separated judge model ids (default: env JUDGE_MODELS or claude-opus-4-8)")
     ap.add_argument("--exec-code", action="store_true",
-                    help="run T8 reference cases in a sandboxed subprocess for a deterministic verdict (executes model code)")
+                    help="run T8 reference cases in a time-boxed subprocess for a deterministic verdict. "
+                         "EXECUTES UNTRUSTED MODEL CODE as this user — not a sandbox (no seccomp/chroot/memory cap); "
+                         "the child only gets a temp cwd, a minimal env and a 5s timeout")
     args = ap.parse_args()
 
     # Resolve the active judge panel before any hashing/judging happens.

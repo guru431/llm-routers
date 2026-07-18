@@ -54,7 +54,10 @@ def load_vault() -> dict[str, str]:
     if not VAULT.exists():
         sys.stderr.write(f"vault not found: {VAULT}\n")
         return env
-    for line in VAULT.read_text(encoding="utf-8", errors="replace").splitlines():
+    # utf-8-sig: a vault.env written by a Windows editor / PowerShell can carry a
+    # BOM, which plain utf-8 keeps as an invisible prefix on the FIRST key — so
+    # env["﻿OPENCODE_GO_KEY"] silently never matches the lookup.
+    for line in VAULT.read_text(encoding="utf-8-sig", errors="replace").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue

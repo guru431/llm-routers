@@ -254,10 +254,23 @@ _write_locks: "dict[str, threading.Lock]" = {}
 _write_locks_meta = threading.Lock()
 
 
+# Ceiling on the per-session lock table. Sessions are never explicitly
+# unregistered here (the dump can outlive the session object), so without this
+# the dict grows for the lifetime of the process — one dead entry per session.
+_MAX_WRITE_LOCKS = 256
+
+
 def _write_lock_for(session_id: str) -> threading.Lock:
     with _write_locks_meta:
         lk = _write_locks.get(session_id)
         if lk is None:
+            if len(_write_locks) >= _MAX_WRITE_LOCKS:
+                # Drop only IDLE locks: a held lock still serializes an in-flight
+                # write, and evicting it would hand the next writer a fresh lock
+                # and reopen the interleaved-write race this table exists to stop.
+                for sid, other in list(_write_locks.items()):
+                    if not other.locked():
+                        del _write_locks[sid]
             lk = threading.Lock()
             _write_locks[session_id] = lk
         return lk

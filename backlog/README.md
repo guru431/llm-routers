@@ -7,22 +7,24 @@ ideas. The files split by **privacy** and **lifecycle stage**:
 |---|---|---|
 | `FINDINGS.md` (repo root) | **gitignored** (private) | only `open` side-findings; may reference internal paths/projects |
 | `IDEAS.md` (repo root) | **gitignored** (private) | feature candidates: `proposed → accepted/rejected → done` |
-| `FINDINGS-archive.md` (repo root) | tracked | audit trail of closed findings (`done`/`wontfix` + resolution) |
-| `IDEAS-archive.md` (repo root) | tracked | audit trail of decided ideas (`done`/`rejected` + rationale) |
+| `FINDINGS-archive.md` (repo root) | **gitignored** (private) | findings deliberately *not* done (`wontfix`/`deferred` + rationale) |
+| `IDEAS-archive.md` (repo root) | **gitignored** (private) | ideas deliberately *not* built (`wontfix`/`deferred`/`partial` + rationale) |
 
-**Why the split:** this is a public repo. Open notes can reference internal hosts,
-projects, or people, so they stay local (gitignored). Once an item is *closed* it is
-rewritten to a publishable form and moved to the tracked `*-archive.md` — that file is
-the durable, reviewable record of "what was actually decided and why".
+**Why:** this is a public repo, and all four files can reference internal hosts,
+projects, or people — so all four stay local. The archives hold only what was
+consciously turned down; their job is to stop the same rejected item being filed
+again (weekly auto-review is the main repeat offender). Completed work is *not*
+archived — `git log` and the code are its record.
 
 **Lifecycle rules** (canonical form lives in the global `CLAUDE.md`):
 
 - New finding → prepend to `FINDINGS.md` with `**Status:** open`.
-- Closing a finding → **first** prepend it to `FINDINGS-archive.md` (with
-  `**Status:** done|wontfix` + `**Resolved:** YYYY-MM-DD — …`), **then** delete it
-  from `FINDINGS.md`. Append-before-delete so a crash leaves a dup, never a loss.
-- Ideas follow the same append-to-archive-then-remove flow.
-- Archive entries are never deleted — they are the audit trail.
+- Finding **done** → just delete it from `FINDINGS.md`. Do not archive it.
+- Finding **rejected** → **first** prepend it to `FINDINGS-archive.md` (with
+  `**Status:** wontfix|deferred` + `**Resolved:** YYYY-MM-DD — why not`), **then** delete
+  it from `FINDINGS.md`. Append-before-delete so a crash leaves a dup, never a loss.
+- Ideas follow the same flow: shipped → deleted, rejected → archived.
+- Archive entries are never deleted.
 
 ## Status manifest + stale reminder
 

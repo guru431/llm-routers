@@ -44,3 +44,7 @@ backlog/manifest.json
 # Bench raw runtime artifacts (provider error bodies incl. account ids, reasoning
 # traces, prompt echoes) — never publish. Aggregate numbers live in the report md.
 bench/results/
+
+# Agent-side backlog files (private to maintainer, never published)
+FINDINGS-archive.md
+IDEAS-archive.md

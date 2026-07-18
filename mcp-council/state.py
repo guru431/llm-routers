@@ -346,7 +346,11 @@ async def cancel_job(job_id: str) -> bool:
     # and writing under _jobs_lock keeps this ordered against those and against a
     # second cancel_job, and prevents the _persist here from racing GC's unlink.
     async with _jobs_lock:
-        if j.phase not in TERMINAL_PHASES:
+        # `is _jobs.get(job_id)` — the drain yielded the loop, so a concurrent
+        # _gc_locked may have evicted this job and unlinked its snapshot. Writing
+        # _persist(j) for an evicted job would resurrect the file as an orphan
+        # that nothing ever reaps.
+        if j is _jobs.get(job_id) and j.phase not in TERMINAL_PHASES:
             # No handler ran (e.g. bare coroutine in tests) or it ran but didn't
             # call mark_phase — finalize synchronously.
             j.phase = "cancelled"

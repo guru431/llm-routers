@@ -1403,8 +1403,16 @@ async def _start_dialogue_session(
     state.event_writer.write("phase", {"phase": "starting", "mode": mode,
                                        "participants": [p.get("id") for p in participants]})
 
-    task = asyncio.create_task(_dialogue_runner_guard(state, runner_coro_factory))
-    dialogue_state.attach_task(state, task)
+    # If the runner never starts, nothing will ever close the journal — the
+    # writer stays registered in event_log's process-global table with its file
+    # handle open. Close it on a failed hand-off before re-raising.
+    try:
+        task = asyncio.create_task(_dialogue_runner_guard(state, runner_coro_factory))
+        dialogue_state.attach_task(state, task)
+    except BaseException:
+        event_log.close_writer(state.session_id)
+        state.event_writer = None
+        raise
 
     return {
         "session_id": state.session_id,

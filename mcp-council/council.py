@@ -18,7 +18,7 @@ from typing import Any, Awaitable, Callable
 
 import adaptive
 from budget import RunBudget
-from dlp import build_claim_ledger
+from dlp import build_claim_ledger, redact_secrets
 from healthcheck import _classify_error, healthcheck_models
 from models import CATALOG, effective_max_tokens, provider_domain, resolve_members
 from openai_client import call_openai_compat
@@ -127,12 +127,15 @@ async def _run_member_stage1(
         # Always return a dict so asyncio.gather (no return_exceptions) never
         # sees a raise: any non-cancellation failure (HTTP, KeyError on a
         # malformed result, …) becomes this member's status="error" and the
-        # rest of the fan-out keeps its answers.
+        # rest of the fan-out keeps its answers. The message is redacted first:
+        # it travels into notes / summary.failed_models and back to the MCP
+        # client, and an HTTP library can echo a key-bearing URL or an
+        # Authorization header into the exception text.
         return {
             "id": member["id"],
             "model": member["model"],
             "status": "error",
-            "error": str(e),
+            "error": redact_secrets(str(e)),
             "answer": None,
             "latency_ms": int((time.monotonic() - start) * 1000),
             "tokens_in": None,
@@ -227,7 +230,7 @@ async def _run_member_stage1_round_n(
         # failure becomes status="error" so gather doesn't abort the fan-out.
         return {
             "id": member["id"], "model": member["model"], "status": "error",
-            "error": str(e), "answer": None,
+            "error": redact_secrets(str(e)), "answer": None,
             "latency_ms": int((time.monotonic() - start) * 1000),
             "tokens_in": None, "tokens_out": None,
             "attempts": getattr(e, "attempts", None),
@@ -487,7 +490,7 @@ async def _run_member_stage2(
         return {
             "ranker_id": ranker["id"],
             "status": "error",
-            "error": str(e),
+            "error": redact_secrets(str(e)),
             "rankings": [],
             "pseudonyms": pseudonyms,
             "latency_ms": int((time.monotonic() - start) * 1000),
@@ -523,8 +526,11 @@ async def _run_member_stage2(
             repaired = True
             tin += result2.get("tokens_in") or 0
             tout += result2.get("tokens_out") or 0
-            if result2.get("attempts") is not None:
-                attempts = (attempts or 0) + result2["attempts"]
+            # Sum unconditionally: attempts from the first call may legitimately
+            # be None (a provider result without the field), and the old
+            # `is not None` guard then dropped the repair call's attempts
+            # entirely. `or 0` on both sides keeps None-plus-N == N.
+            attempts = (attempts or 0) + (result2.get("attempts") or 0)
             try:
                 clean, confidence = _normalize_stage2(result2.get("content"), pseudonyms)
             except (_Stage2ParseError, ValueError, KeyError, TypeError) as second_err:
@@ -700,7 +706,7 @@ async def _run_stage3_synthesis(
             "chairman_model": chairman["model"],
             "status": "error",
             "synthesis": None,
-            "error": str(e),
+            "error": redact_secrets(str(e)),
             "latency_ms": int((time.monotonic() - start) * 1000),
             "attempts": getattr(e, "attempts", None),
         }
@@ -862,14 +868,18 @@ def _compute_usage(
         # Prefer the tool-loop aggregates for web_search members (calls/tokens/
         # attempts summed across every iteration); fall back to the single-call
         # figures for plain (non-web) members.
-        if "loop_calls" in rec:
-            rec_calls = rec.get("loop_calls") or 0
+        if rec.get("loop_calls"):
+            rec_calls = rec["loop_calls"]
             rec_in = rec.get("loop_tokens_in") or 0
             rec_out = rec.get("loop_tokens_out") or 0
             rec_attempts = rec.get("loop_attempts") or 0
             calls += rec_calls
             retries += max(0, rec_attempts - rec_calls)
         else:
+            # Falls through here when loop_* is absent OR present-but-zero (a
+            # truncated/legacy record). A zero loop_calls used to swallow the
+            # member entirely — no calls, no tokens — so a web_search member
+            # vanished from llm_calls. Use the single-call figures instead.
             rec_in = rec.get("tokens_in") or 0
             rec_out = rec.get("tokens_out") or 0
             # `attempts` is set on the SUCCESS path and, since the retry/attempt

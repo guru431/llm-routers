@@ -164,15 +164,26 @@ class ResponseCache:
         try:
             value = await compute()
             self._put(key, value)
+            # Retire the in-flight entry BEFORE waking the waiters. Waking first
+            # would let a request that arrives between set_result and the pop see
+            # a completed-but-still-registered future (or, on the failure path, a
+            # future that already carries the exception) and either await a dead
+            # entry or start a redundant compute. Popping first means a newcomer
+            # sees either the fresh _store entry or a clean miss.
+            self._inflight.pop(key, None)
             if not fut.done():
                 fut.set_result(value)
             return value, None
         except Exception as e:
+            self._inflight.pop(key, None)
             if not fut.done():
                 fut.set_exception(e)
+                # Mark it retrieved: with no concurrent waiter nobody ever awaits
+                # this future, and asyncio would log a spurious "Future exception
+                # was never retrieved" traceback for an error the caller already
+                # received by `raise` below. Real waiters still get it raised.
+                fut.exception()
             raise
-        finally:
-            self._inflight.pop(key, None)
 
     def stats(self) -> dict:
         total = self.hits + self.misses

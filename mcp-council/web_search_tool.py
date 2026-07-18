@@ -84,9 +84,20 @@ class RunSearchCache:
             else:
                 self.hits += 1
         # Await outside the lock so a slow Exa call doesn't serialize other
-        # distinct queries. WebSearchError propagates to every awaiter — within
-        # one run a failing query is unlikely to start succeeding.
-        return await task
+        # distinct queries. WebSearchError propagates to every awaiter that is
+        # ALREADY waiting on this task, but the failed task is then evicted so a
+        # LATER member asking the same query gets a fresh attempt instead of the
+        # cached exception forever (a transient 5xx/timeout otherwise poisoned
+        # the query for the whole run). `misses` is deliberately NOT decremented:
+        # the run-wide budget stays a hard ceiling, so a persistently failing
+        # query can't be retried without bound.
+        try:
+            return await task
+        except Exception:
+            async with self._lock:
+                if self._tasks.get(key) is task:
+                    del self._tasks[key]
+            raise
 
 
 async def execute_tool_call(

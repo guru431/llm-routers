@@ -1174,17 +1174,17 @@ class Handler(BaseHTTPRequestHandler):
 
             # Cache hit → serve immediately (no slot, no subprocess). cache is only
             # eligible without tools/structured, so no tool parse is needed here.
-            if cached is not None:
+            def serve_cached(text: str) -> None:
                 METRICS.inc("cache_hits")
                 usage = {
                     "prompt_tokens": len(prompt) // 4,
-                    "completion_tokens": len(cached) // 4,
-                    "total_tokens": (len(prompt) + len(cached)) // 4,
+                    "completion_tokens": len(text) // 4,
+                    "total_tokens": (len(prompt) + len(text)) // 4,
                     "estimate": True,
                     "cached": True,
                     "profile": profile,
                 }
-                resp_message = {"role": "assistant", "content": cached}
+                resp_message = {"role": "assistant", "content": text}
                 if stream:
                     self._send_stream(resp_id, created, resp_model, resp_message, "stop", usage)
                 else:
@@ -1195,9 +1195,10 @@ class Handler(BaseHTTPRequestHandler):
                         "usage": usage,
                     })
                 METRICS.record_latency(time.monotonic() - req_start)
+
+            if cached is not None:
+                serve_cached(cached)
                 return
-            if cache_eligible:
-                METRICS.inc("cache_misses")
 
             # Bounded queue (Idea 13): wait briefly for a slot, else 429+Retry-After.
             if not _acquire_slot():
@@ -1208,6 +1209,19 @@ class Handler(BaseHTTPRequestHandler):
                     headers={"Retry-After": str(RETRY_AFTER)})
                 return
             slot = True
+
+            # Re-check the cache now that we hold a slot: the lookup above and the
+            # CACHE.put below straddle the queue wait, so an identical request that
+            # was already running may have finished and cached its answer while we
+            # queued. Serving it here saves a duplicate CLI subprocess. (It does not
+            # collapse two requests that miss simultaneously — the second still runs
+            # its own claude; the queue wait is much shorter than a claude call.)
+            if cache_eligible:
+                cached = CACHE.get(model or MODEL, system_prompt, prompt)
+                if cached is not None:
+                    serve_cached(cached)
+                    return
+                METRICS.inc("cache_misses")
 
             # Real streaming (Idea 11) — only for plain text: tools and structured
             # output must buffer the whole answer to parse/validate/repair it. A

@@ -76,6 +76,23 @@ def scrub_outbound_query(query: str) -> tuple[str | None, str | None]:
     return query, None
 
 
+def redact_secrets(text: str) -> str:
+    """Mask credential-shaped tokens in an arbitrary string.
+
+    Used on provider ERROR messages before they are stored in a member result
+    (`error` → `notes` → `summary.failed_models`) and handed back to the MCP
+    client: an HTTP library can echo the full request URL (which may carry an
+    `api_key=` query parameter) or an `Authorization` header into the exception
+    text. Same pattern set as the outbound query guard — this only masks the
+    matched token, the rest of the message stays readable for triage.
+    """
+    if not text:
+        return text
+    for _label, pat in _SECRET_PATTERNS:
+        text = pat.sub("[REDACTED]", text)
+    return text
+
+
 # --- Claim→source ledger ---------------------------------------------------
 
 

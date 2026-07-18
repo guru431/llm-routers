@@ -207,9 +207,12 @@ _BINARY_SNIFF_BYTES = 8192
 
 def _looks_binary_bytes(chunk: bytes) -> bool:
     """Heuristic on an in-memory buffer: binary if the first 8KB contain a NUL
-    byte (same rule git uses). Exception: UTF-16 text (PowerShell 5.1's default
-    Out-File encoding) is full of NULs but legitimate — a leading UTF-16 BOM
-    (FF FE LE / FE FF BE) marks it as text."""
+    byte (same rule git uses). Exception: UTF-16/UTF-32 text (PowerShell's
+    Out-File -Encoding unicode/utf32) is full of NULs but legitimate — a leading
+    BOM marks it as text. UTF-32 is checked FIRST: its LE BOM (FF FE 00 00)
+    starts with the UTF-16 LE BOM, so the shorter test would claim it."""
+    if chunk[:4] in (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff"):
+        return False
     if chunk[:2] in (b"\xff\xfe", b"\xfe\xff"):
         return False
     return b"\x00" in chunk[:_BINARY_SNIFF_BYTES]
@@ -228,6 +231,12 @@ def _decode_text(raw: bytes) -> str:
     else plain UTF-8 (errors='replace' for the odd stray byte)."""
     if raw[:3] == b"\xef\xbb\xbf":
         return raw[3:].decode("utf-8", errors="replace")
+    # UTF-32 before UTF-16: the UTF-32 LE BOM (FF FE 00 00) has the UTF-16 LE BOM
+    # as its prefix, so testing 2 bytes first would decode it as UTF-16 garbage.
+    if raw[:4] == b"\xff\xfe\x00\x00":
+        return raw[4:].decode("utf-32-le", errors="replace")
+    if raw[:4] == b"\x00\x00\xfe\xff":
+        return raw[4:].decode("utf-32-be", errors="replace")
     if raw[:2] == b"\xff\xfe":
         return raw[2:].decode("utf-16-le", errors="replace")
     if raw[:2] == b"\xfe\xff":

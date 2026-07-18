@@ -24,6 +24,7 @@
 
 param(
     [switch]$Uninstall,
+    [switch]$Force,
     [string]$ServerPath,
     [string]$BindHost = '127.0.0.1',
     [int]$Port = 8765
@@ -83,6 +84,19 @@ if ($root -match '^[A-Za-z]:\\$') {
 
 # Build the action argument. Quote the script path so spaces don't break it.
 $Arguments = "`"$ServerPath`" --host $BindHost --port $Port"
+
+# Refuse to clobber an already-registered task (same guard as codex-agent-server,
+# which had it while this script did not). On managed machines this task is owned
+# by a central task registry + syncer; a manual Register-ScheduledTask here drifts
+# from it and the next sync reverts the change.
+$existing = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
+if ($existing -and -not $Force) {
+    Write-Error ("Scheduled task $FullName already exists. On managed machines it may be owned by a " +
+        "central task registry + syncer — re-registering here drifts from it and the next sync " +
+        "reverts your change. Edit the registry entry and re-run the syncer instead. " +
+        "For a STANDALONE (unmanaged) deploy, re-run with -Force to overwrite.")
+    exit 1
+}
 
 Write-Host "Creating scheduled task: $FullName"
 Write-Host "  Exe:  $pythonw"
