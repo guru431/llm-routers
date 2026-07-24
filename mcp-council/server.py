@@ -24,6 +24,7 @@ from council import _aggregate as _aggregate_helper  # noqa: F401 — re-exporte
 from council import run_council, run_adaptive_council
 from council import MAX_ROUNDS as COUNCIL_MAX_ROUNDS
 from critique import (
+    MAX_VERIFIED_FINDINGS,
     MAX_VERIFIERS_PER_FINDING,
     format_critique_markdown,
     run_critique,
@@ -113,17 +114,53 @@ _UNTRUSTED_CONTEXT_BANNER = (
 )
 
 
+def _outbound_label(path: Path) -> str:
+    """Label a context file for the OUTBOUND prompt without leaking the local
+    absolute path.
+
+    `resolve_and_validate` returns fully-resolved paths, so the old
+    `=== FILE: {path} ===` header shipped the OS user name, the internal project
+    / server directory name and the on-disk layout to every external provider —
+    and then parked the same string in the call dump. None of that helps the
+    model reason about the file. Emit the path RELATIVE to the allowed root it
+    matched; fall back to the basename when no root matches (fail-open mode)."""
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return path.name
+    for root in sandbox._allowed_roots():
+        try:
+            return resolved.relative_to(root).as_posix()
+        except ValueError:
+            continue
+    return path.name
+
+
 def _build_files_section(files: list[tuple[Path, str]]) -> str:
     if not files:
         return ""
     parts = [_UNTRUSTED_CONTEXT_BANNER, "=== CONTEXT FILES ==="]
     for path, content in files:
-        parts.append(f"=== FILE: {path} ===\n{content}\n")
+        parts.append(f"=== FILE: {_outbound_label(path)} ===\n{content}\n")
     return "\n".join(parts)
 
 
 def _clamp_tokens(n: int) -> int:
     return min(max(n, 1), MAX_RESPONSE_TOKENS_HARD_CAP)
+
+
+def _require_range(name: str, value: int, lo: int, hi: int) -> int:
+    """Reject an out-of-range numeric tool argument with a client error.
+
+    Public tool args used to reach slicing / loop bounds unvalidated, where a
+    negative value is not an error but a DIFFERENT operation: `rounds=-1` produced
+    a negative cost estimate, `max_verified_findings=-1` silently dropped the last
+    finding via `merged[:-1]`. Both returned HTTP 200 with a nonsense result. One
+    validator, applied at the tool boundary, so every public numeric argument
+    fails loudly instead."""
+    if not isinstance(value, int) or isinstance(value, bool) or not (lo <= value <= hi):
+        raise RuntimeError(f"{name} must be an integer in [{lo}, {hi}], got {value!r}")
+    return value
 
 
 def _format_analysis_lines(analysis: dict) -> list[str]:
@@ -529,6 +566,13 @@ async def _do_council_ask_async(
                 question=question, model_configs=members, synthesis=synthesis,
                 rounds=rounds, web_search=web_search, max_tokens=max_tokens,
                 context_fingerprint=ctx_fp,
+                # Hash the RESOLVED execution spec: these three decide whether the
+                # rankers saw the context, whether the run was a small adaptive
+                # subset, and where the ceilings stopped it. Without them a
+                # budget-stopped adaptive answer could be served for a full run.
+                context_in_stage2=context_in_stage2,
+                adaptive=adaptive,
+                budget=budget.as_dict_key() if budget is not None else None,
             )
             markdown, prov = await _RESPONSE_CACHE.get_or_compute(key, _run_and_render)
             if prov is not None:
@@ -1105,6 +1149,9 @@ async def council_estimate(
     calls, tokens, wall-minutes, and a reference-PAYG dollar yardstick (NOT billed
     — members are flat-rate). Cheap, no LLM calls. Mirror the args you'd pass to
     council_ask to see its cost first."""
+    # Same bounds council_ask enforces — otherwise the "dry run" of a request
+    # that would be rejected returns a (possibly negative) estimate.
+    _require_range("rounds", rounds, 1, COUNCIL_MAX_ROUNDS)
     resolved = _resolve_models_arg(models, models_preset)
     members = resolve_members(resolved)
     # Reference price from the first priced member, if any (yardstick only).
@@ -1210,6 +1257,7 @@ def _resolve_critique_args(
     lenses_arg: list[str] | None,
     lenses_preset: str | None,
     verifiers_per_finding: int,
+    max_verified_findings: int = MAX_VERIFIED_FINDINGS,
 ) -> tuple[list[dict], list[str]]:
     """Resolve + validate members and lenses. Raises before any work starts."""
     resolved_models = _resolve_models_arg(models, models_preset)
@@ -1218,11 +1266,14 @@ def _resolve_critique_args(
             "council_critique requires at least 2 distinct models — with one model "
             "the verification stage would only ever be self-review"
         )
-    if not (0 <= verifiers_per_finding <= MAX_VERIFIERS_PER_FINDING):
-        raise RuntimeError(
-            f"verifiers_per_finding must be in [0, {MAX_VERIFIERS_PER_FINDING}], "
-            f"got {verifiers_per_finding}"
-        )
+    _require_range(
+        "verifiers_per_finding", verifiers_per_finding, 0, MAX_VERIFIERS_PER_FINDING,
+    )
+    # A negative cap is not "no findings" — it slices from the END of the merged
+    # list (`merged[:-1]` drops the last one) and reports a nonsense overflow.
+    _require_range(
+        "max_verified_findings", max_verified_findings, 1, MAX_VERIFIED_FINDINGS,
+    )
     return resolve_members(resolved_models), resolve_lenses(lenses_arg, lenses_preset)
 
 
@@ -1290,7 +1341,8 @@ async def council_critique(
     `council_critique_async` + council_status/council_result.
     """
     members, lens_ids = _resolve_critique_args(
-        models, models_preset, lenses, lenses_preset, verifiers_per_finding
+        models, models_preset, lenses, lenses_preset, verifiers_per_finding,
+        max_verified_findings,
     )
     return await _do_critique_async(
         subject, context_paths or [], max_response_tokens, members, lens_ids,
@@ -1381,7 +1433,8 @@ async def council_critique_async(
     Отмена — `council_cancel(job_id)`. Тот же job-store, что у council_ask_async.
     """
     members, lens_ids = _resolve_critique_args(
-        models, models_preset, lenses, lenses_preset, verifiers_per_finding
+        models, models_preset, lenses, lenses_preset, verifiers_per_finding,
+        max_verified_findings,
     )
     state = await job_state.create_job(
         question_preview=subject, synthesis=False, rounds=1,
@@ -1463,12 +1516,12 @@ def _build_files_sections(
     if context_files:
         ctx = ["=== CONTEXT FILES ==="]
         for path, content in context_files:
-            ctx.append(f"=== FILE: {path} ===\n{content}\n")
+            ctx.append(f"=== FILE: {_outbound_label(path)} ===\n{content}\n")
         parts.append("\n".join(ctx))
     if example_files:
         ex = ["=== STYLE EXAMPLES ==="]
         for path, content in example_files:
-            ex.append(f"=== FILE: {path} ===\n{content}\n")
+            ex.append(f"=== FILE: {_outbound_label(path)} ===\n{content}\n")
         parts.append("\n".join(ex))
     return "\n\n".join(parts)
 
@@ -2061,65 +2114,67 @@ async def dialogue_continue(
     max_tokens = state.max_tokens
 
     # create_session is the only gate for MAX_ACTIVE_SESSIONS; reactivating a
-    # terminal session here would bypass it. Re-check the cap (same RuntimeError)
-    # before any mutation so a failure can't leave a half-mutated session.
-    await dialogue_state.reserve_active_slot()
+    # terminal session here would bypass it. reserve_active_slot ATOMICALLY
+    # re-checks the phase, counts the cap and flips this session to 'starting'
+    # under one hold of the global lock — check and transition must not be
+    # separated, or two continues on two different sessions both take the same
+    # last free slot. It is therefore also the authoritative "already resuming"
+    # gate; the early phase check above is only a cheap pre-filter.
+    previous_phase = await dialogue_state.reserve_active_slot(state)
 
-    # All pre-flight passed — now mutate, under the per-session lock so two
-    # concurrent dialogue_continue calls can't both claim the same session and
-    # spawn two runners. The early phase check above is a cheap pre-filter; this
-    # re-check under the lock is the authoritative gate — the loser wakes to find
-    # phase=='starting' and refuses. Lock is released before create_task, but by
-    # then phase=='starting' already blocks any other continue.
-    async with state._continue_lock:
-        if state.phase not in ("done", "interrupted"):
-            raise RuntimeError(
-                f"dialogue_continue: session already resuming or active "
-                f"(phase '{state.phase}')"
-            )
-        # Strip terminal artifacts before resuming: a phase=='summary' entry has
-        # no branch in format_history_section, so it would render as a plain
-        # participant reply in the next round's history and leak the verdict to
-        # every model, biasing the continuation toward the stated conclusion
-        # (breaks anti-convergence). The renderer recreates the summary from
-        # summary_entries.
-        state.history = [h for h in state.history if h["phase"] != "summary"]
-        mod_id = (state.moderator or {}).get("id", "moderator")
-        state.history.append({
-            "round": state.current_round,
-            "phase": "directive",
-            "id": mod_id,
-            "text": DIRECTIVE_INJECTION_TEMPLATE.format(directive=directive),
-            "latency_ms": 0,
-            "status": "ok",
-        })
-        state.total_rounds = new_total
-        state.error = None
-        # Reset result + timing so a FAILED/cancelled continuation doesn't serve
-        # the previous run's stale markdown (hiding the directive + new history):
-        # with result_markdown=None, dialogue_result rebuilds from live history.
-        # Clearing started_at (mark_phase("starting") won't set it) makes
-        # elapsed_ms track the continuation, not include the first run's duration.
-        state.result_markdown = None
-        state.started_at = None
-        state.finished_at = None
-        dialogue_state.mark_phase(state, "starting")
-        # Persist the continuation now (directive + bumped total_rounds + the
-        # 'starting' phase) so a crash before the first continued round dumps
-        # doesn't revert to the pre-continuation dump and silently drop the
-        # directive. Records the correct self-referential dump_path (F#17).
-        try:
-            await asyncio.to_thread(write_dump, state, base_dir=dialogue_state.resolve_dump_dir(DIALOGUE_DUMP_DIR))
-        except Exception:
-            pass
+    # The slot is held from here on. Any failure before the runner is attached
+    # must release it, or the session sits 'starting' forever holding capacity.
+    try:
+        # Mutate under the per-session lock so two concurrent continues can't
+        # interleave their history edits.
+        async with state._continue_lock:
+            # Strip terminal artifacts before resuming: a phase=='summary' entry
+            # has no branch in format_history_section, so it would render as a
+            # plain participant reply in the next round's history and leak the
+            # verdict to every model, biasing the continuation toward the stated
+            # conclusion (breaks anti-convergence). The renderer recreates the
+            # summary from summary_entries.
+            state.history = [h for h in state.history if h["phase"] != "summary"]
+            mod_id = (state.moderator or {}).get("id", "moderator")
+            state.history.append({
+                "round": state.current_round,
+                "phase": "directive",
+                "id": mod_id,
+                "text": DIRECTIVE_INJECTION_TEMPLATE.format(directive=directive),
+                "latency_ms": 0,
+                "status": "ok",
+            })
+            state.total_rounds = new_total
+            state.error = None
+            # Reset result + timing so a FAILED/cancelled continuation doesn't
+            # serve the previous run's stale markdown (hiding the directive + new
+            # history): with result_markdown=None, dialogue_result rebuilds from
+            # live history. Clearing started_at (mark_phase("starting") won't set
+            # it) makes elapsed_ms track the continuation, not include the first
+            # run's duration.
+            state.result_markdown = None
+            state.started_at = None
+            state.finished_at = None
+            dialogue_state.mark_phase(state, "starting")
+            # Persist the continuation now (directive + bumped total_rounds + the
+            # 'starting' phase) so a crash before the first continued round dumps
+            # doesn't revert to the pre-continuation dump and silently drop the
+            # directive. Records the correct self-referential dump_path (F#17).
+            try:
+                await asyncio.to_thread(write_dump, state, base_dir=dialogue_state.resolve_dump_dir(DIALOGUE_DUMP_DIR))
+            except Exception:
+                pass
 
-    runner = _build_resume_runner(state, part_cfgs, mod_cfg, files_section, web_search, max_tokens)
+        runner = _build_resume_runner(state, part_cfgs, mod_cfg, files_section, web_search, max_tokens)
 
-    # Fork/continue share the event journal: reopen (or reuse) a writer so the
-    # continued run's events land in the session's journal.
-    state.event_writer = event_log.open_writer(state.session_id, LOGS_DIR)
-    task = asyncio.create_task(_dialogue_runner_guard(state, runner))
-    dialogue_state.attach_task(state, task)
+        # Fork/continue share the event journal: reopen (or reuse) a writer so the
+        # continued run's events land in the session's journal.
+        state.event_writer = event_log.open_writer(state.session_id, LOGS_DIR)
+        task = asyncio.create_task(_dialogue_runner_guard(state, runner))
+        dialogue_state.attach_task(state, task)
+    except BaseException:
+        await dialogue_state.release_active_slot(state, previous_phase)
+        raise
     return {
         "session_id": state.session_id,
         "mode": state.mode,
@@ -2280,6 +2335,25 @@ def _run_startup_recovery() -> None:
     """Warn about an unset context-roots allow-list and reload persisted job /
     dialogue snapshots, marking still-running ones 'interrupted'."""
     _warn_if_context_roots_unset()
+    # Enforce the configured retention window on EVERY launch. Purge used to run
+    # only when someone called council_purge_logs by hand, so the advertised
+    # "168h default" bounded nothing — full call dumps (prompts, context
+    # excerpts, provider bodies) simply accumulated. Best-effort: a failure here
+    # must never stop the server from starting.
+    try:
+        purged = retention_mod.purge_all(LOGS_DIR)
+        removed = sum(
+            v.get("removed_by_age", 0) + v.get("removed_by_quota", 0)
+            for v in purged.values() if isinstance(v, dict)
+        )
+        if removed:
+            print(
+                f"[mcp-council] retention: purged {removed} expired/over-quota "
+                f"log artifact(s) (TTL {purged.get('retention_hours')}h).",
+                file=sys.stderr,
+            )
+    except OSError as e:
+        print(f"[mcp-council] retention purge skipped: {e}", file=sys.stderr)
     # Reap event-log files older than the job TTL: a job whose in-memory state
     # was lost on a prior restart otherwise leaves its logs/events/<id>.jsonl
     # behind forever (GC only reaps live jobs).

@@ -1,6 +1,7 @@
 """Tests for the in-memory job state module."""
 
 import asyncio
+import json
 import time
 
 import pytest
@@ -232,3 +233,35 @@ async def test_terminal_state_always_flushed():
     disk = _read_persisted(s.job_id)
     assert disk["phase"] == "done"
     assert disk["result_markdown"] == "# final"
+
+
+async def test_one_corrupt_snapshot_does_not_abort_loading(tmp_path, monkeypatch):
+    """A string `created_at` / unhashable job_id used to raise TypeError OUTSIDE
+    the guarded block, killing the whole load — and with it server startup. The
+    bad file must be quarantined and the good ones still load."""
+    monkeypatch.setenv("COUNCIL_JOBS_DIR", str(tmp_path))
+    state._jobs.clear()
+
+    good = {"job_id": "job-good", "created_at": time.time(), "phase": "done",
+            "question_preview": "q"}
+    (tmp_path / "job-good.json").write_text(json.dumps(good), encoding="utf-8")
+    for name, payload in [
+        ("bad-created-at.json", {"job_id": "j1", "created_at": "yesterday"}),
+        ("bad-id-type.json", {"job_id": ["not", "hashable"], "created_at": 1.0}),
+        ("bad-root-type.json", ["not", "an", "object"]),
+        ("bad-json.json", None),
+    ]:
+        f = tmp_path / name
+        if payload is None:
+            f.write_text("{truncated", encoding="utf-8")
+        else:
+            f.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert state.load_persisted_jobs() == 1
+    assert "job-good" in state._jobs
+    quarantined = {p.name for p in (tmp_path / state.QUARANTINE_DIRNAME).glob("*.json")}
+    assert quarantined == {"bad-created-at.json", "bad-id-type.json",
+                           "bad-root-type.json", "bad-json.json"}
+    # …and a second start doesn't re-trip on them.
+    state._jobs.clear()
+    assert state.load_persisted_jobs() == 1

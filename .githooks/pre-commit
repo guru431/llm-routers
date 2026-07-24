@@ -10,16 +10,23 @@ set -eu
 repo_root=$(git rev-parse --show-toplevel)
 fail=0
 
-# 1) Block sensitive filenames entering the tree (allow *.example* templates).
+# 1) Block sensitive filenames entering the tree (allow *.example templates).
 # ACMR (not just A) so a rename/copy INTO a sensitive name is caught by its
 # destination path — --name-only prints the new path for renames.
 # The .env pattern uses (\..+)? so multi-suffix names like .env.production.local
-# are matched too (the single-suffix form missed them); .example is re-included.
+# are matched too (the single-suffix form missed them); templates are re-included.
+#
+# The template exemption is applied to the BASENAME, and only as a trailing
+# `.example` suffix. Applying it to the whole path (the previous `grep -ivE
+# '\.example(\.|$)'`) meant ANY directory containing `.example.` in its name
+# exempted everything under it: `foo.example.bar/id_rsa` sailed through the
+# filename check entirely. A template is a file named `<something>.example`,
+# never a file that merely lives under such a directory.
 added=$(git diff --cached --name-only --diff-filter=ACMR || true)
 if [ -n "$added" ]; then
   bad=$(printf '%s\n' "$added" \
     | grep -iE '(^|/)(\.env(\..+)?$|.*\.pem$|.*\.key$|.*\.p12$|.*\.pfx$|id_rsa|id_ed25519|id_dsa|vault\.env|\.sanitize-patterns$)' \
-    | grep -ivE '\.example(\.|$)' || true)
+    | awk -F/ '{ b = tolower($NF); if (b !~ /\.example$/) print }' || true)
   if [ -n "$bad" ]; then
     echo "BLOCKED: refusing to commit sensitive file(s):"
     printf '  %s\n' $bad

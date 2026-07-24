@@ -11,10 +11,11 @@ ideas. The files split by **privacy** and **lifecycle stage**:
 | `IDEAS-archive.md` (repo root) | **gitignored** (private) | ideas deliberately *not* built (`wontfix`/`deferred`/`partial` + rationale) |
 
 **Why:** this is a public repo, and all four files can reference internal hosts,
-projects, or people — so all four stay local. The archives hold only what was
-consciously turned down; their job is to stop the same rejected item being filed
-again (weekly auto-review is the main repeat offender). Completed work is *not*
-archived — `git log` and the code are its record.
+projects, or people — so all four stay local (`.gitignore` covers all four; the
+archives are a LOCAL audit trail, not a tracked one). The archives hold only what
+was consciously turned down; their job is to stop the same rejected item being
+filed again (weekly auto-review is the main repeat offender). Completed work is
+*not* archived — `git log` and the code are its record.
 
 **Lifecycle rules** (canonical form lives in the global `CLAUDE.md`):
 

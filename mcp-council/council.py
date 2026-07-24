@@ -1,7 +1,10 @@
-"""Council orchestrator: stage 1 (independent) → stage 2 (anonymized peer-ranking).
+"""Council orchestrator: stage 1 (independent) → stage 2 (anonymized peer-ranking)
+→ optional stage 3 (chairman synthesis, `synthesis=True`).
 
-Stage 3 (synthesis) is delegated to the main Claude agent — this module returns
-all materials, the caller formats them into markdown.
+Stage 3 runs HERE (`_run_stage3_synthesis`): one surviving member is elected
+chairman and writes the prose synthesis plus the structured analysis block. The
+caller only formats the returned materials into markdown — it does not
+synthesise anything itself.
 """
 
 from __future__ import annotations
@@ -41,8 +44,10 @@ from web_search_tool import MAX_TOOL_ITERATIONS, RunSearchCache, run_with_tool_l
 # wall-time so we don't want hidden cost blow-ups.
 MAX_ROUNDS = 3
 
-# Fallback chairman id when peer-rankings can't pick one. DeepSeek-direct is the
-# most stable provider in this stack (api.deepseek.com vs OCG outages).
+# Fallback chairman id when peer-rankings can't pick one. `deepseek-pro` is the
+# most consistently available member of the default council (it routes through
+# the same OCG gateway as the other four — this is an availability preference,
+# not an independent-provider guarantee).
 DEFAULT_CHAIRMAN_FALLBACK_ID = "deepseek-pro"
 
 # Type for the HTTP client function — overridable in tests via dependency injection.
@@ -369,8 +374,24 @@ class _Stage2ParseError(ValueError):
     a strict-JSON demand is worth one attempt."""
 
 
-def _normalize_stage2(content: str | None, pseudonyms: dict[str, str]) -> tuple[list[dict], int | None]:
-    """Parse + normalize a ranker's raw content into (clean_rankings, confidence).
+def _normalize_stage2(
+    content: str | None,
+    pseudonyms: dict[str, str],
+    *,
+    require_complete: bool = True,
+) -> tuple[list[dict], int | None, list[str]]:
+    """Parse + normalize a ranker's raw content into
+    (clean_rankings, confidence, missing_ids).
+
+    `pseudonyms` is exactly the set of peers this ranker was asked to rank, so
+    `missing_ids` = peers it silently omitted. With `require_complete=True` (the
+    first attempt) an incomplete list raises _Stage2ParseError, which routes into
+    the existing single repair-retry: partial rankings make mean/Borda compare
+    candidates on different numbers of scores, so we ask once for the full list
+    before accepting one. The repair pass calls with `require_complete=False` —
+    a still-incomplete list is then kept (its answers are real) but reported via
+    `missing_ids` so the summary can refuse to count that ranker as an
+    independent supporter.
 
     Raises _Stage2ParseError on any unusable result (no JSON object, rankings not
     a list, empty, or every entry dropped by normalization). Pure — no I/O — so
@@ -419,7 +440,14 @@ def _normalize_stage2(content: str | None, pseudonyms: dict[str, str]) -> tuple[
         })
     if not clean:
         raise _Stage2ParseError("no valid rankings after normalization")
-    return clean, confidence
+    missing = [mid for mid in pseudonyms if mid not in seen_ranked]
+    if missing and require_complete:
+        raise _Stage2ParseError(
+            "incomplete rankings: "
+            + ", ".join(sorted(pseudonyms[mid] for mid in missing))
+            + " not ranked (every listed answer must get a score)"
+        )
+    return clean, confidence, missing
 
 
 async def _run_member_stage2(
@@ -504,8 +532,9 @@ async def _run_member_stage2(
     attempts = result.get("attempts")
     repaired = False
 
+    missing: list[str] = []
     try:
-        clean, confidence = _normalize_stage2(result.get("content"), pseudonyms)
+        clean, confidence, missing = _normalize_stage2(result.get("content"), pseudonyms)
     except (_Stage2ParseError, ValueError, KeyError, TypeError) as first_err:
         # ONE repair retry: re-ask with the parse error + strict-JSON demand +
         # response_format. Calibrated ranking is only as good as the JSON we can
@@ -532,7 +561,14 @@ async def _run_member_stage2(
             # entirely. `or 0` on both sides keeps None-plus-N == N.
             attempts = (attempts or 0) + (result2.get("attempts") or 0)
             try:
-                clean, confidence = _normalize_stage2(result2.get("content"), pseudonyms)
+                # `require_complete=False`: the repair pass already asked for the
+                # full list. If the ranker still omitted peers we keep what it
+                # gave (real scores) and report the gap instead of discarding the
+                # ranker — the summary refuses to count it as an independent
+                # supporter, which is the accounting the gap actually corrupts.
+                clean, confidence, missing = _normalize_stage2(
+                    result2.get("content"), pseudonyms, require_complete=False,
+                )
             except (_Stage2ParseError, ValueError, KeyError, TypeError) as second_err:
                 return {
                     "ranker_id": ranker["id"], "status": "error",
@@ -558,6 +594,9 @@ async def _run_member_stage2(
         "rankings": clean,
         "confidence": confidence,
         "pseudonyms": pseudonyms,
+        # Peers this ranker was asked to score but didn't (empty on the normal
+        # path — an incomplete first reply is repaired once before being kept).
+        "missing_rankings": missing,
         "latency_ms": int((time.monotonic() - start) * 1000),
         "tokens_in": tin,
         "tokens_out": tout,
@@ -976,11 +1015,28 @@ def _council_failure_reason(error: str | None) -> str:
 # destructive ops, money, irreversible infra changes. On these the verdict never
 # auto-"adopt"s on council agreement alone — agreement between correlated LLMs is
 # not evidence, and the blast radius of a wrong call is high.
+#
+# The gate is bilingual on purpose: this is a Russian-language project, and an
+# English-only marker list let "удалить базу без бэкапа" / "раскрыть пароль и
+# токен" classify as `normal` and earn human_review_required=false while their
+# English equivalents were gated. Cyrillic stems use the same \b + \w* form —
+# Python's `re` is Unicode-aware for str patterns, so \w covers Cyrillic.
 _HIGH_RISK_PATTERN = re.compile(
     r"\b(security|vulnerab\w*|exploit|cve|credential\w*|password|secret|token|"
     r"delete|drop\s+table|truncate|rm\s+-rf|migrat\w*|production|prod|deploy\w*|"
     r"payment|money|financ\w*|billing|invoice|irreversible|data[\s-]*loss|"
-    r"encrypt\w*|auth\w*|permission\w*|privilege\w*|rotate\s+key)\b",
+    r"encrypt\w*|auth\w*|permission\w*|privilege\w*|rotate\s+key|"
+    # --- Russian: security / secrets ---
+    r"безопасност\w*|уязвим\w*|эксплойт\w*|взлом\w*|парол\w*|секрет\w*|токен\w*|"
+    r"учётн\w*|учетн\w*|доступ\w*|прав[ао]\w*|привилег\w*|аутентифик\w*|"
+    r"авториз\w*|шифр\w*|ключ\w*|ротаци\w*|"
+    # --- Russian: destructive / irreversible ---
+    r"удал\w*|снос\w*|сброс\w*|очист\w*|затр\w*|перезапис\w*|дроп\w*|"
+    r"необрати\w*|безвозвратн\w*|потер\w*\s+данн\w*|"
+    # --- Russian: prod / migrations / deploy ---
+    r"прод\w*|боев\w*|миграц\w*|деплой\w*|развёртыв\w*|развертыв\w*|"
+    # --- Russian: money ---
+    r"платёж\w*|платеж\w*|деньг\w*|финанс\w*|биллинг\w*|счёт\w*|оплат\w*)\b",
     re.IGNORECASE,
 )
 
@@ -988,27 +1044,165 @@ _HIGH_RISK_PATTERN = re.compile(
 def _classify_risk(question: str) -> str:
     """Coarse risk class for the question. 'high' means a wrong-but-confident
     answer is costly (security/destructive/money/irreversible) — auto-adopt is
-    then gated on external verification, not council agreement alone."""
+    then gated on external verification, not council agreement alone.
+
+    Deliberately over-inclusive: a false 'high' costs one extra human look, a
+    false 'normal' hands automation an unverified destructive recommendation."""
     if question and _HIGH_RISK_PATTERN.search(question):
         return "high"
     return "normal"
 
 
-def _evidence_strength(stage1: list[dict]) -> tuple[str, int]:
-    """Independent-source signal from web_search: total result sources gathered
-    by surviving members. 'none' (0), 'weak' (1-2), 'corroborated' (3+). This is
-    orthogonal to agreement — the council can agree with zero evidence, or bring
-    many sources yet still disagree."""
-    sources = 0
-    for s in stage1:
+_TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "gclid", "fbclid", "yclid", "ref", "ref_src",
+}
+
+
+def _canonical_source(url: str) -> tuple[str, str] | None:
+    """Normalize a web_search result URL to (canonical_url, registrable-ish host).
+
+    Lowercases scheme+host, strips `www.`, the fragment, tracking query params
+    and a trailing slash — so the same page fetched by two members (or served
+    twice from the run cache) collapses to ONE source instead of two. Returns
+    None for anything that isn't a usable http(s) URL."""
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+    if not isinstance(url, str) or not url.strip():
+        return None
+    try:
+        parts = urlsplit(url.strip())
+    except ValueError:
+        return None
+    if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+        return None
+    host = parts.netloc.lower().split("@")[-1]
+    if host.startswith("www."):
+        host = host[4:]
+    query = urlencode([
+        (k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+        if k.lower() not in _TRACKING_PARAMS
+    ])
+    path = parts.path.rstrip("/") or "/"
+    canonical = urlunsplit((parts.scheme.lower(), host, path, query, ""))
+    return canonical, host
+
+
+def _evidence_strength(records: list[dict]) -> dict:
+    """External-source signal from web_search, measured as DISTINCT sources.
+
+    The previous version summed `len(sources)` per successful call, so one
+    ordinary Exa query returning five results scored `corroborated` /
+    "multi-source" — a single search is a single source of evidence, however
+    many rows it returns, and the same URL reached by several members (or by the
+    run cache) was counted once per member.
+
+    Now:
+      * `results_total` — raw result rows (unchanged old number, kept for cost /
+        volume reporting only, NEVER as corroboration);
+      * `sources` — distinct canonical URLs;
+      * `domains` — distinct hosts among them;
+      * `level` — `none` (no sources), `weak` (all sources from a single host —
+        one publisher is one source however many pages it has), `corroborated`
+        (≥3 distinct sources across ≥2 distinct hosts).
+
+    Still orthogonal to agreement: the council can agree with zero evidence, or
+    bring many sources and still disagree. It does NOT establish that any source
+    supports any particular claim — see `claim_ledger` for query→source
+    provenance; nothing here links a source to a claim."""
+    results_total = 0
+    urls: set[str] = set()
+    hosts: set[str] = set()
+    for s in records:
         for e in s.get("tool_calls_log") or []:
-            if isinstance(e, dict) and e.get("name") == "web_search" and e.get("ok"):
-                sources += len(e.get("sources") or [])
-    if sources == 0:
-        return "none", 0
-    if sources < 3:
-        return "weak", sources
-    return "corroborated", sources
+            if not (isinstance(e, dict) and e.get("name") == "web_search" and e.get("ok")):
+                continue
+            for u in e.get("sources") or []:
+                results_total += 1
+                canon = _canonical_source(u)
+                if canon is None:
+                    continue
+                urls.add(canon[0])
+                hosts.add(canon[1])
+    if not urls:
+        level = "none"
+    elif len(hosts) < 2 or len(urls) < 3:
+        level = "weak"
+    else:
+        level = "corroborated"
+    return {
+        "level": level,
+        "sources": len(urls),
+        "domains": len(hosts),
+        "results_total": results_total,
+    }
+
+
+# Minimum score a ranker must have given the winner for it to count as SUPPORT.
+# Above the 1-10 midpoint: a top-of-list score of 4/10 says "least bad", which is
+# not corroboration of anything.
+MIN_SUPPORT_SCORE = 6
+
+
+def _winner_supporters(
+    stage2: list[dict],
+    winner_id: str | None,
+    exclude_rankers: frozenset[str] | set[str] = frozenset(),
+) -> set[str]:
+    """Rankers that actually SUPPORTED `winner_id` — i.e. gave it their own top
+    score — as opposed to merely mentioning it somewhere in their list.
+
+    Presence in a ranking is not support: with full rankings every candidate
+    appears in every ranker's list, so "the winner is in your list" was true for
+    the last-placed answer too, and a candidate two rankers scored 1/10 could
+    still report `independent_votes=2, quorum_ok=true`.
+
+    Three rankers are excluded from support:
+      * a FLAT ranker with ≥2 peers (all scored the same) expressed no preference
+        — counting it as a supporter of whoever happens to win is noise. A
+        single-peer ranker is NOT flat: with one peer the score IS the verdict;
+      * a ranker whose top score is below MIN_SUPPORT_SCORE — "least bad of a bad
+        field" is not an endorsement;
+      * an INCOMPLETE ranker (it skipped peers, see `missing_rankings`) picked a
+        top choice out of a partial field, so its "top" isn't comparable."""
+    supporters: set[str] = set()
+    for s in stage2:
+        if s["status"] != "ok" or s.get("missing_rankings"):
+            continue
+        if s["ranker_id"] in exclude_rankers:
+            continue
+        rankings = s.get("rankings") or []
+        scores = [r["score"] for r in rankings]
+        if not scores:
+            continue
+        top = max(scores)
+        if len(scores) >= 2 and top == min(scores):
+            continue
+        if top < MIN_SUPPORT_SCORE:
+            continue
+        if any(r["ranked_id"] == winner_id and r["score"] == top for r in rankings):
+            supporters.add(s["ranker_id"])
+    return supporters
+
+
+def _incomplete_rankings(stage1: list[dict], stage2: list[dict]) -> list[dict]:
+    """Rankers whose list didn't cover every stage-1 survivor they should have.
+
+    Derived from stage 1 rather than from the ranker's own `missing_rankings` so
+    it also holds for hand-built summaries (tests, replay of an older dump)."""
+    ok_ids = {s["id"] for s in stage1 if s["status"] == "ok"}
+    out: list[dict] = []
+    for s in stage2:
+        if s["status"] != "ok":
+            continue
+        expected = ok_ids - {s["ranker_id"]}
+        if not expected:
+            continue
+        got = {r["ranked_id"] for r in s.get("rankings") or []}
+        missing = sorted(expected - got)
+        if missing:
+            out.append({"ranker_id": s["ranker_id"], "missing": missing})
+    return out
 
 
 def _build_summary(
@@ -1020,14 +1214,22 @@ def _build_summary(
     *,
     question: str = "",
     borda: list[tuple[str, int, int]] | None = None,
+    rounds_attempted: int | None = None,
+    rounds_completed: int | None = None,
+    stop_reason: str = "completed",
 ) -> dict:
     """Machine-readable verdict for automation (n8n etc.): winner, confidence,
     failed models, top disagreements, recommended next action.
 
-    `rounds` = the requested round count for this run, so the recommendation
-    builder never suggests an action already taken (synthesis, or "another round"
-    when already at MAX_ROUNDS)."""
+    `rounds` = the REQUESTED round count. `rounds_attempted` / `rounds_completed`
+    are what actually ran (a round can be cut by budget/deadline before it starts
+    or collapse to all-errors), and `stop_reason` says why deliberation ended.
+    The recommendation builder uses the COMPLETED count, so it never claims the
+    maximum rounds were already applied when a budget stop ended the run early.
+    They default to `rounds` for callers that don't track the distinction."""
     model_by_id = {s["id"]: s["model"] for s in stage1}
+    attempted = rounds if rounds_attempted is None else rounds_attempted
+    completed = rounds if rounds_completed is None else rounds_completed
 
     failed_models: list[dict] = []
     for s in stage1:
@@ -1064,18 +1266,29 @@ def _build_summary(
     # or an automatic "adopt" (guards the 2-model "cheap" preset and an OCG-outage
     # where 5 "votes" collapse to a single failure domain).
     #
-    # Both signals are computed from the rankers that ACTUALLY ranked the winner
-    # (not from all stage-1 survivors): a cross-provider survivor whose own
-    # ranking failed must not lend the winner a second domain it never voted from.
-    winner_voter_ids: set[str] = set()
-    if winner_id is not None:
-        for s in stage2:
-            if s["status"] != "ok":
-                continue
-            if any(r["ranked_id"] == winner_id for r in s["rankings"]):
-                winner_voter_ids.add(s["ranker_id"])
-    independent_votes = len(winner_voter_ids)
-    provider_domains = len({provider_domain(rid) for rid in winner_voter_ids})
+    # Both signals are computed from the rankers that actually SUPPORTED the
+    # winner — gave it their own top score (see _winner_supporters) — not from
+    # every ranker whose list merely contains it, and not from all stage-1
+    # survivors: a cross-provider survivor whose own ranking failed (or which
+    # ranked the winner last) must not lend it a domain it never voted from.
+    incomplete_rankings = _incomplete_rankings(stage1, stage2)
+    winner_supporter_ids = (
+        _winner_supporters(
+            stage2, winner_id,
+            exclude_rankers={e["ranker_id"] for e in incomplete_rankings},
+        )
+        if winner_id is not None else set()
+    )
+    independent_votes = len(winner_supporter_ids)
+    provider_domains = len({provider_domain(rid) for rid in winner_supporter_ids})
+    # Rankers that scored the winner at all, regardless of position. Reported
+    # separately so the drop from `ranked_by` to `independent_votes` is visible
+    # instead of one number silently meaning two different things.
+    ranked_by = sum(
+        1 for s in stage2
+        if s["status"] == "ok"
+        and any(r["ranked_id"] == winner_id for r in s.get("rankings") or [])
+    )
     quorum_ok = independent_votes >= 2 and provider_domains >= 2
 
     # Confidence from the margin between the top two aggregate means. A single
@@ -1095,8 +1308,10 @@ def _build_summary(
         else:
             confidence = "low"
     # A margin can look decisive on too few / single-domain votes — cap "high"
-    # at "medium" unless the winner is independently corroborated.
-    if confidence == "high" and not quorum_ok:
+    # at "medium" unless the winner is independently corroborated. Same cap when
+    # some ranker skipped peers: the means being compared then rest on different
+    # numbers of scores, so the margin isn't a like-for-like measurement.
+    if confidence == "high" and (not quorum_ok or incomplete_rankings):
         confidence = "medium"
 
     # Disagreements: per-member score spread across rankers (1-10 scale).
@@ -1127,7 +1342,12 @@ def _build_summary(
     # axes so a caller can gate risk-sensitive auto-adopt on evidence + risk, not
     # on correlated-LLM agreement alone.
     risk_class = _classify_risk(question)
-    evidence_level, evidence_sources = _evidence_strength(stage1)
+    # Chairman searches count too — same run, same evidence pool.
+    evidence = _evidence_strength(
+        list(stage1) + ([stage3] if isinstance(stage3, dict) else [])
+    )
+    evidence_level = evidence["level"]
+    evidence_sources = evidence["sources"]
     # Borda (rank-based) cross-check: does the scale-free ranking agree with the
     # mean on the winner? Disagreement = a fragile winner (scale bias flipped it).
     borda_winner_id = borda[0][0] if borda else None
@@ -1141,6 +1361,7 @@ def _build_summary(
     human_review_required = (
         risk_class == "high" or not quorum_ok or confidence == "low"
         or (borda is not None and not ranking_methods_agree)
+        or bool(incomplete_rankings)
     )
     # A provider/health failure (auth/402/timeout/5xx/rate/network) is worth a
     # healthcheck; a purely parse-level failure (invalid_json / tool-exhaustion,
@@ -1159,19 +1380,23 @@ def _build_summary(
             )
     elif not quorum_ok:
         next_action = (
-            f"Not independently corroborated — winner rests on {independent_votes} "
-            f"peer vote(s) across {provider_domains} provider domain(s). Treat as a "
-            "single opinion; add an independent source (another provider, or human "
+            f"Not independently corroborated — winner is the top choice of "
+            f"{independent_votes} peer(s) across {provider_domains} provider "
+            f"domain(s) (ranked at all by {ranked_by}). Treat as a single "
+            "opinion; add an independent source (another provider, or human "
             "review) before adopting."
         )
     elif confidence == "low" or top_disagreements:
         # Only suggest levers NOT already pulled: synthesis if it didn't run,
-        # another round if we're below MAX_ROUNDS.
+        # another round if the run actually COMPLETED fewer than MAX_ROUNDS (a
+        # budget/deadline stop leaves the requested count unreached — suggesting
+        # "rounds=4" there would be nonsense, and claiming max rounds were
+        # applied when they weren't is worse).
         levers: list[str] = []
         if not synthesized_ok:
             levers.append("synthesis=True")
-        if rounds < MAX_ROUNDS:
-            levers.append(f"another round (rounds={rounds + 1})")
+        if completed < MAX_ROUNDS:
+            levers.append(f"another round (rounds={completed + 1})")
         if levers:
             next_action = "Low agreement — consider " + " or ".join(levers) + "."
         else:
@@ -1179,6 +1404,8 @@ def _build_summary(
                 "Low agreement, and synthesis + max rounds already applied — treat "
                 "as genuinely contested; get human review."
             )
+        if stop_reason != "completed":
+            next_action += f" (deliberation ended early: {stop_reason})"
     elif risk_class == "high":
         # Corroborated + agreed, but a high-risk topic: agreement between
         # correlated LLMs is not evidence of correctness, and the cost of a wrong
@@ -1212,17 +1439,25 @@ def _build_summary(
         # Evidence-aware verdict: SEPARATE axes so risk-sensitive automation gates
         # on evidence + risk, not on correlated-LLM agreement alone.
         #   agreement       — the council concurrence signal (== confidence).
-        #   evidence        — external corroboration from web_search sources.
+        #   evidence        — external corroboration level from web_search.
+        #   evidence_sources / evidence_domains — DISTINCT canonical URLs and
+        #     distinct hosts among them (NOT the raw result count: five rows from
+        #     one Exa query are one search, not five corroborating sources).
+        #   evidence_results_total — raw result rows, volume reporting only.
         #   executable_test — reserved: the council does not run tests (always None).
-        #   source_quality  — coarse label derived from evidence volume.
+        #   source_quality  — coarse label derived from distinct hosts.
         #   human_review_required — hard flag (risk/quorum/agreement/ranking).
+        # None of these link a source to a specific claim — see `claim_ledger`
+        # for query→source provenance.
         "verdict": {
             "agreement": confidence,
             "evidence": evidence_level,
             "evidence_sources": evidence_sources,
+            "evidence_domains": evidence["domains"],
+            "evidence_results_total": evidence["results_total"],
             "executable_test": None,
             "source_quality": (
-                "multi-source" if evidence_sources >= 3
+                "multi-source" if evidence["domains"] >= 2
                 else ("single-source" if evidence_sources else "none")
             ),
             "risk_class": risk_class,
@@ -1238,15 +1473,31 @@ def _build_summary(
         # not on this number alone.
         "confidence": confidence,
         "agreement_confidence": confidence,
-        # Corroboration signals: independent_votes = peers who ranked the winner;
-        # provider_domains = distinct provider/credential domains among THOSE
-        # winner-voting peers. single_provider flags a council that can't
-        # self-corroborate. quorum_ok is the gate behind the "adopt"/"high"
-        # verdict — downstream automation can branch on it without re-deriving it.
+        # Corroboration signals. independent_votes = peers that made the winner
+        # their OWN top choice (support), not peers that merely listed it —
+        # with full rankings every candidate appears in every list, so presence
+        # measured nothing. provider_domains = distinct provider/credential
+        # domains among those supporters. winner_ranked_by = the weaker
+        # "appeared in the list at all" count, exposed so the gap is visible.
+        # single_provider flags a council that can't self-corroborate. quorum_ok
+        # is the gate behind the "adopt"/"high" verdict — downstream automation
+        # can branch on it without re-deriving it.
         "independent_votes": independent_votes,
+        "winner_ranked_by": ranked_by,
         "provider_domains": provider_domains,
         "single_provider": provider_domains < 2,
         "quorum_ok": quorum_ok,
+        # Rankers that skipped peers they were asked to score. Non-empty means
+        # the aggregate means/Borda points rest on unequal numbers of scores —
+        # confidence is capped and human review forced.
+        "incomplete_rankings": incomplete_rankings,
+        # Deliberation actually performed vs requested. `rounds_completed` is
+        # what produced rankings; `stop_reason` ∈ completed | budget |
+        # round_collapse. Automation must not read `rounds_requested` as work done.
+        "rounds_requested": rounds,
+        "rounds_attempted": attempted,
+        "rounds_completed": completed,
+        "stop_reason": stop_reason,
         "survivors": ok_stage1,
         "failed_models": failed_models,
         "top_disagreements": top_disagreements,
@@ -1321,6 +1572,8 @@ async def run_council(
     on_progress: ProgressFn | None = None,
     context_in_stage2: bool = True,
     budget: RunBudget | None = None,
+    usage_offset: dict | None = None,
+    search_cache: RunSearchCache | None = None,
 ) -> dict:
     """End-to-end orchestration of stages 1+2 across N rounds, optionally
     stage 3 synthesis at the end.
@@ -1330,6 +1583,14 @@ async def run_council(
     boundaries and before synthesis — an in-flight round always finishes and its
     answers are kept; crossing a ceiling stops further rounds/synthesis and adds
     a note. `budget.max_web_searches` also lowers the per-run Exa search cap.
+
+    `usage_offset` / `search_cache`: for multi-pass callers (run_adaptive_council
+    escalates by re-running the council with more members). Spend already made by
+    earlier passes — and the probe calls of a pre-flight healthcheck — is added to
+    every usage figure this run reports AND to what the budget guard sees, so the
+    ceilings bound the whole operation instead of resetting per pass. Passing the
+    caller's `search_cache` likewise keeps the Exa cap and the dedup cache shared
+    across passes rather than handing each pass a fresh `max_web_searches`.
 
     `context_in_stage2=False`: drop the (potentially up-to-500KB) context files
     from stage 2 ranking and stage 3 synthesis prompts — stage 1 still gets the
@@ -1371,18 +1632,36 @@ async def run_council(
 
     notes: list[str] = []
     rounds_detail: list[dict] = []
+    # Why deliberation ended: "completed" | "budget" | "round_collapse". Reported
+    # in the summary so a caller can tell "we ran the rounds you asked for" from
+    # "we stopped early" — the requested count alone never says which happened.
+    stop_reason = "completed"
 
     # One shared search cache per run — members issue overlapping queries and
     # otherwise pay Exa per duplicate. Round-1 stage 1 and (when synthesis runs)
     # the stage-3 chairman share it; stage 2 and rounds 2+ stay search-free.
     # A budget.max_web_searches lowers the per-run Exa cap below the default.
-    if web_search:
+    # An injected cache (multi-pass adaptive run) is reused as-is so the cap and
+    # the dedup hits carry across passes instead of resetting.
+    if search_cache is None and web_search:
         if budget is not None and budget.max_web_searches is not None:
             search_cache = RunSearchCache(max_searches=budget.max_web_searches)
         else:
             search_cache = RunSearchCache()
-    else:
+    elif not web_search:
         search_cache = None
+
+    def _total_usage(u: dict) -> dict:
+        """This pass's usage plus whatever earlier passes/probes already spent."""
+        if not usage_offset:
+            return u
+        merged = dict(u)
+        for k, v in usage_offset.items():
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                continue
+            cur = merged.get(k)
+            merged[k] = (cur + v) if isinstance(cur, (int, float)) else v
+        return merged
 
     # --- Round 1 ---------------------------------------------------------
     progress("phase", {"phase": "stage1", "members": [m["id"] for m in members]})
@@ -1424,9 +1703,10 @@ async def run_council(
         # Budget gate at the round boundary: an in-flight round always finished
         # above (its answers are kept) — here we decide whether to start ANOTHER.
         if budget is not None:
-            stop = budget.check(_compute_usage(rounds_detail, None, search_cache))
+            stop = budget.check(_total_usage(_compute_usage(rounds_detail, None, search_cache)))
             if stop:
                 notes.append(f"stopped before round {round_idx}: budget — {stop}")
+                stop_reason = "budget"
                 break
         progress("phase", {"phase": f"round{round_idx}_stage1"})
         prior_stage1 = stage1  # immutable snapshot of previous round
@@ -1484,6 +1764,7 @@ async def run_council(
             ok_stage1 = [s for s in prior_stage1 if s["status"] == "ok"]
             stage2 = prior_stage2
             aggregate = prior_aggregate
+            stop_reason = "round_collapse"
             break
 
         stage2, stage2_notes = await _run_stage2_for_round(
@@ -1497,11 +1778,12 @@ async def run_council(
     # --- Stage 3 (optional) ---------------------------------------------
     stage3: dict | None = None
     budget_stop_synthesis = (
-        budget.check(_compute_usage(rounds_detail, None, search_cache))
+        budget.check(_total_usage(_compute_usage(rounds_detail, None, search_cache)))
         if budget is not None else None
     )
     if synthesis and budget_stop_synthesis:
         notes.append(f"stage3 synthesis skipped: budget — {budget_stop_synthesis}")
+        stop_reason = "budget"
     elif synthesis:
         chairman = _pick_chairman(
             aggregate, [s["id"] for s in ok_stage1], members_by_id
@@ -1558,10 +1840,18 @@ async def run_council(
         "notes": notes,
         # query→sources provenance from web_search (empty without web_search).
         "claim_ledger": claim_ledger,
-        "usage": _compute_usage(rounds_detail, stage3, search_cache),
+        "usage": _total_usage(_compute_usage(rounds_detail, stage3, search_cache)),
         "summary": _build_summary(
             stage1, stage2, aggregate, stage3, rounds=rounds,
             question=question, borda=borda,
+            rounds_attempted=len(rounds_detail),
+            # A round "completed" when it produced at least one live answer; the
+            # all-errors round recorded for usage accounting doesn't count.
+            rounds_completed=sum(
+                1 for rd in rounds_detail
+                if any(s["status"] == "ok" for s in rd["stage1"])
+            ),
+            stop_reason=stop_reason,
         ),
         "budget": budget.as_dict() if budget is not None else None,
     }
@@ -1587,14 +1877,43 @@ async def run_adaptive_council(
 
     Returns the final run_council result with an extra `adaptive` section
     (dropped members, subset used, escalation trail). `run_kwargs` are forwarded
-    to run_council (synthesis, rounds, web_search, budget, on_progress, …)."""
+    to run_council (synthesis, rounds, web_search, budget, on_progress, …).
+
+    ACCOUNTING: every pass — and the healthcheck probes — spends real calls, but
+    only the LAST pass's materials are returned. So the passes share one run
+    context: a single `RunSearchCache` (one Exa cap and one dedup pool for the
+    whole operation, not a fresh `max_web_searches` per pass) and a cumulative
+    `usage_offset`. The returned `usage` is therefore the TOTAL across probes and
+    every attempt, and the budget guard inside the final pass sees that total —
+    without this a 2-pass escalation could spend ~2× its `max_llm_calls` ceiling
+    while both the guard and the report saw only the last pass. Per-pass figures
+    stay visible in `adaptive.attempts`."""
     members = members if members is not None else resolve_members(None)
     call_fn = call_fn or call_openai_compat
     adaptive_notes: list[str] = []
     dropped: list[tuple[str, str]] = []
+    # Cumulative spend of everything already done (probes + finished passes).
+    spent: dict = {"llm_calls": 0, "tokens_in": 0, "tokens_out": 0,
+                   "web_search_calls": 0, "retries": 0}
+    attempts_usage: list[dict] = []
+
+    def _add_spent(u: dict) -> None:
+        for k, v in u.items():
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                continue
+            cur = spent.get(k)
+            spent[k] = (cur + v) if isinstance(cur, (int, float)) else v
 
     if healthcheck:
         rows = await healthcheck_models([m["id"] for m in members], call_fn=call_fn)
+        # Probes are real provider calls — count them, or the run under-reports
+        # its own spend by one call per member before the council even starts.
+        probe_usage = {
+            "llm_calls": sum(1 for r in rows if r.get("key_present") and r.get("enabled")),
+            "tokens_out": sum(int(r.get("tokens_out") or 0) for r in rows),
+        }
+        _add_spent(probe_usage)
+        attempts_usage.append({"pass": "healthcheck", "usage": probe_usage})
         kept_ids, dropped = adaptive.filter_healthy([m["id"] for m in members], rows)
         if dropped:
             adaptive_notes.append(
@@ -1603,15 +1922,47 @@ async def run_adaptive_council(
             )
         kept = [m for m in members if m["id"] in kept_ids]
         # Never shrink below the 2-member council floor on a flaky probe — if the
-        # health filter would leave <2, fall back to the full requested set.
-        members = kept if len(kept) >= 2 else members
+        # health filter would leave <2, fall back to the full requested set. The
+        # members then come BACK into play, so `dropped` must not keep claiming
+        # they were excluded — that metadata would name models the run used.
+        if len(kept) >= 2:
+            members = kept
+        elif dropped:
+            adaptive_notes.append(
+                "adaptive: health filter would leave <2 members — kept the full "
+                "set; the models listed above were used after all"
+            )
+            dropped = []
+
+    # One search cache for the whole operation (shared Exa cap across passes).
+    # Built here rather than per-pass; run_council reuses an injected cache as-is.
+    shared_cache: RunSearchCache | None = None
+    if run_kwargs.get("web_search"):
+        budget = run_kwargs.get("budget")
+        if budget is not None and budget.max_web_searches is not None:
+            shared_cache = RunSearchCache(max_searches=budget.max_web_searches)
+        else:
+            shared_cache = RunSearchCache()
 
     start_ids = adaptive.pick_starting_subset(members)
     used_ids = set(start_ids)
     start_members = [m for m in members if m["id"] in start_ids]
     adaptive_notes.append(f"adaptive: started with {sorted(used_ids)}")
 
-    result = await run_council(question, members=start_members, call_fn=call_fn, **run_kwargs)
+    result = await run_council(
+        question, members=start_members, call_fn=call_fn,
+        usage_offset=dict(spent), search_cache=shared_cache, **run_kwargs,
+    )
+    # run_council already folded `spent` into the usage it reports, so the pass's
+    # own cost is the difference — track it separately for the attempts trail and
+    # then make it the new cumulative total.
+    pass_usage = result.get("usage") or {}
+    attempts_usage.append({
+        "pass": f"subset:{sorted(used_ids)}",
+        "usage": {k: v for k, v in pass_usage.items() if isinstance(v, (int, float))},
+    })
+    spent = {k: v for k, v in pass_usage.items()
+             if isinstance(v, (int, float)) and not isinstance(v, bool)}
 
     escalation_trail: list[dict] = []
     escalations = 0
@@ -1626,8 +1977,16 @@ async def run_adaptive_council(
         adaptive_notes.append(f"adaptive: escalated ({reason}) → {sorted(used_ids)}")
         result = await run_council(
             question, members=[m for m in members if m["id"] in used_ids],
-            call_fn=call_fn, **run_kwargs,
+            call_fn=call_fn, usage_offset=dict(spent), search_cache=shared_cache,
+            **run_kwargs,
         )
+        pass_usage = result.get("usage") or {}
+        attempts_usage.append({
+            "pass": f"escalation:{sorted(used_ids)}",
+            "usage": {k: v for k, v in pass_usage.items() if isinstance(v, (int, float))},
+        })
+        spent = {k: v for k, v in pass_usage.items()
+                 if isinstance(v, (int, float)) and not isinstance(v, bool)}
         escalations += 1
 
     result.setdefault("notes", [])
@@ -1638,5 +1997,8 @@ async def run_adaptive_council(
         "starting_subset": sorted(start_ids),
         "final_members": sorted(used_ids),
         "escalations": escalation_trail,
+        # Cumulative usage after each pass (probes first). The top-level `usage`
+        # is the total; these show where it went.
+        "attempts": attempts_usage,
     }
     return result

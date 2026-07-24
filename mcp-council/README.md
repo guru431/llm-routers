@@ -20,7 +20,9 @@ MCP-сервер: Karpathy 3-stage council из 7 LLM с опционально�
 | gemini | gemini-3.1-pro-preview | Helicone AI Gateway | `HELICONE_GATEWAY_KEY` |
 | codex | gpt-5.5 | codex-agent-server :8766 (read-only) | `CODEX_AGENT_TOKEN` |
 
-`deepseek-pro` теперь идёт через OCG-прокси (DeepSeek direct PAYG исчерпан с 2026-06-07). **Provider-домены** (независимые точки отказа): 5 моделей на OCG (`glm`/`kimi`/`deepseek-pro`/`qwen`/`minimax`) делят один ключ и падают вместе → при OCG outage живыми голосами остаются `gemini` (Helicone) и `codex` (локальный codex-agent-server), т.е. **два независимых домена, а не только Gemini**. Именно поэтому council считает distinct provider-домены, а не число имён: `summary.provider_domains`/`single_provider`/`quorum_ok` гейтят «adopt»-вердикт (см. `_build_summary`). См. также `_pick_chairman` — DeepSeek используется как fallback chairman.
+`deepseek-pro` теперь идёт через OCG-прокси (DeepSeek direct PAYG исчерпан с 2026-06-07). **Provider-домены** (независимые точки отказа): 5 моделей на OCG (`glm`/`kimi`/`deepseek-pro`/`qwen`/`minimax`) делят один ключ и падают вместе → при OCG outage живыми голосами остаются `gemini` (Helicone) и `codex` (локальный codex-agent-server), т.е. **два независимых домена, а не только Gemini**. Именно поэтому council считает distinct provider-домены, а не число имён: `summary.provider_domains`/`single_provider`/`quorum_ok` гейтят «adopt»-вердикт (см. `_build_summary`). См. также `_pick_chairman` — `deepseek-pro` используется как fallback chairman (это предпочтение по доступности внутри дефолтного состава, а НЕ независимый провайдер: он ходит через тот же OCG-шлюз).
+
+**Что считается голосом.** `summary.independent_votes` — число ранкеров, поставивших winner СВОЙ высший балл (и не ниже 6/10). Просто «winner присутствует в списке ранкера» голосом не считается: при полных рейтингах там присутствуют все, включая последнее место. Не засчитываются также плоские рейтинги (всем одинаково — предпочтение не выражено) и ранкеры с неполным списком. Более слабый счёт «упомянут вообще» доступен как `winner_ranked_by`, а пропуски — как `incomplete_rankings` (непустой список срезает `confidence` с `high` до `medium` и включает `human_review_required`: средние тогда сравниваются на разном числе оценок).
 
 ## Tools
 
@@ -189,10 +191,30 @@ Async-job исполнение council живёт в `state.py`; промпты 
 
 Эффективная поза видна в `model_healthcheck` (`context_roots_configured`, `context_fail_open`) и в startup-логе (stderr).
 
+**Проверки применяются к тому, что реально открыто.** `resolve_and_validate` — ранний дешёвый гейт; настоящая граница — `read_files_with_limit`: файл открывается ОДИН раз, и по этому открытию заново проверяются тип (`fstat` — обычный ли файл), deny-list и allowed roots по пути, private-key/binary sniff по прочитанным байтам и суммарный размер. Поэтому подмена пути на symlink/junction между валидацией и чтением не даёт прочитать чужой файл.
+
+**Наружу уходит относительный путь.** В промпт (и, соответственно, всем внешним провайдерам) заголовок файла пишется как путь относительно matched root — или как basename, если корней нет. Абсолютный путь раскрывал имя пользователя, внутреннее имя проекта и раскладку каталогов, ничего не давая модели; он остаётся только в локальных audit-метаданных дампа.
+
 ## Logging
 
 - JSONL события per-call: `logs/council_YYYY-MM-DD.log` (метаданные).
 - Полный дамп per-call: `logs/calls/<timestamp>-<hash>.json` (question + stage1 ответы + stage2 рейтинги + stage3 synthesis + errors + latency). Используется для анализа качества council.
+
+### Retention и redaction
+
+| Что | Где | Под ретеншеном |
+|---|---|---|
+| полные дампы вызовов | `logs/calls/*.json` | да |
+| per-day JSONL журнал | `logs/council_*.log` (корень `logs/`) | да |
+| снапшоты async-job | `logs/jobs/*.json` | да |
+| дампы диалогов | `logs/dialogues/*.json` | да |
+| event-журналы | `logs/events/*.jsonl` | да |
+
+- **TTL** — `COUNCIL_LOG_RETENTION_HOURS` (дефолт `168` = 7 дней; `0` отключает).
+- **Квота на каталог** — `COUNCIL_LOG_DIR_QUOTA_BYTES` (дефолт 256 MB), удаление oldest-first после TTL-прохода.
+- **Когда чистится** — автоматически при **старте сервера** и по требованию через `council_purge_logs`. Настроенный TTL — реальный срок хранения, а не обещание, действующее только когда кто-то вручную дёрнул tool.
+- **Redaction** — дампы и JSONL записываются уже с замаскированными credential-подобными токенами (`retention.redact` поверх сериализованного JSON). `COUNCIL_LOG_REDACT=0` пишет как есть — только для отладки.
+- Снапшоты `jobs/` и `dialogues/` **намеренно не редактируются**: это рабочее состояние, которое обязано round-trip'иться дословно (восстановленный job отдаёт свой результат клиенту), их ограничивает TTL/квота. Структурно битый снапшот при загрузке переезжает в `<dir>/corrupt/` и не мешает старту сервера.
 
 ## HTTP behaviour
 

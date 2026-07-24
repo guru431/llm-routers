@@ -78,7 +78,7 @@ curl -H "Authorization: Bearer $CCR_API_KEY" http://127.0.0.1:3456/
 Клиент (Claude Code или любой Anthropic SDK) ставит:
 - `ANTHROPIC_BASE_URL=http://127.0.0.1:3456` (локально) или `http://<host>:3456` (из LAN)
 - `ANTHROPIC_AUTH_TOKEN=$CCR_API_KEY`
-- опционально `ANTHROPIC_MODEL=<upstream-model>` (любая модель upstream-провайдера)
+- опционально `ANTHROPIC_MODEL=<upstream-model>` — **только id из списка** `Providers[opencode].models` вашего `config.json` (см. «Каталог моделей» ниже). Незнакомый id роутером не принимается: `claude-*` уходит в `Router.default`, всё остальное — тоже в дефолт с `reason=unknown_model_builtin_routing`. Это не «любая модель upstream».
 
 ccr:
 1. Принимает Anthropic-формат
@@ -92,12 +92,21 @@ ccr:
 
 `custom_router.js` решает роут по `req.body.model`. Источник допустимых upstream-id — **`config.Providers[opencode].models`** из живого `~/.claude-code-router/config.json`; хардкод `OPENCODE_MODELS_FALLBACK` в `custom_router.js` — только safety-net.
 
-**Синхронизация каталога (три копии, нет build-step):**
-1. `mcp-council/models.py::CATALOG` — канон OCG-моделей для всего репо;
-2. `config.example.json` → `Providers[opencode].models` — ручное зеркало (template);
-3. `OPENCODE_MODELS_FALLBACK` в `custom_router.js` — ручное зеркало (fallback).
+**CCR — самостоятельный upstream-каталог, а НЕ зеркало `mcp-council/models.py::CATALOG`.**
+Это разные списки по назначению и они намеренно расходятся:
 
-При добавлении/удалении модели править все три. Реальный роут берёт список из вашего `config.json` (копия template), поэтому обычно достаточно обновить `config.json` + `ccr restart` — fallback используется только если список в конфиге **пуст/отсутствует** (сломанный конфиг), и тогда роутер печатает `WARNING: config.Providers[opencode].models is empty or missing` (fail-closed видимость дрейфа, а не молчаливый хардкод).
+- `CATALOG` — модели, которые совет реально вызывает (нужны цены, quirks, env-ключ, provider-домен для кворума). Это **подмножество**;
+- `Providers[opencode].models` — всё, что подписка OpenCode Go отдаёт через CCR и что вы хотите иметь под рукой в Claude Code. Это **надмножество**, и оно живёт своей жизнью (там есть mimo-*, glm-5, qwen3.5/3.7-plus, minimax-m2.5, которых в совете нет).
+
+Не сводить их «в канон»: добавление модели в CCR не означает, что она годится в совет, и наоборот.
+
+**Две копии CCR-списка (нет build-step):**
+1. `config.example.json` → `Providers[opencode].models` — template;
+2. `OPENCODE_MODELS_FALLBACK` в `custom_router.js` — safety-net, если список в конфиге пуст.
+
+При добавлении/удалении модели править обе. Реальный роут берёт список из вашего `config.json` (копия template), поэтому обычно достаточно обновить `config.json` + `ccr restart`.
+
+Про fallback: он **не** fail-closed. Если `Providers[opencode].models` пуст/отсутствует, роутер печатает `WARNING: config.Providers[opencode].models is empty or missing` и **продолжает маршрутизировать по хардкоду** — это шумный fallback (дрейф видно в логе), но не отказ в обслуживании.
 
 **Трассировка решений.** CCR-контракт кастомного роутера даёт только `(req, config)` и ждёт назад строку `"provider,model"` (или `null`) — объекта ответа, куда можно повесить trace-заголовок, нет. Поэтому на **каждое** решение роутер печатает одну структурную строку в stdout:
 

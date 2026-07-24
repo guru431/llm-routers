@@ -46,27 +46,39 @@ def fingerprint(
     web_search: bool,
     max_tokens: int,
     context_fingerprint: str = "",
+    context_in_stage2: bool = True,
+    adaptive: bool = False,
+    budget: dict | None = None,
 ) -> str:
-    """Stable sha256 over everything that changes the council answer.
+    """Stable sha256 over the RESOLVED execution spec — everything that changes
+    the council answer, after defaults are applied.
 
-    `model_configs` are the resolved member dicts (id + catalog fields); we hash
-    the id + model + base_url + provider + extra so a catalog edit (new model
-    string, changed quirk) invalidates the entry instead of serving a stale brief.
-    Members are sorted by id so member ORDER doesn't fork the key.
+    `model_configs` are the resolved member dicts; we hash id + model + base_url
+    + provider + extra + the effective min_max_tokens (a catalog edit, a changed
+    quirk or a raised per-model floor must invalidate the entry rather than serve
+    a stale brief).
+
+    Member ORDER is part of the key. It is NOT sorted away: stage-1 order decides
+    each ranker's pseudonym assignment and the presentation order of the answers
+    it ranks, so two runs with the same members in a different order are two
+    different deliberations that can pick different winners.
+
+    `context_in_stage2`, `adaptive` and `budget` (deadline / cost / search /
+    call ceilings) are hashed too — they were previously absent, so a
+    budget-stopped 2-model adaptive run could be served for a full, unbounded,
+    context-carrying one.
     """
-    members = sorted(
-        (
-            {
-                "id": m.get("id"),
-                "model": m.get("model"),
-                "base_url": m.get("base_url"),
-                "provider": m.get("provider"),
-                "extra": m.get("extra"),
-            }
-            for m in model_configs
-        ),
-        key=lambda d: str(d.get("id")),
-    )
+    members = [
+        {
+            "id": m.get("id"),
+            "model": m.get("model"),
+            "base_url": m.get("base_url"),
+            "provider": m.get("provider"),
+            "extra": m.get("extra"),
+            "min_max_tokens": m.get("min_max_tokens"),
+        }
+        for m in model_configs
+    ]
     material = json.dumps(
         {
             "q": question,
@@ -76,6 +88,9 @@ def fingerprint(
             "web_search": web_search,
             "max_tokens": max_tokens,
             "ctx": context_fingerprint,
+            "context_in_stage2": context_in_stage2,
+            "adaptive": adaptive,
+            "budget": budget or {},
         },
         sort_keys=True,
         ensure_ascii=False,
@@ -151,7 +166,15 @@ class ResponseCache:
         # Singleflight: if an identical run is already in flight, await it.
         inflight = self._inflight.get(key)
         if inflight is not None:
-            value = await inflight
+            try:
+                value = await inflight
+            except asyncio.CancelledError:
+                if not inflight.cancelled():
+                    raise  # THIS task was cancelled — propagate our own.
+                # The owner was cancelled; a waiter must not inherit that. The
+                # owner already removed the key, so this retry takes the owner
+                # path and computes for real.
+                return await self.get_or_compute(key, compute)
             # Served off a concurrent computation — count as a hit and attach
             # provenance if the winner cached it.
             self.hits += 1
@@ -174,15 +197,29 @@ class ResponseCache:
             if not fut.done():
                 fut.set_result(value)
             return value, None
-        except Exception as e:
+        except BaseException as e:
+            # BaseException, not Exception: asyncio.CancelledError inherits from
+            # BaseException, so an `except Exception` cleanup NEVER ran when the
+            # OWNER of the singleflight was cancelled (client disconnect, timeout,
+            # task cancellation). The key then stayed in `_inflight` holding a
+            # future nobody would ever complete, and every later request for that
+            # question awaited it forever — a permanently poisoned key, curable
+            # only by restarting the process.
             self._inflight.pop(key, None)
             if not fut.done():
-                fut.set_exception(e)
-                # Mark it retrieved: with no concurrent waiter nobody ever awaits
-                # this future, and asyncio would log a spurious "Future exception
-                # was never retrieved" traceback for an error the caller already
-                # received by `raise` below. Real waiters still get it raised.
-                fut.exception()
+                if isinstance(e, asyncio.CancelledError):
+                    # Waiters must not inherit the owner's cancellation as their
+                    # own — cancel the shared future so each waiter raises
+                    # CancelledError at its own await and can retry cleanly.
+                    fut.cancel()
+                else:
+                    fut.set_exception(e)
+                    # Mark it retrieved: with no concurrent waiter nobody ever
+                    # awaits this future, and asyncio would log a spurious
+                    # "Future exception was never retrieved" traceback for an
+                    # error the caller already received by `raise` below. Real
+                    # waiters still get it raised.
+                    fut.exception()
             raise
 
     def stats(self) -> dict:

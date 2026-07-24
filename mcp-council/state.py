@@ -145,51 +145,96 @@ def _state_from_snapshot(data: dict) -> "JobState":
     return state
 
 
+QUARANTINE_DIRNAME = "corrupt"
+
+
+def quarantine_snapshot(f: Path, reason: str) -> None:
+    """Move an unloadable snapshot into `<dir>/corrupt/` and log why.
+
+    Leaving it in place meant the SAME file broke startup on every restart;
+    deleting it destroys the evidence. Moving it out of the load path does both
+    jobs. Falls back to deleting if the move fails (a read-only dir would
+    otherwise re-break the next boot)."""
+    print(
+        f"[mcp-council] quarantining unreadable snapshot {f.name}: {reason}",
+        file=sys.stderr,
+    )
+    try:
+        qdir = f.parent / QUARANTINE_DIRNAME
+        qdir.mkdir(parents=True, exist_ok=True)
+        f.replace(qdir / f.name)
+    except OSError:
+        try:
+            f.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _valid_snapshot(data: object) -> tuple[dict, str] | None:
+    """Type-validate a parsed snapshot BEFORE any arithmetic or dict lookup on
+    it. Returns (data, job_id) or None when the shape is unusable.
+
+    The old loader computed `now - (data.get("created_at") or 0)` and tested
+    `jid in _jobs` straight after json.loads — a string `created_at` raised
+    TypeError, an unhashable (list) job_id raised TypeError, and neither was
+    inside the guarded block, so ONE hand-edited or truncated-then-repaired file
+    aborted the whole load and the server start."""
+    if not isinstance(data, dict):
+        return None
+    jid = data.get("job_id")
+    if not isinstance(jid, str) or not jid:
+        return None
+    created = data.get("created_at")
+    if created is not None and (
+        not isinstance(created, (int, float)) or isinstance(created, bool)
+    ):
+        return None
+    return data, jid
+
+
 def load_persisted_jobs() -> int:
     """Load persisted snapshots into memory at startup, marking non-terminal
     jobs as 'interrupted'. Returns the number of jobs loaded. Synchronous —
-    intended to run once before the event loop starts serving."""
+    intended to run once before the event loop starts serving.
+
+    Every per-file step is guarded: a single malformed snapshot is quarantined
+    and the rest still load. Startup must never depend on one file's contents."""
     d = _persist_dir()
     if not d.exists():
         return 0
     now = time.time()
     loaded = 0
-    for f in d.glob("*.json"):
+    for f in sorted(d.glob("*.json")):
         try:
-            data = json.loads(f.read_text(encoding="utf-8"))
-        except OSError:
-            continue
-        except ValueError:
-            # Permanently corrupt/truncated snapshot — delete it so it isn't
-            # re-read and re-failed on every restart.
             try:
-                f.unlink(missing_ok=True)
+                data = json.loads(f.read_text(encoding="utf-8"))
             except OSError:
-                pass
-            continue
-        if now - (data.get("created_at") or 0) > JOB_TTL_SECONDS:
-            try:
-                f.unlink(missing_ok=True)
-            except OSError:
-                pass
-            continue
-        jid = data.get("job_id")
-        if not jid or jid in _jobs:
-            continue
-        # _state_from_snapshot does MemberProgress(**m) — a snapshot with
-        # extra/changed keys raises TypeError (and KeyError on a missing "id").
-        # One bad file must not down the whole server: skip it with a warning
-        # and keep loading the rest. Mirrors load_persisted_dialogues.
-        try:
+                continue  # transient read problem — leave the file alone
+            except ValueError as e:
+                quarantine_snapshot(f, f"invalid JSON: {e}")
+                continue
+
+            valid = _valid_snapshot(data)
+            if valid is None:
+                quarantine_snapshot(f, "snapshot shape/type invalid")
+                continue
+            data, jid = valid
+
+            if now - (data.get("created_at") or 0) > JOB_TTL_SECONDS:
+                try:
+                    f.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                continue
+            if jid in _jobs:
+                continue
+            # _state_from_snapshot does MemberProgress(**m) — a snapshot with
+            # extra/changed keys raises TypeError (and KeyError on a missing "id").
             _jobs[jid] = _state_from_snapshot(data)
-        except (KeyError, TypeError, ValueError) as e:
-            print(
-                f"[mcp-council] skipping unreadable job snapshot {f.name}: "
-                f"{type(e).__name__}: {e}",
-                file=sys.stderr,
-            )
+            loaded += 1
+        except Exception as e:  # noqa: BLE001 — one bad file must not stop startup
+            quarantine_snapshot(f, f"{type(e).__name__}: {e}")
             continue
-        loaded += 1
     return loaded
 
 

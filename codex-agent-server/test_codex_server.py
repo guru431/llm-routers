@@ -8,6 +8,8 @@ the historical codex suite renamed to integration_suite.py.
 
 import io
 import json
+import os
+from pathlib import Path
 
 import pytest
 
@@ -159,14 +161,35 @@ def test_extract_content_variants():
     assert server.extract_content(None) == ""
 
 
-def test_child_env_strips_secrets(monkeypatch):
+def test_child_env_is_an_allowlist(monkeypatch):
+    """Guessing secret NAMES doesn't work: DATABASE_URL / GITHUB_PAT / AWS_SESSION
+    carry credentials and match no suffix-or-substring rule, so the old denylist
+    handed them to a CLI that can read its own environment. Only names the CLI
+    needs to run get through now."""
     monkeypatch.setattr(server.os, "environ", {
-        "FOO_TOKEN": "s1", "BAR_KEY": "s2", "MY_PASSWORD": "s3", "PLAIN": "keep",
+        "FOO_TOKEN": "s1", "BAR_KEY": "s2", "MY_PASSWORD": "s3",
+        # These are exactly the ones a denylist misses.
+        "DATABASE_URL": "postgres://u:p@h/db", "GITHUB_PAT": "ghp_x",
+        "AWS_SESSION": "s", "STRIPE_SK": "sk_live_x",
+        "PATH": "/usr/bin", "HOME": "/home/u", "PLAIN": "not-needed",
     })
     env = server._child_env_without_secrets(EXTRA="1")
-    assert "FOO_TOKEN" not in env and "BAR_KEY" not in env and "MY_PASSWORD" not in env
-    assert env["PLAIN"] == "keep"
+    for leaked in ("FOO_TOKEN", "BAR_KEY", "MY_PASSWORD", "DATABASE_URL",
+                   "GITHUB_PAT", "AWS_SESSION", "STRIPE_SK", "PLAIN"):
+        assert leaked not in env, f"{leaked} must not reach the child CLI"
+    assert env["PATH"] == "/usr/bin"
+    assert env["HOME"] == "/home/u"
     assert env["EXTRA"] == "1"
+
+
+def test_child_env_passthrough_opt_in(monkeypatch):
+    """A deployment that genuinely needs another variable opts in explicitly."""
+    monkeypatch.setattr(server.os, "environ", {
+        "HTTPS_PROXY": "http://proxy:3128", "PATH": "/usr/bin",
+        "AGENT_CHILD_ENV_PASSTHROUGH": "https_proxy",
+    })
+    env = server._child_env_without_secrets()
+    assert env["HTTPS_PROXY"] == "http://proxy:3128"
 
 
 def test_build_tools_system_prompt_lists_functions():
@@ -540,3 +563,232 @@ def test_do_get_metrics_and_ready(monkeypatch):
     assert code in (200, 503)
     assert "ready" in data and "checks" in data
     assert set(data["checks"]) >= {"auth_token_configured", "cli_found", "not_overloaded"}
+
+
+# ── FINDINGS 2026-07-21: streaming honesty + no double workspace-write ──────
+
+
+@pytest.fixture(autouse=True)
+def _reset_stream_support():
+    """The support memo is process-wide; keep tests independent."""
+    server._STREAM_JSON_SUPPORTED[0] = None
+    yield
+    server._STREAM_JSON_SUPPORTED[0] = None
+
+
+class _FailingStreamProc(_FakeStreamProc):
+    """A CLI that emits one recognized event, then dies with a non-zero code."""
+
+    def __init__(self, lines, returncode=1):
+        super().__init__(lines)
+        self._rc = returncode
+        self.stderr = _FakeStream(["codex: boom\n"])
+
+    def poll(self):
+        return self._rc
+
+    def wait(self, timeout=None):
+        return self._rc
+
+
+def test_stream_nonzero_exit_raises_instead_of_clean_finish(monkeypatch):
+    """EOF on stdout is not success: a CLI that emitted one delta and then failed
+    used to be reported to the client as a completed answer."""
+    lines = [json.dumps({"type": "agent_message_delta", "delta": "partial"}) + "\n"]
+    monkeypatch.setattr(server, "READ_ROOT", None)
+    monkeypatch.setattr(server.subprocess, "Popen",
+                        lambda *a, **k: _FailingStreamProc(lines))
+    gen = server.run_codex_stream("hi", model_base="gpt-5.5", sandbox="read-only")
+    assert next(gen) == ("text", "partial")
+    with pytest.raises(server.StreamFailed):
+        next(gen)
+
+
+def test_stream_timeout_is_reported_not_silently_completed(monkeypatch):
+    lines = [json.dumps({"type": "agent_message_delta", "delta": "partial"}) + "\n"]
+    monkeypatch.setattr(server, "READ_ROOT", None)
+    monkeypatch.setattr(server.subprocess, "Popen",
+                        lambda *a, **k: _FakeStreamProc(lines))
+
+    class _ImmediateTimer:
+        """Fire the watchdog callback as soon as it is started."""
+
+        def __init__(self, interval, fn, args=()):
+            self._fn, self._args = fn, args
+            self.daemon = True
+
+        def start(self):
+            self._fn(*self._args)
+
+        def cancel(self):
+            pass
+
+    monkeypatch.setattr(server.threading, "Timer", _ImmediateTimer)
+    monkeypatch.setattr(server, "_kill_process_tree", lambda proc: None)
+    gen = server.run_codex_stream("hi", model_base="gpt-5.5", sandbox="read-only")
+    items = []
+    with pytest.raises(server.StreamFailed, match="timed out"):
+        for item in gen:
+            items.append(item)
+    assert ("text", "partial") in items
+
+
+def test_stream_reconciles_outfile_after_partial_deltas(monkeypatch, tmp_path):
+    """One early delta used to suppress the authoritative `-o` outfile entirely,
+    so a truncated event stream silently became the whole answer."""
+    outfile = tmp_path / "codex-out.txt"
+    outfile.write_text("partial and the rest", encoding="utf-8")
+    monkeypatch.setattr(server, "READ_ROOT", None)
+    monkeypatch.setattr(server.tempfile, "mkstemp",
+                        lambda **k: (os.open(outfile, os.O_RDONLY), str(outfile)))
+    lines = [json.dumps({"type": "agent_message_delta", "delta": "partial"}) + "\n"]
+    monkeypatch.setattr(server.subprocess, "Popen",
+                        lambda *a, **k: _FakeStreamProc(lines))
+    items = list(server.run_codex_stream("hi", model_base="gpt-5.5", sandbox="read-only"))
+    texts = [p for kind, p in items if kind == "text"]
+    assert texts == ["partial", " and the rest"]
+    assert items[-1][1]["text"] == "partial and the rest"
+
+
+def test_stream_unsupported_never_reruns_a_workspace_write(monkeypatch):
+    """The buffered fallback re-executes the SAME prompt. For workspace-write the
+    first process may already have edited files, so the agent action would be
+    applied twice — report the failure instead of retrying."""
+    def fake_stream(*a, **k):
+        raise server.StreamUnsupported("nope")
+        yield  # pragma: no cover
+
+    ran = []
+    monkeypatch.setattr(server, "run_codex_stream", fake_stream)
+    monkeypatch.setattr(server, "run_codex",
+                        lambda *a, **k: ran.append(1) or "buffered answer")
+    monkeypatch.setattr(server, "resolve_workdir", lambda *a, **k: str(Path.cwd()))
+    monkeypatch.setattr(server, "AGENT_AUTH_TOKEN", "agent-tok")
+    h = _handler(monkeypatch)
+    h._check_agent_auth = lambda: True
+    h._handle_chat({"messages": [{"role": "user", "content": "hi"}],
+                    "model": "gpt-5.5-agent", "stream": True})
+    assert ran == [], "workspace-write must not be re-executed"
+    assert h.sent and h.sent[0][0] == 502
+    assert "will NOT be retried" in h.sent[0][1]["error"]["message"]
+
+
+def test_stream_unsupported_is_remembered(monkeypatch):
+    """After learning the CLI has no --json, later requests skip the doomed pass."""
+    calls = []
+
+    def fake_stream(*a, **k):
+        calls.append(1)
+        raise server.StreamUnsupported("nope")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(server, "run_codex_stream", fake_stream)
+    monkeypatch.setattr(server, "run_codex", lambda *a, **k: "buffered answer")
+    for _ in range(3):
+        h = _handler(monkeypatch)
+        h._handle_chat({"messages": [{"role": "user", "content": "hi"}], "stream": True})
+        assert h.stream_calls  # buffered pseudo-stream each time
+    assert len(calls) == 1
+
+
+def test_send_stream_live_reports_failure_instead_of_done():
+    """A failed run must not sign off with a successful finish chunk + [DONE]."""
+    def gen_items():
+        yield ("text", "partial")
+        raise server.StreamFailed("codex timed out after 300s")
+
+    g = gen_items()
+    first = next(g)
+    h = server.Handler.__new__(server.Handler)
+    h.send_response = lambda *a, **k: None
+    h.send_header = lambda *a, **k: None
+    h.end_headers = lambda *a, **k: None
+    h.wfile = io.BytesIO()
+    before = server.METRICS.timeouts
+    h._send_stream_live(g, first, "id1", 123, "gpt-5.5", {"estimate": True})
+    body = h.wfile.getvalue().decode("utf-8")
+    assert "[DONE]" not in body
+    assert '"finish_reason": "error"' in body
+    assert "timed out" in body
+    assert server.METRICS.timeouts == before + 1
+
+
+def test_unknown_tool_name_is_an_error():
+    """A hallucinated tool used to be skipped by the validator and reach the
+    client as a legitimate finish_reason=tool_calls."""
+    tools = [{"function": {"name": "weather", "parameters": {
+        "type": "object", "properties": {"loc": {"type": "string"}}}}}]
+    errs = server.tool_calls_schema_errors(
+        [{"function": {"name": "rm_rf", "arguments": "{}"}}], tools)
+    assert errs and "not one of the offered tools" in errs[0]
+    assert server.tool_calls_schema_errors(
+        [{"function": {"name": "weather", "arguments": '{"loc": "Moscow"}'}}], tools) == []
+
+
+def test_structured_repair_is_revalidated(monkeypatch):
+    """A second invalid response used to return 200 with structured_output=true."""
+    monkeypatch.setattr(server, "run_codex", lambda *a, **k: "still not json")
+    h = _handler(monkeypatch)
+    h._handle_chat({
+        "messages": [{"role": "user", "content": "hi"}],
+        "response_format": {"type": "json_object"},
+    })
+    code, data = h.sent[0]
+    assert code == 502 and "after one repair" in data["error"]["message"]
+
+
+def test_malformed_message_tool_calls_is_400(monkeypatch):
+    monkeypatch.setattr(server, "run_codex", lambda *a, **k: "x")
+    h = _handler(monkeypatch)
+    h._handle_chat({"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "", "tool_calls": {"id": "1"}},
+    ]})
+    assert h.sent[0][0] == 400
+
+
+def test_ready_checks_read_root_and_reasoning(monkeypatch, tmp_path):
+    """/ready stayed green while every read-only call failed on a bad `-C`, and
+    an invalid CODEX_AGENT_REASONING was never validated at all."""
+    sent = []
+    h = server.Handler.__new__(server.Handler)
+    h._send = lambda code, data, headers=None: sent.append((code, data))
+
+    monkeypatch.setattr(server, "AUTH_TOKEN", "tok")
+    monkeypatch.setattr(server.shutil, "which", lambda name: "codex")
+    monkeypatch.setattr(server, "WORKDIR_ROOT", None)
+    monkeypatch.setattr(server, "DEFAULT_SANDBOX", "read-only")
+    monkeypatch.setattr(server, "REASONING_ENV_VALID", True)
+
+    monkeypatch.setattr(server, "READ_ROOT", str(tmp_path / "missing"))
+    h._send_ready()
+    assert sent[-1][0] == 503
+    assert sent[-1][1]["checks"]["read_root_exists"] is False
+
+    monkeypatch.setattr(server, "READ_ROOT", str(tmp_path))
+    h._send_ready()
+    assert sent[-1][0] == 200
+
+    monkeypatch.setattr(server, "REASONING_ENV_VALID", False)
+    h._send_ready()
+    assert sent[-1][0] == 503
+    assert sent[-1][1]["checks"]["reasoning_valid"] is False
+
+
+def test_ready_requires_agent_config_when_default_is_workspace_write(monkeypatch, tmp_path):
+    sent = []
+    h = server.Handler.__new__(server.Handler)
+    h._send = lambda code, data, headers=None: sent.append((code, data))
+    monkeypatch.setattr(server, "AUTH_TOKEN", "tok")
+    monkeypatch.setattr(server.shutil, "which", lambda name: "codex")
+    monkeypatch.setattr(server, "READ_ROOT", str(tmp_path))
+    monkeypatch.setattr(server, "WORKDIR_ROOT", None)
+    monkeypatch.setattr(server, "WORKDIR", None)
+    monkeypatch.setattr(server, "AGENT_AUTH_TOKEN", None)
+    monkeypatch.setattr(server, "REASONING_ENV_VALID", True)
+    monkeypatch.setattr(server, "DEFAULT_SANDBOX", "workspace-write")
+    h._send_ready()
+    code, data = sent[-1]
+    assert code == 503
+    assert data["checks"]["default_route_workdir_configured"] is False
+    assert data["checks"]["default_route_agent_token_configured"] is False

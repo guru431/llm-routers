@@ -1,12 +1,41 @@
-"""JSONL logger for mcp-council. Writes metadata per-call + full dump for analysis."""
+"""JSONL logger for mcp-council. Writes metadata per-call + full dump for analysis.
+
+Everything written here is REDACTED first (retention.redact over the serialized
+JSON): a dump carries the whole question, the context excerpts and every
+provider body, so a key pasted into a question would otherwise sit on disk in
+clear text for the whole retention window. Set COUNCIL_LOG_REDACT=0 to write raw
+(debugging only — it defeats the point of the redaction promise in
+retention.py's docstring).
+"""
 
 import json
+import os
 import uuid
 from datetime import datetime
 from pathlib import Path
 
+from retention import redact
+
 LOG_DIR = Path(__file__).parent / "logs"
 CALLS_DIR = LOG_DIR / "calls"
+
+_REDACT_ENV = "COUNCIL_LOG_REDACT"
+
+
+def _redaction_enabled() -> bool:
+    return os.environ.get(_REDACT_ENV, "1").strip().lower() not in ("0", "false", "no")
+
+
+def _redacted_json(payload: dict, **dumps_kwargs) -> str:
+    """Serialize `payload` and mask credential-shaped tokens in the result.
+
+    Redacting the SERIALIZED text (rather than walking the structure) covers
+    secrets wherever they sit — nested provider bodies, answer prose, file
+    excerpts — with one pass and no schema assumptions. JSON string escaping
+    can't hide a token from the patterns: the credential shapes are ASCII and
+    survive `json.dumps` unchanged."""
+    text = json.dumps(payload, ensure_ascii=False, **dumps_kwargs)
+    return redact(text) if _redaction_enabled() else text
 
 
 def _new_call_id() -> str:
@@ -28,7 +57,7 @@ def write_full_dump(call_id: str, dump: dict) -> Path:
     # Atomic write (tmp + replace) so a crash mid-write can't leave a truncated
     # dump that later fails to parse as JSON.
     tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(dump, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(_redacted_json(dump, indent=2), encoding="utf-8")
     tmp.replace(path)
     return path
 
@@ -69,4 +98,5 @@ def log_call(
     }
 
     with log_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        # `status` carries provider error text, which can echo a key-bearing URL.
+        f.write(_redacted_json(record) + "\n")

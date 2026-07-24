@@ -110,12 +110,15 @@ async def test_reserve_active_slot_raises_when_cap_full():
     """reserve_active_slot (the dialogue_continue gate) raises the same
     RuntimeError as create_session when MAX_ACTIVE_SESSIONS active sessions
     exist, so resuming a terminal session cannot bypass the cap."""
+    resuming = await create_session(mode="debate", question_preview="q", total_rounds=1)
+    mark_phase(resuming, "done")  # terminal -> frees its slot
     for _ in range(MAX_ACTIVE_SESSIONS):
         s = await create_session(mode="debate", question_preview="q", total_rounds=1)
         mark_phase(s, "round_1_critique")  # active
     with pytest.raises(RuntimeError) as exc:
-        await reserve_active_slot()
+        await reserve_active_slot(resuming)
     assert "active sessions" in str(exc.value).lower()
+    assert resuming.phase == "done"  # no slot taken on the failure path
 
 
 async def test_reserve_active_slot_ok_when_room_for_resume():
@@ -126,7 +129,50 @@ async def test_reserve_active_slot_ok_when_room_for_resume():
         mark_phase(s, "round_1_critique")  # active
     terminal = await create_session(mode="debate", question_preview="q", total_rounds=1)
     mark_phase(terminal, "done")  # terminal -> not counted
-    await reserve_active_slot()  # must not raise
+    previous = await reserve_active_slot(terminal)  # must not raise
+    assert previous == "done"
+    # The reservation IS the transition — the slot is consumed immediately.
+    assert terminal.phase == "starting"
+
+
+async def test_concurrent_reservations_cannot_share_the_last_slot():
+    """Check-then-act race: two continues on two DIFFERENT terminal sessions both
+    used to see the same single free slot (the count and the phase flip were in
+    separate lock holds) and both activated, exceeding MAX_ACTIVE_SESSIONS."""
+    import asyncio
+
+    a = await create_session(mode="debate", question_preview="q", total_rounds=1)
+    b = await create_session(mode="debate", question_preview="q", total_rounds=1)
+    mark_phase(a, "done")
+    mark_phase(b, "done")
+    for _ in range(MAX_ACTIVE_SESSIONS - 1):
+        s = await create_session(mode="debate", question_preview="q", total_rounds=1)
+        mark_phase(s, "round_1_critique")
+
+    results = await asyncio.gather(
+        reserve_active_slot(a), reserve_active_slot(b), return_exceptions=True,
+    )
+    winners = [r for r in results if not isinstance(r, Exception)]
+    losers = [r for r in results if isinstance(r, RuntimeError)]
+    assert len(winners) == 1 and len(losers) == 1
+    assert "active sessions" in str(losers[0]).lower()
+
+
+async def test_reserve_rejects_non_terminal_session():
+    s = await create_session(mode="debate", question_preview="q", total_rounds=1)
+    mark_phase(s, "round_1_critique")
+    with pytest.raises(RuntimeError, match="already resuming or active"):
+        await reserve_active_slot(s)
+
+
+async def test_release_active_slot_restores_previous_phase():
+    from dialogue.state import release_active_slot
+
+    s = await create_session(mode="debate", question_preview="q", total_rounds=1)
+    mark_phase(s, "done")
+    previous = await reserve_active_slot(s)
+    await release_active_slot(s, previous)
+    assert s.phase == "done"
 
 
 async def test_terminal_sessions_do_not_block_cap():
@@ -194,3 +240,32 @@ async def test_attach_task_and_cancel_propagates():
     # Give the event loop a tick to propagate the cancel
     await asyncio.sleep(0.05)
     assert cancelled_flag["v"] is True
+
+
+async def test_one_corrupt_dump_does_not_abort_loading(tmp_path, monkeypatch):
+    """Mirror of the job-store guard: a snapshot with a string timestamp or an
+    unhashable session_id used to raise TypeError outside any guard and abort the
+    whole dialogue load (and, at startup, the server)."""
+    import json
+
+    from dialogue.state import load_persisted_dialogues
+
+    monkeypatch.setenv("COUNCIL_DIALOGUES_DIR", str(tmp_path))
+    dialogue_state._sessions.clear()
+
+    now = time.time()
+    good = {"session_id": "dlg-good", "mode": "debate", "question_preview": "q",
+            "total_rounds": 1, "created_at": now, "last_activity": now,
+            "phase": "done"}
+    (tmp_path / "dlg-good.json").write_text(json.dumps(good), encoding="utf-8")
+    (tmp_path / "bad-ts.json").write_text(
+        json.dumps({"session_id": "dlg-bad", "last_activity": "recently"}),
+        encoding="utf-8")
+    (tmp_path / "bad-id.json").write_text(
+        json.dumps({"session_id": ["x"], "created_at": now}), encoding="utf-8")
+    (tmp_path / "bad-json.json").write_text("{oops", encoding="utf-8")
+
+    assert load_persisted_dialogues() == 1
+    assert "dlg-good" in dialogue_state._sessions
+    assert {p.name for p in (tmp_path / "corrupt").glob("*.json")} == {
+        "bad-ts.json", "bad-id.json", "bad-json.json"}

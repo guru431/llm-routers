@@ -11,6 +11,12 @@ from the real constants so a catalog edit updates the reference automatically:
   * `model_ask_models_line()` — the exact "Available: …" line the model_ask
     docstring uses, generated from CATALOG. A unit test asserts the docstring
     matches this, so the two can never silently diverge.
+
+The `tools` list is read from the LIVE FastMCP registry (`registered_tools()`),
+not hand-maintained. The hand-written copy it replaced had already drifted —
+council_purge_logs, council_estimate, council_critique, council_critique_async
+and dialogue_fork were all missing, so the discovery tool hid five capabilities
+from every caller that used it to find out what the server can do.
 """
 
 from __future__ import annotations
@@ -46,6 +52,21 @@ def model_ask_models_line() -> str:
     if disabled:
         line += f". ({', '.join(disabled)} — disabled.)"
     return line
+
+
+def registered_tools() -> list[str]:
+    """Names of every tool actually registered on the FastMCP server, sorted.
+
+    Read from the live registry so `council_capabilities` cannot claim a tool
+    set the server doesn't have (or omit one it does). Returns [] if the server
+    module can't be imported — capabilities then reports an empty list rather
+    than a plausible-looking lie."""
+    try:
+        import server as _srv
+
+        return sorted(t.name for t in _srv.mcp._tool_manager.list_tools())
+    except Exception:  # pragma: no cover — introspection is best-effort
+        return []
 
 
 def build_capabilities() -> dict:
@@ -100,17 +121,12 @@ def build_capabilities() -> dict:
             "max_run_web_searches": MAX_RUN_SEARCHES,
             "max_active_async_jobs": MAX_ACTIVE_JOBS,
         },
-        "tools": [
-            "council_ask", "council_ask_async", "council_status", "council_result",
-            "council_cancel", "council_list_jobs", "model_ask", "model_healthcheck",
-            "council_capabilities",
-            "model_debate", "model_panel", "model_socratic",
-            "dialogue_continue", "dialogue_status", "dialogue_result",
-            "dialogue_cancel", "dialogue_list_sessions",
-        ],
+        # Live FastMCP registry — never a hand-maintained copy (see module docstring).
+        "tools": registered_tools(),
         "verdict_axes": [
             "agreement_confidence", "quorum_ok", "independent_votes",
-            "provider_domains", "evidence", "risk_class", "human_review_required",
-            "ranking_methods_agree",
+            "winner_ranked_by", "provider_domains", "evidence",
+            "evidence_domains", "risk_class", "human_review_required",
+            "ranking_methods_agree", "incomplete_rankings", "stop_reason",
         ],
     }

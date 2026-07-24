@@ -30,7 +30,7 @@ ROOT = Path(__file__).parent
 # Subprojects that ship pytest suites. Each runs in its own process with cwd set
 # to its own directory, so its conftest.py / pyproject.toml resolve exactly as in
 # a standalone `pytest` run.
-SUITES = ["mcp-council", "claude-agent-server", "codex-agent-server"]
+SUITES = ["mcp-council", "claude-agent-server", "codex-agent-server", "bench"]
 
 # Packages to byte-compile in --full (catches syntax errors the test suites
 # don't import). The agent-server integration suite is excluded — it's live-only.

@@ -306,3 +306,92 @@ def test_do_get_ready_and_metrics():
     h.do_GET()
     code, data = h.sent[-1]
     assert code == 200 and "total_requests" in data
+
+
+# ── FINDINGS 2026-07-21 ─────────────────────────────────────────────────────
+
+
+def test_unknown_tool_name_is_an_error(monkeypatch):
+    """The emulation layer parses whatever the model writes, so a hallucinated
+    tool used to be skipped by the validator and reach the client as a
+    legitimate finish_reason=tool_calls."""
+    tools = [{"function": {"name": "weather", "parameters": {
+        "type": "object", "properties": {"loc": {"type": "string"}}}}}]
+    calls = [{"function": {"name": "delete_everything", "arguments": "{}"}}]
+    errs = server.tool_calls_schema_errors(calls, tools)
+    assert errs and "not one of the offered tools" in errs[0]
+    ok = [{"function": {"name": "weather", "arguments": '{"loc": "Moscow"}'}}]
+    assert server.tool_calls_schema_errors(ok, tools) == []
+
+
+def test_structured_repair_is_revalidated(monkeypatch):
+    """A second invalid response used to return 200 with structured_output=true."""
+    monkeypatch.setattr(server, "run_claude", lambda *a, **k: "still not json")
+    h = _handler()
+    h._handle_chat({
+        "messages": [{"role": "user", "content": "hi"}],
+        "response_format": {"type": "json_object"},
+    })
+    code, data = h.sent[0]
+    assert code == 502
+    assert "after one repair" in data["error"]["message"]
+
+
+def test_malformed_message_tool_calls_is_400(monkeypatch):
+    """`tool_calls` as a dict iterates its KEYS and .get explodes during
+    rendering — a client-shape error must be a 400, not a 500."""
+    monkeypatch.setattr(server, "run_claude", lambda *a, **k: "x")
+    h = _handler()
+    h._handle_chat({"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "", "tool_calls": {"id": "1"}},
+    ]})
+    code, data = h.sent[0]
+    assert code == 400 and data["error"]["type"] == "invalid_request_error"
+
+    h2 = _handler()
+    h2._handle_chat({"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "", "tool_calls": [None]},
+    ]})
+    assert h2.sent[0][0] == 400
+
+
+def test_malformed_tool_parameters_is_400(monkeypatch):
+    monkeypatch.setattr(server, "run_claude", lambda *a, **k: "x")
+    h = _handler()
+    h._handle_chat({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"function": {"name": "t", "parameters": 5}}],
+    })
+    assert h.sent[0][0] == 400
+
+    h2 = _handler()
+    h2._handle_chat({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"function": {"name": "t", "parameters": {"properties": []}}}],
+    })
+    assert h2.sent[0][0] == 400
+
+
+def test_large_system_prompt_is_accepted_via_file():
+    """The 7000-char guard was justified by a `--system-prompt=` argv limit that
+    no longer applies (the prompt goes through --system-prompt-file)."""
+    assert server.MAX_SYSTEM_PROMPT_CHARS >= 100000
+
+
+def test_cache_peek_does_not_count_stats():
+    """The post-queue re-check is a second look at the SAME request; counting it
+    made /health report two misses for one uncached request."""
+    from cache import ResponseCache
+
+    c = ResponseCache()
+    assert c.get("m", None, "p") is None
+    assert c.stats()["misses"] == 1
+    assert c.peek("m", None, "p") is None
+    assert c.stats()["misses"] == 1
+    c.put("m", None, "p", "v")
+    assert c.peek("m", None, "p") == "v"
+    assert c.stats()["hits"] == 0  # peek never counts
+    assert c.get("m", None, "p") == "v"
+    assert c.stats()["hits"] == 1

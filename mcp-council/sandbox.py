@@ -1,6 +1,23 @@
-"""Path validation and blacklist for DeepSeek MCP helper."""
+"""Path validation and blacklist for context files shipped to third-party LLMs.
+
+TOCTOU note: `resolve_and_validate()` checks a NAME and a PATH; the bytes are
+read later, by `read_files_with_limit()`, after an `await` boundary in the
+server. A path validated as safe can be swapped for a symlink / junction /
+reparse point to a file outside the allow-list in between, and the old code
+would then read the new target — the sandbox boundary held for the object that
+was checked, not for the object that was read.
+
+So the boundary lives in `read_files_with_limit()` now: it opens each file ONCE
+and re-runs every guard against what it actually opened — the file descriptor
+(regular-file check via `fstat`) and the bytes it actually read (private-key
+sniff, binary sniff, size), plus the path guards (deny-list, allowed roots). A
+swap after validation therefore can't smuggle content past the checks; the
+worst case is a rejected read. `resolve_and_validate()` stays the early,
+cheap-failure gate (and the count/ordering contract its callers rely on).
+"""
 
 import os
+import stat as _stat
 
 BLOCK_NAMES = frozenset({
     ".env",
@@ -108,9 +125,12 @@ def fail_open() -> bool:
 def context_roots_configured() -> bool:
     """True if COUNCIL_CONTEXT_ROOTS is set to at least one non-empty root.
 
-    When False the sandbox runs deny-list-only: a prompt-injected context_path
-    can still ship any non-blacklisted file to a third-party LLM. Callers
-    (server startup, healthcheck) use this to surface the missing guardrail.
+    When False, context files are REJECTED outright (fail-closed default) — the
+    deny-list-only mode this used to describe now requires an explicit
+    COUNCIL_CONTEXT_FAIL_OPEN=1, and only THEN can a prompt-injected
+    context_path ship a non-blacklisted file to a third-party LLM. Read together
+    with `fail_open()` for the effective posture; callers (server startup,
+    healthcheck) surface both.
     """
     return bool(_allowed_roots())
 
@@ -150,15 +170,24 @@ _SECRET_HEADER_MARKERS = (
 )
 
 
+def _has_secret_header_bytes(chunk: bytes) -> bool:
+    """True if an already-read buffer starts with a private-key / credential
+    header. Operating on the bytes we actually read (rather than on a second
+    open of the path) is what makes the sniff TOCTOU-proof."""
+    head = chunk[:_SECRET_SNIFF_BYTES]
+    return any(marker in head for marker in _SECRET_HEADER_MARKERS)
+
+
 def _has_secret_header(p: Path) -> bool:
     """True if the file's first 8KB contain a private-key / credential header.
-    Content-sniff safety net for renamed or extensionless secrets."""
+    Content-sniff safety net for renamed or extensionless secrets. This is the
+    EARLY gate only — the authoritative sniff runs on the bytes actually read."""
     try:
         with p.open("rb") as fh:
             chunk = fh.read(_SECRET_SNIFF_BYTES)
     except OSError:
         return False
-    return any(marker in chunk for marker in _SECRET_HEADER_MARKERS)
+    return _has_secret_header_bytes(chunk)
 
 
 def resolve_and_validate(paths: list[str]) -> list[Path]:
@@ -244,29 +273,74 @@ def _decode_text(raw: bytes) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+def _read_fd(fd: int, limit: int) -> bytes:
+    """Read up to `limit` bytes from an open descriptor. os.read can return short
+    reads, so loop until EOF or the budget is spent."""
+    chunks: list[bytes] = []
+    got = 0
+    while got < limit:
+        chunk = os.read(fd, min(65536, limit - got))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        got += len(chunk)
+    return b"".join(chunks)
+
+
 def read_files_with_limit(paths: list[Path]) -> list[tuple[Path, str]]:
-    """Читать файлы, проверяя суммарный размер.
+    """Читать файлы, проверяя суммарный размер и заново применяя все проверки
+    sandbox к тому, что реально открыто.
 
     Порядок результата соответствует порядку входных paths.
 
-    Каждый файл открывается РОВНО ОДИН раз: размер считается по фактически
-    прочитанным байтам (read budget+1), а не отдельным stat() — это закрывает
-    TOCTOU-окно между проверкой размера и чтением. Декодирование BOM-aware.
+    Каждый файл открывается РОВНО ОДИН раз, и ВСЕ гарантии проверяются по этому
+    открытию, а не по отдельному stat()/open():
+      * `fstat` на дескрипторе — обычный ли это файл (не каталог/устройство);
+      * deny-list и allowed roots — по пути, который открыли;
+      * private-key sniff и binary sniff — по прочитанным байтам;
+      * размер — по фактически прочитанным байтам (read budget+1).
+    Это и закрывает TOCTOU-окно: подмена пути на symlink/junction после
+    `resolve_and_validate` не даёт прочитать чужой файл — проверки применяются
+    к содержимому, которое уходит наружу. Декодирование BOM-aware.
 
-    Raises SandboxError если суммарный размер превышает MAX_TOTAL_BYTES
-    или один из файлов выглядит бинарным (NUL byte в первых 8KB).
+    Raises SandboxError при нарушении любого из правил.
     """
+    roots = _allowed_roots()
     total = 0
     out: list[tuple[Path, str]] = []
     for p in paths:
         remaining = MAX_TOTAL_BYTES - total
-        # Read one byte past the remaining budget so overflow is detected from the
-        # bytes actually read — no separate stat() → no size/read TOCTOU window.
+        # Deny-list on the path we are about to open. Cheap, and it re-runs the
+        # name/dir-segment rules in case the path changed since validation.
+        if is_blocked(str(p)):
+            raise SandboxError(f"blocked by sandbox: {p}")
+        if roots and not _within_allowed_roots(Path(p).resolve(), roots):
+            raise SandboxError(
+                f"path outside allowed roots ({_CONTEXT_ROOTS_ENV}): {p}"
+            )
+        # O_NOFOLLOW is deliberately NOT used: it doesn't exist on Windows and
+        # would break legitimately symlinked workspaces. The guarantee comes from
+        # checking the OPENED object instead of the path.
         try:
-            with p.open("rb") as fh:
-                raw = fh.read(remaining + 1)
+            fd = os.open(str(p), os.O_RDONLY | getattr(os, "O_BINARY", 0))
         except OSError as e:
             raise SandboxError(f"cannot read file: {p} ({e})")
+        try:
+            st = os.fstat(fd)
+            if not _stat.S_ISREG(st.st_mode):
+                raise SandboxError(f"not a regular file: {p}")
+            # Read one byte past the remaining budget so overflow is detected
+            # from the bytes actually read — no separate stat() involved.
+            raw = _read_fd(fd, remaining + 1)
+        except OSError as e:
+            raise SandboxError(f"cannot read file: {p} ({e})")
+        finally:
+            os.close(fd)
+        # Authoritative content checks — on the bytes that would be shipped.
+        if _has_secret_header_bytes(raw):
+            raise SandboxError(
+                f"blocked by sandbox (private-key/credential content): {p}"
+            )
         total += len(raw)
         if total > MAX_TOTAL_BYTES:
             raise SandboxError(

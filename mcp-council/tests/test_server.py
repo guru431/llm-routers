@@ -422,3 +422,45 @@ def test_council_result_non_terminal_not_ready(monkeypatch, tmp_path):
             await job_state._reset_for_tests()
 
     asyncio.run(_run())
+
+
+# --- FINDINGS 2026-07-21: numeric arg validation + outbound path labels -------
+
+
+def test_council_estimate_rejects_negative_rounds():
+    """Unvalidated rounds reached the estimator's arithmetic and produced a
+    negative "estimate" with HTTP 200 instead of a client error."""
+    import asyncio
+
+    with pytest.raises(RuntimeError, match="rounds"):
+        asyncio.run(server.council_estimate(rounds=-1))
+    with pytest.raises(RuntimeError, match="rounds"):
+        asyncio.run(server.council_estimate(rounds=99))
+
+
+def test_critique_args_reject_negative_caps():
+    with pytest.raises(RuntimeError, match="max_verified_findings"):
+        server._resolve_critique_args(None, None, None, None, 2, -1)
+    with pytest.raises(RuntimeError, match="verifiers_per_finding"):
+        server._resolve_critique_args(None, None, None, None, -1, 24)
+
+
+def test_outbound_label_hides_absolute_path(tmp_path, monkeypatch):
+    """The prompt header used to ship the resolved absolute path — OS user name,
+    internal project name and directory layout — to every external provider."""
+    monkeypatch.setenv("COUNCIL_CONTEXT_ROOTS", str(tmp_path))
+    f = tmp_path / "pkg" / "mod.py"
+    f.parent.mkdir()
+    f.write_text("x = 1", encoding="utf-8")
+    section = server._build_files_section([(f.resolve(), "x = 1")])
+    assert "=== FILE: pkg/mod.py ===" in section
+    assert str(tmp_path) not in section
+
+
+def test_outbound_label_falls_back_to_basename_without_roots(tmp_path, monkeypatch):
+    monkeypatch.delenv("COUNCIL_CONTEXT_ROOTS", raising=False)
+    f = tmp_path / "note.txt"
+    f.write_text("hi", encoding="utf-8")
+    section = server._build_files_section([(f.resolve(), "hi")])
+    assert "=== FILE: note.txt ===" in section
+    assert str(tmp_path) not in section

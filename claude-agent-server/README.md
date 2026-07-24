@@ -139,7 +139,7 @@ curl -H "Authorization: Bearer $CLAUDE_AGENT_TOKEN" http://localhost:8765/metric
 | `CLAUDE_AGENT_MAX_CONCURRENCY` | `4` | Макс. параллельных claude-вызовов; сверх → bounded queue |
 | `CLAUDE_AGENT_QUEUE_WAIT` | `5` | Сек. ожидания свободного слота в bounded queue перед `429` (Idea 13) |
 | `CLAUDE_AGENT_MAX_QUEUE` | `2×concurrency` | Макс. ожидающих в очереди; переполнение → сразу `429 + Retry-After` |
-| `CLAUDE_AGENT_MAX_SYSTEM_PROMPT` | `7000` | Макс. длина system-prompt (символов). Он идёт в `--system-prompt=` argv; на Windows больше ~8191 символов cmdline упирается в лимит cmd.exe. Больше → `400`. Поднять, если подтверждён больший реальный лимит. |
+| `CLAUDE_AGENT_MAX_SYSTEM_PROMPT` | `200000` | Макс. длина system-prompt (символов). Это лимит **тела**, а не argv: prompt пишется во временный файл и передаётся как `--system-prompt-file`, поэтому лимит cmdline cmd.exe не применяется. Смысл ограничения — system-prompt дописывается к каждому запросу и без потолка съедает контекстное окно. Больше → `400`. |
 
 ## Профили, structured output, стриминг и наблюдаемость
 

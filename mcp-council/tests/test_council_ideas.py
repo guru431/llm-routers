@@ -253,3 +253,18 @@ async def test_stage2_repair_recovers_bad_json(monkeypatch):
     s2 = {s["ranker_id"]: s for s in result["stage2"]}
     assert s2["m1"]["status"] == "ok"
     assert s2["m1"]["repaired"] is True
+
+
+def test_capabilities_tools_match_the_live_registry():
+    """The tool list must be generated, not hand-maintained: the previous
+    hard-coded copy had already dropped council_purge_logs, council_estimate,
+    council_critique(_async) and dialogue_fork, hiding them from discovery."""
+    import server  # noqa: F401 — registers the tools on import
+
+    caps = capabilities_mod.build_capabilities()
+    live = sorted(t.name for t in server.mcp._tool_manager.list_tools())
+    assert caps["tools"] == live
+    # Guard against an introspection failure silently reporting an empty set.
+    for expected in ("council_ask", "council_critique", "council_critique_async",
+                     "council_estimate", "council_purge_logs", "dialogue_fork"):
+        assert expected in caps["tools"]

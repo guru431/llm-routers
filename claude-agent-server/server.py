@@ -84,25 +84,54 @@ def _load_dotenv() -> None:
 _load_dotenv()
 
 
-# Names whose upper-cased form ends with one of these (or contains SECRET/
-# PASSWORD/TOKEN) are treated as secrets and stripped from any child-process env.
-# The child codex/claude CLI authenticates via its own ~/.codex / ~/.claude login,
-# never via these, so removing them is safe — and it closes the /proc/self/environ
-# and `echo $VAR` exfiltration vectors for provider keys AND this server's own
-# bearer tokens (a read-only prompt-injection must not be able to harvest the
-# workspace-write token and self-escalate).
-_SECRET_ENV_SUFFIXES = ("_TOKEN", "_KEY", "_SECRET", "_PASSWORD", "_APIKEY", "_CREDENTIALS")
-_SECRET_ENV_SUBSTRINGS = ("SECRET", "PASSWORD", "TOKEN")
+# The child env is an ALLOW-list, not a deny-list. Guessing secret NAMES does not
+# work: `DATABASE_URL`, `GITHUB_PAT`, `AWS_SESSION`, `STRIPE_SK` and every
+# in-house naming convention carry credentials while matching no suffix or
+# substring rule, so the old denylist happily handed them to the child CLI. That
+# matters most for codex, where even the read-only sandbox executes commands and
+# can read its own environment — one prompt injection was enough to print any
+# credential the denylist missed.
+#
+# So: only names the CLI actually needs to run are passed through. The child
+# codex/claude CLI authenticates via its own ~/.codex / ~/.claude login, never via
+# environment credentials, so nothing else is required.
+_CHILD_ENV_ALLOWLIST = frozenset({
+    # Process / shell basics
+    "PATH", "PATHEXT", "COMSPEC", "SHELL", "TERM", "COLORTERM", "NO_COLOR",
+    # Windows system layout
+    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "OS", "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER", "NUMBER_OF_PROCESSORS",
+    "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432",
+    "COMMONPROGRAMFILES", "COMMONPROGRAMFILES(X86)", "COMMONPROGRAMW6432",
+    # Home / config / scratch — the CLI reads ~/.claude or ~/.codex from these
+    "HOME", "HOMEDRIVE", "HOMEPATH", "USERPROFILE", "USERNAME", "USERDOMAIN",
+    "APPDATA", "LOCALAPPDATA", "TEMP", "TMP", "TMPDIR",
+    "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+    # Locale / time / TLS trust
+    "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+})
+
+# Extra names to pass through, comma-separated. For deployments that genuinely
+# need something else (a proxy, a corporate CA path). Proxy variables are NOT in
+# the default allowlist on purpose: an authenticated proxy URL embeds
+# credentials, so passing it to the child has to be a deliberate choice.
+_CHILD_ENV_PASSTHROUGH_VAR = "AGENT_CHILD_ENV_PASSTHROUGH"
+
+
+def _child_env_allowlist() -> frozenset:
+    extra = os.getenv(_CHILD_ENV_PASSTHROUGH_VAR, "")
+    names = {n.strip().upper() for n in extra.split(",") if n.strip()}
+    return _CHILD_ENV_ALLOWLIST | names
 
 
 def _child_env_without_secrets(**overrides: str) -> dict:
-    """Copy os.environ with every secret-looking var removed, then apply
-    overrides. Pass to subprocess `env=` so a spawned CLI can't leak our keys."""
-    env = {
-        k: v for k, v in os.environ.items()
-        if not (k.upper().endswith(_SECRET_ENV_SUFFIXES)
-                or any(s in k.upper() for s in _SECRET_ENV_SUBSTRINGS))
-    }
+    """Build the child-process environment from an ALLOW-list, then apply
+    overrides. Pass to subprocess `env=` so a spawned CLI sees only what it needs
+    to run — never this server's tokens, nor any unrelated credential that
+    happens not to look like one."""
+    allowed = _child_env_allowlist()
+    env = {k: v for k, v in os.environ.items() if k.upper() in allowed}
     env.update(overrides)
     return env
 
@@ -281,18 +310,23 @@ class Metrics:
 
 METRICS = Metrics()
 
-# The system prompt (all system messages + injected tool descriptions) is passed
-# as a single `--system-prompt=<value>` argv. CLAUDE_BIN resolves to the npm
-# `claude.CMD` shim, so subprocess routes it through cmd.exe, whose command-line
-# ceiling is ~8191 chars (the raw CreateProcessW limit is 32767). A large system
-# prompt + many tools would silently overflow → truncated flag or spawn failure
-# surfacing as a generic 500. Reject with a clear 400 instead. Default 7000 is
-# conservative for cmd.exe minus the rest of argv; raise via env if you confirm a
-# higher real limit (e.g. POSIX shells).
+# Ceiling on the system prompt (all system messages + injected tool
+# descriptions).
+#
+# This is NO LONGER an argv limit. The prompt is written to a temp file and
+# passed as `--system-prompt-file <path>` (see run_claude), so the ~8191-char
+# cmd.exe command-line ceiling stopped applying — yet the old 7000-char guard
+# stayed, rejecting perfectly valid long instructions and tool schemas for a
+# reason that no longer existed.
+#
+# What remains worth bounding is the BODY: the system prompt is prepended to
+# every request's context, so an unbounded one silently burns the model's window
+# and the caller's budget. 200k chars ≈ 50k tokens — generous for real system
+# prompts and tool schemas, still a bound. Raise/lower via env.
 try:
-    SYSTEM_PROMPT_ARGV_LIMIT = max(1024, int(os.getenv("CLAUDE_AGENT_MAX_SYSTEM_PROMPT", "7000")))
+    MAX_SYSTEM_PROMPT_CHARS = max(1024, int(os.getenv("CLAUDE_AGENT_MAX_SYSTEM_PROMPT", "200000")))
 except ValueError:
-    SYSTEM_PROMPT_ARGV_LIMIT = 7000
+    MAX_SYSTEM_PROMPT_CHARS = 200000
 
 
 # ============================================================
@@ -482,10 +516,16 @@ def validate_structured_output(text: str, schema) -> tuple:
 
 
 def tool_calls_schema_errors(tool_calls: list, tools: list) -> list:
-    """For each parsed tool call, check its arguments carry the required keys of
-    the matching tool's parameters schema. Returns a flat list of human-readable
-    errors (empty = ok). Calls whose name isn't in `tools`, or whose tool has no
-    object schema, are skipped."""
+    """For each parsed tool call, check the tool EXISTS in `tools` and that its
+    arguments carry the required keys of that tool's parameters schema. Returns a
+    flat list of human-readable errors (empty = ok).
+
+    An unknown name is an error, not something to skip: the emulation layer puts
+    the offered functions in the system prompt and parses whatever comes back, so
+    a model that invents `delete_everything` used to sail straight through this
+    validator and reach the client as a legitimate `finish_reason=tool_calls`.
+    A tool with no object schema still can't be argument-checked — but its NAME
+    is now verified."""
     schemas: dict = {}
     for t in tools or []:
         if isinstance(t, dict):
@@ -494,8 +534,14 @@ def tool_calls_schema_errors(tool_calls: list, tools: list) -> list:
                 schemas[fn["name"]] = fn.get("parameters") or {}
     errors: list = []
     for tc in tool_calls:
-        fn = tc.get("function", {})
-        name = fn.get("name", "")
+        fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+        name = fn.get("name", "") if isinstance(fn, dict) else ""
+        if name not in schemas:
+            errors.append(
+                f"tool {name!r}: not one of the offered tools "
+                f"({', '.join(sorted(schemas)) or 'none'})"
+            )
+            continue
         schema = schemas.get(name)
         if not isinstance(schema, dict) or not schema:
             continue
@@ -702,6 +748,17 @@ class StreamUnsupported(Exception):
     can't be used, so _handle_chat falls back to the buffered path."""
 
 
+class StreamFailed(Exception):
+    """Raised AFTER deltas have been emitted when the run did not actually
+    succeed — watchdog timeout, non-zero exit, or a CLI error event.
+
+    Distinct from StreamUnsupported (which means "nothing ran usefully, retry
+    buffered"): here the run started and failed, so the SSE writer must emit an
+    error and NOT a clean `[DONE]`. Without this, a killed or crashed CLI whose
+    stdout simply reached EOF after one recognized delta was reported to the
+    client as a completed answer, with timeout/kill metrics left at zero."""
+
+
 def _map_stop_reason(sr) -> str:
     """Map an Anthropic stop_reason to an OpenAI finish_reason."""
     return {
@@ -775,7 +832,16 @@ def run_claude_stream(prompt, *, system_prompt=None, model=None, timeout=300):
         popen_kwargs["start_new_session"] = True
 
     proc = subprocess.Popen(cmd, **popen_kwargs)
-    watchdog = threading.Timer(timeout, _kill_process_tree, args=(proc,))
+    # The watchdog used to kill the tree and leave NO trace: stdout hit EOF, the
+    # loop ended normally and the caller emitted a successful `[DONE]`. Record the
+    # kill so the post-loop check can tell "finished" from "was killed".
+    killed = {"timeout": False}
+
+    def _on_timeout():
+        killed["timeout"] = True
+        _kill_process_tree(proc)
+
+    watchdog = threading.Timer(timeout, _on_timeout)
     watchdog.daemon = True
     watchdog.start()
 
@@ -787,6 +853,21 @@ def run_claude_stream(prompt, *, system_prompt=None, model=None, timeout=300):
             pass
 
     threading.Thread(target=_feed, daemon=True).start()
+
+    # Drain stderr concurrently. Undrained, a chatty CLI fills the pipe buffer and
+    # DEADLOCKS on write while we wait on stdout; it also gives the failure path
+    # something to log.
+    stderr_lines: list = []
+
+    def _drain_stderr():
+        try:
+            for line in proc.stderr:
+                if len(stderr_lines) < 200:
+                    stderr_lines.append(line.rstrip())
+        except (OSError, ValueError):
+            pass
+
+    threading.Thread(target=_drain_stderr, daemon=True).start()
 
     emitted = ""
     usage_meta = None
@@ -837,14 +918,32 @@ def run_claude_stream(prompt, *, system_prompt=None, model=None, timeout=300):
                         yield ("text", rtxt)
         if not saw_json:
             raise StreamUnsupported("no stream-json output")
+
+        # EOF on stdout is NOT success. Wait for the real exit status before
+        # calling the run complete.
+        try:
+            returncode = proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            _kill_process_tree(proc)
+            returncode = proc.poll()
+        if killed["timeout"]:
+            logger.error("claude stream timed out after %ss; stderr: %s",
+                         timeout, " | ".join(stderr_lines[-5:]) or "(empty)")
+            raise StreamFailed(f"claude timed out after {timeout}s")
+        if returncode not in (0, None):
+            logger.error("claude stream exit code %s; stderr: %s",
+                         returncode, " | ".join(stderr_lines[-5:]) or "(empty)")
+            raise StreamFailed("claude command failed")
+
         yield ("meta", {"usage": usage_meta, "stop_reason": stop_reason, "text": emitted})
     finally:
         watchdog.cancel()
         _kill_process_tree(proc)
-        try:
-            proc.stdout.close()
-        except Exception:
-            pass
+        for pipe in (proc.stdout, proc.stderr):
+            try:
+                pipe.close()
+            except Exception:
+                pass
         try:
             proc.wait(timeout=5)
         except Exception:
@@ -1024,6 +1123,42 @@ class Handler(BaseHTTPRequestHandler):
                             "type": "invalid_request_error"}})
                         return
 
+                    # Nested schema shape: build_tools_system_prompt and
+                    # json_schema_errors walk `parameters`/`properties`/`required`
+                    # assuming dict/list. A scalar there crashed rendering and
+                    # surfaced as a 500 — the client's JSON is the client's error.
+                    params = t.get("function", {}).get("parameters")
+                    if params is not None and not isinstance(params, dict):
+                        self._send(400, {"error": {
+                            "message": "tool function.parameters must be an object",
+                            "type": "invalid_request_error"}})
+                        return
+                    if isinstance(params, dict):
+                        props = params.get("properties")
+                        if props is not None and not isinstance(props, dict):
+                            self._send(400, {"error": {
+                                "message": "tool parameters.properties must be an object",
+                                "type": "invalid_request_error"}})
+                            return
+                        req = params.get("required")
+                        if req is not None and not isinstance(req, list):
+                            self._send(400, {"error": {
+                                "message": "tool parameters.required must be a list",
+                                "type": "invalid_request_error"}})
+                            return
+            # Assistant `tool_calls` are rendered into the prompt with
+            # tc.get("id") — a dict instead of a list iterates its KEYS, and a
+            # non-dict element has no .get, both raising inside rendering.
+            for m in messages:
+                tcs = m.get("tool_calls")
+                if tcs is None:
+                    continue
+                if not isinstance(tcs, list) or not all(isinstance(tc, dict) for tc in tcs):
+                    self._send(400, {"error": {
+                        "message": "message.tool_calls must be a list of objects",
+                        "type": "invalid_request_error"}})
+                    return
+
             model = body.get("model")
             # Reject an unknown model with 400 invalid_request_error rather than
             # letting run_claude raise ValueError → broad except → 500 server_error.
@@ -1119,14 +1254,15 @@ class Handler(BaseHTTPRequestHandler):
 
             system_prompt = "\n\n".join(system_parts) if system_parts else None
 
-            # Guard the CLI argv length (see SYSTEM_PROMPT_ARGV_LIMIT): a system
-            # prompt too large for `--system-prompt=` on Windows would otherwise fail
-            # opaquely as a 500. A 400 is honest and actionable.
-            if system_prompt and len(system_prompt) > SYSTEM_PROMPT_ARGV_LIMIT:
+            # Bound the system prompt BODY (see MAX_SYSTEM_PROMPT_CHARS) — it is
+            # prepended to every request, so an unbounded one eats the context
+            # window. This is no longer an argv limit: the prompt goes to the CLI
+            # through --system-prompt-file.
+            if system_prompt and len(system_prompt) > MAX_SYSTEM_PROMPT_CHARS:
                 self._send(400, {"error": {
                     "message": (
-                        f"system prompt too large for CLI argv "
-                        f"({len(system_prompt)} > {SYSTEM_PROMPT_ARGV_LIMIT} chars); "
+                        f"system prompt too large "
+                        f"({len(system_prompt)} > {MAX_SYSTEM_PROMPT_CHARS} chars); "
                         f"reduce system messages or number/size of tools"),
                     "type": "invalid_request_error"}})
                 return
@@ -1217,7 +1353,13 @@ class Handler(BaseHTTPRequestHandler):
             # collapse two requests that miss simultaneously — the second still runs
             # its own claude; the queue wait is much shorter than a claude call.)
             if cache_eligible:
-                cached = CACHE.get(model or MODEL, system_prompt, prompt)
+                # `peek`, not `get`: this is a SECOND look at the same request
+                # (a concurrent winner may have filled the entry while we queued),
+                # not a new cache access. Counting it in cache stats gave an
+                # ordinary uncached request two misses while request-level
+                # METRICS.cache_misses rose by one, so /health's hit rate stopped
+                # matching the server's own request metrics.
+                cached = CACHE.peek(model or MODEL, system_prompt, prompt)
                 if cached is not None:
                     serve_cached(cached)
                     return
@@ -1258,7 +1400,10 @@ class Handler(BaseHTTPRequestHandler):
             # Buffered path (tools, structured output, or streaming fallback).
             result = run_claude(prompt, system_prompt=system_prompt, model=model, timeout=timeout)
 
-            # Structured output: validate + ONE repair-retry (Idea 12).
+            # Structured output: validate + ONE repair-retry (Idea 12). The
+            # REPAIRED payload is validated again — without that, a second
+            # invalid response still returned 200 with structured_output=true,
+            # i.e. the server asserted a contract it had just seen violated.
             if structured and result:
                 ok, err = validate_structured_output(result, structured_schema)
                 if not ok:
@@ -1266,20 +1411,38 @@ class Handler(BaseHTTPRequestHandler):
                     repair = (prompt + "\n\n# REPAIR — YOUR PREVIOUS RESPONSE WAS INVALID\n"
                               + err + "\nReturn ONLY the corrected JSON value, nothing else.")
                     result = run_claude(repair, system_prompt=system_prompt, model=model, timeout=timeout)
+                    ok, err = validate_structured_output(result or "", structured_schema)
+                    if not ok:
+                        logger.warning("structured output still invalid after repair: %s", err)
+                        self._send(502, {"error": {
+                            "message": ("model did not produce output matching the "
+                                        f"requested response_format after one repair: {err}"),
+                            "type": "upstream_error"}})
+                        return
 
             # Parse tool calls if tools were provided
             tool_calls = []
             content = result
             if tools and result:
                 tool_calls, content = parse_tool_calls(result)
-                # Validate required args are present + ONE repair-retry (Idea 12).
+                # Validate the call (known tool + required args) + ONE repair-retry
+                # (Idea 12), then re-validate the repaired call for the same reason
+                # as above.
                 errs = tool_calls_schema_errors(tool_calls, tools)
                 if errs:
-                    logger.info("tool call missing required args (%s); one repair-retry", "; ".join(errs))
+                    logger.info("invalid tool call (%s); one repair-retry", "; ".join(errs))
                     repair = (prompt + "\n\n# REPAIR — YOUR PREVIOUS TOOL CALL WAS INVALID\n"
                               + "; ".join(errs) + "\nReissue the <tool_call> block with ALL required fields set.")
                     result = run_claude(repair, system_prompt=system_prompt, model=model, timeout=timeout)
                     tool_calls, content = parse_tool_calls(result)
+                    errs = tool_calls_schema_errors(tool_calls, tools)
+                    if errs:
+                        logger.warning("tool call still invalid after repair: %s", "; ".join(errs))
+                        self._send(502, {"error": {
+                            "message": ("model did not produce a valid tool call after "
+                                        f"one repair: {'; '.join(errs)}"),
+                            "type": "upstream_error"}})
+                        return
 
             if cache_eligible and result:
                 CACHE.put(model or MODEL, system_prompt, prompt, result)
@@ -1434,6 +1597,24 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"data: [DONE]\n\n")
         except (ConnectionError, BrokenPipeError):
             disconnected = True
+        except StreamFailed as e:
+            # The run started and FAILED (timeout / non-zero exit). Deltas may
+            # already be on the wire, so we can't switch to a JSON error response
+            # — but we must not sign off with a successful finish chunk and
+            # `[DONE]` either, which is exactly how a killed CLI used to look
+            # indistinguishable from a completed answer.
+            METRICS.inc("timeouts")
+            METRICS.inc("killed_processes")
+            logger.error("live stream failed after %d chars: %s", len(str(usage)), e)
+            try:
+                emit({}, finish="error", usage=usage)
+                self.wfile.write(
+                    ("data: " + json.dumps(
+                        {"error": {"message": str(e), "type": "upstream_error"}},
+                        ensure_ascii=False) + "\n\n").encode("utf-8")
+                )
+            except (ConnectionError, BrokenPipeError):
+                disconnected = True
         finally:
             # Cancellation: closing the generator throws GeneratorExit into it, so
             # its finally kills the CLI tree. Harmless if it already finished.

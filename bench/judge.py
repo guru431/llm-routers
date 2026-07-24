@@ -180,10 +180,33 @@ USER: {task['user']}
 # UNAMBIGUOUS; when format is fine but semantic quality still needs a human-like
 # judgement (e.g. summary coverage, one-liner correctness) it returns None so the
 # LLM panel decides. This is a *gate* — deterministic verdicts win over the LLM.
+#
+# IMPORTANT: format checks are a CAP, never a substitute for semantic scoring.
+# The gate used to award T4 a full 5/5 for merely having the four keys — values
+# unchecked — so a well-shaped JSON of entirely wrong data outscored a correct
+# answer in a slightly different shape. And any non-5 bullet count forced
+# summarization to exactly 3/5, letting one nonsense line bypass the semantic
+# judge. Both now compare against the ground truth in the task spec
+# (`task["expected"]`), and a passing format defers to the LLM instead of
+# claiming a perfect score.
 # ============================================================================
 
 def _strip_fences(text: str, langs: str = "") -> str:
     return re.sub(rf"^```(?:{langs})?\s*|\s*```$", "", text.strip(), flags=re.MULTILINE).strip()
+
+
+def _field_matches(value, spec: dict) -> bool:
+    """True if a model-produced field value satisfies its ground-truth spec.
+
+    `any_of` holds case-insensitive substrings — at least one must appear.
+    Substrings rather than equality because the format is legitimately free
+    (a date may be "21 мая", "2026-05-21" or "среда, 21 мая")."""
+    if value is None:
+        return False
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    text = text.casefold()
+    needles = spec.get("any_of") or []
+    return any(str(n).casefold() in text for n in needles)
 
 
 def _exec_parse_duration(code: str) -> bool | None:
@@ -237,7 +260,7 @@ def deterministic_score(task: dict, text: str, exec_code: bool) -> tuple[int, bo
     if not t:
         return (0, False)
 
-    # T4 — structured JSON extraction (person/date/time/action).
+    # T4 — structured JSON extraction (person/date/time/action). Shape AND values.
     if tid == "T4_json_extract":
         cleaned = _strip_fences(t, "json")
         try:
@@ -246,22 +269,34 @@ def deterministic_score(task: dict, text: str, exec_code: bool) -> tuple[int, bo
             return (1, False)  # not valid JSON
         if not isinstance(d, dict):
             return (0, False)
-        keys = {"person", "date", "time", "action"}
+        expected_fields = (task.get("expected") or {}).get("fields") or {}
+        keys = set(expected_fields) or {"person", "date", "time", "action"}
         present = keys & set(d.keys())
-        if present == keys:
+        if not expected_fields:
+            # No ground truth in the spec — shape is all we can check, and shape
+            # alone is not a 5. Defer the content question to the LLM.
+            if present == keys:
+                return None
+            return (3, False) if len(present) >= 2 else (1, False)
+        correct = sum(1 for k in keys if _field_matches(d.get(k), expected_fields[k]))
+        if present != keys:
+            # Missing keys: cap by how many of the present ones are right anyway.
+            return (3, False) if correct >= len(keys) - 1 else (1, False)
+        if correct == len(keys):
             return (5, True)
-        if len(present) >= 2:
-            return (3, False)  # valid JSON but 1-2 keys missing
-        return (1, False)
+        if correct >= len(keys) - 1:
+            return (3, False)  # right shape, one field wrong
+        return (1, False)      # right shape, wrong data — NOT a pass
 
-    # T6 — single-word classification; ground truth = "complaint".
+    # T6 — single-word classification; ground truth from the task spec.
     if tid == "T6_classify":
         allowed = {"question", "complaint", "request", "praise", "spam", "other"}
+        answer = (task.get("expected") or {}).get("answer", "complaint")
         words = re.sub(r"[.!]+$", "", t.lower()).split()
         if not words:
             return (0, False)
         first = words[0].strip(".!,")
-        if first == "complaint":
+        if first == answer:
             return (5, True) if len(words) == 1 else (3, True)  # correct, but with extra text
         if first in allowed:
             return (1, False)  # wrong category
@@ -294,16 +329,37 @@ def deterministic_score(task: dict, text: str, exec_code: bool) -> tuple[int, bo
             return (2, False)
         return None  # single line → LLM judges correctness
 
-    # T2/T3 — summarization. Bullet count is an objective format check; the wrong
-    # count is a clear miss, exactly-5 defers to the LLM (coverage isn't checkable).
+    # T2/T3 — summarization. Bullet count is a format CAP, not a score: any
+    # non-zero wrong count used to force exactly 3/5 regardless of content, so a
+    # single nonsense bullet scored the same as a near-perfect 4-bullet summary
+    # and never reached the semantic judge at all. Now the wrong count only marks
+    # the format failure; the LLM still scores the content, and score_pair caps
+    # the result.
     if cat == "summarization":
+        want = (task.get("expected") or {}).get("bullets", 5)
         bullets = re.findall(r"^\s*(?:[-•*]|\d+[.)])\s", text, flags=re.MULTILINE)
         n = len(bullets)
         if n == 0:
             return None  # prose / no recognizable bullets → LLM
-        if n != 5:
-            return (3, False)  # wrong bullet count
-        return None  # exactly 5 → coverage needs LLM
+        if n != want:
+            return None  # format miss recorded via format_cap below → LLM scores
+        return None  # exact count → coverage needs LLM
+
+
+def format_cap(task: dict, text: str) -> tuple[int, str] | None:
+    """Objective FORMAT violations that cap the LLM score, without replacing it.
+
+    Returns (max_score, reason) or None. Separating this from
+    `deterministic_score` is the point: a format miss must not stand in for a
+    semantic verdict, and a correct format must not stand in for correctness."""
+    cat = task["category"]
+    if cat == "summarization":
+        want = (task.get("expected") or {}).get("bullets", 5)
+        bullets = re.findall(r"^\s*(?:[-•*]|\d+[.)])\s", text, flags=re.MULTILINE)
+        n = len(bullets)
+        if n and n != want:
+            return (3, f"format: {n} bullets, expected {want}")
+    return None
 
     return None
 
@@ -321,12 +377,13 @@ def adjudicate(scores: list[int]) -> tuple[int, bool]:
     return med, disagree
 
 
-def load_judged(judge_file: Path) -> set[tuple[str, str, str]]:
-    """Set of (model_id, task_id, resp_hash) already scored. resp_hash pins the
-    score to the exact response text, so a changed answer is NOT treated as judged.
-    Legacy records without resp_hash use "" — they still match if the current
-    response also hashes to "" (never), i.e. legacy rows are effectively re-judged
-    once, which is the safe direction."""
+def load_judged(judge_file: Path) -> set[tuple[str, str, int, str]]:
+    """Set of (model_id, task_id, repeat_idx, resp_hash) already scored.
+
+    repeat_idx is part of the key because each REPEAT is judged separately (see
+    main): the runner produces N responses per cell and the old dedup collapsed
+    them, judging only the last one. resp_hash pins the score to the exact
+    response text, so a changed answer is NOT treated as judged."""
     if not judge_file.exists():
         return set()
     seen = set()
@@ -339,7 +396,8 @@ def load_judged(judge_file: Path) -> set[tuple[str, str, str]]:
             # so a re-run can re-score just those pairs without a full --rescore.
             if d.get("score") is None:
                 continue
-            seen.add((d["model_id"], d["task_id"], d.get("resp_hash", "")))
+            seen.add((d["model_id"], d["task_id"], d.get("repeat_idx") or 0,
+                      d.get("resp_hash", "")))
         except Exception:
             pass
     return seen
@@ -378,9 +436,15 @@ def score_pair(task: dict, text: str, exec_code: bool, bypass_cache: bool) -> di
             "judge_disagreement": False,
         }
     score, disagree = adjudicate(valid)
+    reason = "; ".join(f"{p['judge']}:{p['score']}" for p in per)
+    # Objective format violations cap the semantic score instead of replacing it.
+    cap = format_cap(task, text)
+    if cap is not None and score > cap[0]:
+        score = cap[0]
+        reason = f"{reason} | capped: {cap[1]}"
     return {
         "score": score,
-        "reason": "; ".join(f"{p['judge']}:{p['score']}" for p in per),
+        "reason": reason,
         "judge_method": "llm",
         "judge_scores": per,
         "judge_disagreement": disagree,
@@ -411,11 +475,21 @@ def main():
     judge_file = _store.judge_file(run_dir)
     sys.stderr.write(f"Scoring {'run ' + run_dir.name if run_dir else 'flat results/'} "
                      f"({len(result_files)} model files)\n")
+    # A run dir exists from before its first cell, so an interrupted run looks
+    # exactly like a finished one unless the manifest lifecycle is checked.
+    status = _store.run_status(run_dir)
+    if run_dir is not None and not status["complete"]:
+        sys.stderr.write(
+            f"WARNING: run {run_dir.name} is {status['status']} "
+            f"({status['completed_cells']}/{status['expected_cells']} cells) — "
+            f"scores will cover an INCOMPLETE matrix. "
+            f"Finish it first: python run.py --resume {run_dir.name}\n"
+        )
 
     tasks_by_id = {t["id"]: t for t in json.loads(TASKS_JSON.read_text(encoding="utf-8"))["tasks"]}
     judged = set() if args.rescore else load_judged(judge_file)
 
-    pairs: list[tuple[str, str, str]] = []  # (model_id, task_id, text)
+    pairs: list[tuple[str, str, int, str]] = []  # (model_id, task_id, repeat_idx, text)
     for jl in result_files:
         model_id = jl.stem
         for line in jl.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -435,15 +509,20 @@ def main():
             task = tasks_by_id.get(tid)
             if task is None:
                 continue
-            if (model_id, tid, _resp_hash(task, r["text"])) in judged:
+            rep = r.get("repeat_idx") or 0
+            if (model_id, tid, rep, _resp_hash(task, r["text"])) in judged:
                 continue
-            pairs.append((model_id, tid, r["text"]))
+            pairs.append((model_id, tid, rep, r["text"]))
 
-    # Dedup by (model_id, task_id), last-wins: results.jsonl can hold multiple
-    # records for the same cell (re-runs/retries); judging each would double-bill.
-    deduped: dict[tuple[str, str], tuple[str, str, str]] = {}
+    # Dedup by (model_id, task_id, REPEAT), last-wins. The repeat index is part
+    # of the key: `--repeats N` produces N distinct responses per cell, and
+    # collapsing them by (model, task) judged only the LAST one — latency then
+    # used all N samples while quality used one, and report.py's bootstrap looked
+    # like a repeat-based confidence interval it never was. Duplicate records for
+    # the SAME repeat (a re-run/retry of that cell) still collapse, as intended.
+    deduped: dict[tuple[str, str, int], tuple[str, str, int, str]] = {}
     for p in pairs:
-        deduped[(p[0], p[1])] = p
+        deduped[(p[0], p[1], p[2])] = p
     pairs = list(deduped.values())
 
     sys.stderr.write(f"Pairs to judge: {len(pairs)}\n")
@@ -467,16 +546,16 @@ def main():
                     continue
                 if d.get("task_id") != args.task:
                     out.write(line + "\n")
-        for i, (mid, tid, text) in enumerate(pairs, 1):
+        for i, (mid, tid, rep, text) in enumerate(pairs, 1):
             task = tasks_by_id.get(tid)
             if not task:
                 continue
-            sys.stderr.write(f"[{i}/{len(pairs)}] {mid} / {tid}... ")
+            sys.stderr.write(f"[{i}/{len(pairs)}] {mid} / {tid} #{rep}... ")
             sys.stderr.flush()
             scored = score_pair(task, text, exec_code=args.exec_code, bypass_cache=args.rescore)
             sys.stderr.write(f"→ score={scored['score']} ({scored['judge_method']})\n")
             rec = {
-                "model_id": mid, "task_id": tid,
+                "model_id": mid, "task_id": tid, "repeat_idx": rep,
                 "score": scored["score"], "reason": scored["reason"],
                 "judge_method": scored["judge_method"],
                 "judge_scores": scored["judge_scores"],

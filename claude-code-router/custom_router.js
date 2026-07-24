@@ -39,10 +39,13 @@
 // Normally we derive the set from config.Providers[opencode].models (below) so
 // the two stay in sync; this hardcode is only the safety net and its use is
 // WARNED about at runtime (a silent hardcode fallback hid config drift before).
-// SOURCE OF TRUTH: config.example.json's Providers[opencode].models (which is
-// itself the hand-maintained mirror of mcp-council/models.py::CATALOG's OCG ids).
-// This list is a copy of it — keep all three in sync when models change (no build
-// step); see README "Каталог моделей и трассировка".
+// SOURCE OF TRUTH: config.example.json's Providers[opencode].models.
+//
+// NOT a mirror of mcp-council/models.py::CATALOG. CCR's catalog is the models the
+// OpenCode Go subscription exposes (a SUPERSET); CATALOG is the subset the council
+// actually calls, with prices/quirks/provider-domain attached. The two diverge on
+// purpose — keep THESE TWO copies in sync (config.example.json + this list), not
+// three; see README "Каталог моделей и трассировка".
 const OPENCODE_MODELS_FALLBACK = new Set([
   'glm-5.2', 'glm-5',
   'kimi-k2.5', 'kimi-k2.7-code',
@@ -72,9 +75,10 @@ module.exports = async function router(req, config) {
   }
 
   // Single source of truth: the opencode provider's model list from config.json.
-  // Fail-closed intent: an EMPTY/absent list means the config is broken, not that
-  // there are zero models — fall back to the hardcoded net but WARN loudly so the
-  // drift is visible instead of silently masked.
+  // An EMPTY/absent list means the config is broken, not that there are zero
+  // models — so we keep routing off the hardcoded net and WARN loudly. This is a
+  // NOISY fallback, NOT fail-closed: requests still route, they just route off a
+  // list that may be stale. Fail-closed would mean refusing to route at all.
   const configModels = config?.Providers?.find((p) => p.name === 'opencode')?.models;
   let opencodeModels;
   if (configModels?.length) {

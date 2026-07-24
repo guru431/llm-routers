@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -44,6 +45,25 @@ def resolve_dump_dir(default: Path) -> Path:
 
 def _dump_dir() -> Path:
     return resolve_dump_dir(_DEFAULT_DUMP_DIR)
+
+
+def _quarantine_dump(f: Path, reason: str) -> None:
+    """Move an unloadable dialogue snapshot into `<dir>/corrupt/` and log why —
+    same contract as state.quarantine_snapshot (kept local to avoid a dialogue →
+    council-state import just for this)."""
+    print(
+        f"[mcp-council] quarantining unreadable dialogue snapshot {f.name}: {reason}",
+        file=sys.stderr,
+    )
+    try:
+        qdir = f.parent / "corrupt"
+        qdir.mkdir(parents=True, exist_ok=True)
+        f.replace(qdir / f.name)
+    except OSError:
+        try:
+            f.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _unlink_dump(session_id: str) -> None:
@@ -201,51 +221,82 @@ def _state_from_dump(data: dict) -> DialogueState:
     return s
 
 
+def _valid_dump(data: object) -> tuple[dict, str, float] | None:
+    """Type-validate a parsed dialogue snapshot BEFORE any arithmetic on it.
+    Returns (data, session_id, activity_timestamp) or None when unusable.
+
+    The old loader did `now - activity` and `sid in _sessions` straight after
+    json.loads, outside any guard: a string/list timestamp raised TypeError and
+    an unhashable session_id raised TypeError, aborting the load of EVERY
+    remaining snapshot — and, since the loader runs at startup, the server."""
+    if not isinstance(data, dict):
+        return None
+    sid = data.get("session_id")
+    if not isinstance(sid, str) or not sid:
+        return None
+    # First TRUTHY timestamp wins — a 0.0 means "never set" and falls through to
+    # the next field (matches the original `or` chain), but a present non-numeric
+    # value is a malformed snapshot rather than something to compute against.
+    activity: float = 0.0
+    for key in ("last_activity", "finished_at", "started_at", "created_at"):
+        v = data.get(key)
+        if v is None:
+            continue
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            return None
+        if v:
+            activity = float(v)
+            break
+    return data, sid, activity
+
+
 def load_persisted_dialogues() -> int:
     """Load persisted session snapshots into memory at startup, marking
     non-terminal sessions as 'interrupted'. Returns the number loaded.
-    Synchronous — intended to run once before the event loop serves."""
+    Synchronous — intended to run once before the event loop serves.
+
+    Every per-file step is guarded: one malformed snapshot is quarantined (moved
+    to `<dir>/corrupt/`) and the rest still load. Startup must never hinge on a
+    single file's contents."""
     d = _dump_dir()
     if not d.exists():
         return 0
     now = time.time()
     loaded = 0
-    for f in d.glob("*.json"):
+    for f in sorted(d.glob("*.json")):
         try:
-            data = json.loads(f.read_text(encoding="utf-8"))
-        except OSError:
-            continue
-        except ValueError:
-            # Permanently corrupt/truncated snapshot — delete it so it isn't
-            # re-read and re-failed on every restart.
             try:
-                f.unlink(missing_ok=True)
+                data = json.loads(f.read_text(encoding="utf-8"))
             except OSError:
-                pass
-            continue
-        # Drop snapshots past the inactive timeout so a restart doesn't resurrect
-        # ancient sessions; matches the in-memory GC horizon (which keys on
-        # last_activity, NOT created_at — a long-lived but recently-active session
-        # must survive a restart). Unlink so the file isn't rescanned every restart.
-        activity = (
-            data.get("last_activity")
-            or data.get("finished_at") or data.get("started_at")
-            or data.get("created_at") or 0
-        )
-        if now - activity > INACTIVE_TIMEOUT_SECONDS:
-            try:
-                f.unlink(missing_ok=True)
-            except OSError:
-                pass
-            continue
-        sid = data.get("session_id")
-        if not sid or sid in _sessions:
-            continue
-        try:
+                continue  # transient read problem — leave the file alone
+            except ValueError as e:
+                _quarantine_dump(f, f"invalid JSON: {e}")
+                continue
+
+            valid = _valid_dump(data)
+            if valid is None:
+                _quarantine_dump(f, "snapshot shape/type invalid")
+                continue
+            data, sid, activity = valid
+
+            # Drop snapshots past the inactive timeout so a restart doesn't
+            # resurrect ancient sessions; matches the in-memory GC horizon (which
+            # keys on last_activity, NOT created_at — a long-lived but recently
+            # active session must survive a restart). Unlink so the file isn't
+            # rescanned every restart.
+            if now - activity > INACTIVE_TIMEOUT_SECONDS:
+                try:
+                    f.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                continue
+            if sid in _sessions:
+                continue
             _sessions[sid] = _state_from_dump(data)
-        except (KeyError, TypeError):
+            loaded += 1
+        except Exception as e:  # noqa: BLE001 — one bad file must not stop startup
+            _quarantine_dump(f, f"{type(e).__name__}: {e}")
             continue
-        loaded += 1
     return loaded
 
 
@@ -289,20 +340,53 @@ async def create_session(
         return s
 
 
-async def reserve_active_slot() -> None:
-    """Re-check the active-session cap before reactivating a terminal session
-    (dialogue_continue). Raises the SAME RuntimeError as create_session when the
-    cap is reached. The resuming session is itself terminal at call time, so it
-    is not counted toward `active` — reactivating it consumes one free slot."""
+RESUMABLE_PHASES = ("done", "interrupted")
+
+
+async def reserve_active_slot(state: DialogueState) -> str:
+    """Atomically claim one active-session slot FOR `state` (dialogue_continue).
+
+    Check-then-act was a real race: the old version only COUNTED active sessions
+    under the global lock and released it before the caller flipped the phase to
+    'starting'. Two continues on two different terminal sessions both saw the
+    same single free slot and both activated, blowing past MAX_ACTIVE_SESSIONS
+    and the spend ceiling tied to it. Here the count and the transition happen
+    under ONE hold of the global lock, so the slot a caller sees free is the slot
+    it takes.
+
+    Returns the phase the session had, so the caller can roll back if the
+    remaining pre-flight fails. Raises RuntimeError if the session is not
+    resumable or the cap is reached.
+    """
     async with _sessions_lock:
         now = time.time()
         _gc_locked(now)
+        if state.phase not in RESUMABLE_PHASES:
+            raise RuntimeError(
+                f"dialogue_continue: session already resuming or active "
+                f"(phase '{state.phase}')"
+            )
         active = sum(1 for s in _sessions.values() if s.phase not in TERMINAL_PHASES)
         if active >= MAX_ACTIVE_SESSIONS:
             raise RuntimeError(
                 f"too many active sessions ({active}/{MAX_ACTIVE_SESSIONS}); "
                 "wait for some to finish or call dialogue_cancel on stale ones"
             )
+        previous = state.phase
+        # The transition IS the reservation — from here the session counts as
+        # active for every concurrent caller.
+        state.phase = "starting"
+        state.last_activity = now
+        return previous
+
+
+async def release_active_slot(state: DialogueState, previous_phase: str) -> None:
+    """Undo `reserve_active_slot` when the caller's remaining pre-flight fails,
+    so a rejected continue doesn't leave a zombie session holding a slot."""
+    async with _sessions_lock:
+        if state.phase == "starting":
+            state.phase = previous_phase
+            state.last_activity = time.time()
 
 
 async def get_session(session_id: str) -> DialogueState | None:

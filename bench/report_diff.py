@@ -67,10 +67,11 @@ def compute_metrics(run_arg: str) -> dict:
                 totals.append(r["total_s"])
             if r.get("tok_out") is not None:
                 toks.append(r["tok_out"])
-        scores = [j["score"] for (jm, jt), j in judges.items()
-                  if jm == mid and j.get("score") is not None]
-        per_task_q = {jt: j["score"] for (jm, jt), j in judges.items()
-                      if jm == mid and j.get("score") is not None}
+        # judges[(model,task)] carries EVERY repeat's score (judge.py scores each
+        # repeat separately). Flatten for the CI; mean per task for the per-task view.
+        scores = [s for (jm, _jt), j in judges.items() if jm == mid for s in j["scores"]]
+        per_task_q = {jt: statistics.mean(j["scores"])
+                      for (jm, jt), j in judges.items() if jm == mid and j["scores"]}
         per_model[mid] = {
             "quality": statistics.mean(scores) if scores else None,
             "quality_ci": bootstrap_ci(scores, repeats),

@@ -1,18 +1,32 @@
 """Privacy / retention controls for mcp-council on-disk artifacts.
 
-The server persists job snapshots (logs/jobs), dialogue dumps (logs/dialogues),
-event journals (logs/events) and full call dumps (logs/dumps). These can carry
-prompt text, context excerpts and provider bodies. Nothing bounded how long they
-lived on disk. This module adds:
+The server writes, under `logs/`:
+
+  * `calls/*.json`      — FULL per-call dumps (question, context excerpts,
+                          every member's answer, provider bodies);
+  * `council_*.log`     — the per-day JSONL summary journal at the logs ROOT;
+  * `jobs/*.json`       — async job snapshots;
+  * `dialogues/*.json`  — dialogue session dumps;
+  * `events/*.jsonl`    — live event journals.
+
+All of them can carry prompt text and context excerpts. This module bounds how
+long they live:
 
   * **TTL purge** — delete artifacts older than a configurable age
     (COUNCIL_LOG_RETENTION_HOURS, default 168h/7d; 0 disables purge).
   * **size quota** — after the age sweep, if a directory still exceeds its byte
     quota, delete oldest-first until under it.
-  * **redaction** — mask credential-shaped tokens in a string before it is logged
-    or surfaced (reuses the dlp secret patterns), for a privacy-mode logger.
-  * **purge API** — `purge_all()` returns per-directory counts, wired to the
-    `council_purge_logs` MCP tool for on-demand cleanup.
+  * **redaction** — mask credential-shaped tokens (reuses the dlp secret
+    patterns). `logger.py` applies it to the call dumps and the JSONL journal
+    before writing, so a key pasted into a question isn't parked on disk in
+    clear text. It is deliberately NOT applied to `jobs/` and `dialogues/`
+    snapshots: those are working state that must round-trip verbatim (a
+    recovered job returns its result to the client), and mangling them would
+    corrupt the answer. They are bounded by the TTL/quota sweep instead.
+  * **purge API** — `purge_all()` returns per-directory counts. Called at server
+    startup (so the configured TTL is a real retention period, not a promise
+    that only holds when someone runs a tool) and exposed on demand through the
+    `council_purge_logs` MCP tool.
 
 Dependency-light (only dlp for the redaction patterns) so it unit-tests without
 the server.
@@ -33,13 +47,20 @@ _DEFAULT_RETENTION_HOURS = 168.0  # 7 days
 _DIR_BYTE_QUOTA_ENV = "COUNCIL_LOG_DIR_QUOTA_BYTES"
 _DEFAULT_DIR_BYTE_QUOTA = 256 * 1024 * 1024  # 256 MB
 
-# The artifact directories under a logs base, with their file globs.
+# The artifact directories under a logs base, with their file globs. `calls` is
+# where write_full_dump() actually puts the full per-call dumps — the old entry
+# said `dumps`, a directory nothing ever writes, so the largest and most
+# sensitive artifact set was silently exempt from every sweep.
 _RETAINED_GLOBS = {
     "jobs": "*.json",
     "dialogues": "*.json",
     "events": "*.jsonl",
-    "dumps": "*.json",
+    "calls": "*.json",
 }
+
+# Files living directly in the logs root (the per-day JSONL journal). Swept with
+# the same TTL/quota as the subdirectories — they were in no registry at all.
+_ROOT_GLOBS = ("council_*.log",)
 
 
 def retention_seconds() -> float:
@@ -112,6 +133,14 @@ def purge_all(logs_base: Path, *, max_age_seconds: float | None = None,
         by_age = _purge_dir_by_age(d, glob, age, now) if (age > 0 and d.exists()) else 0
         by_quota = _purge_dir_by_quota(d, glob, quota) if d.exists() else 0
         result[sub] = {"removed_by_age": by_age, "removed_by_quota": by_quota}
+    if logs_base.exists():
+        root_age = root_quota = 0
+        for glob in _ROOT_GLOBS:
+            root_age += _purge_dir_by_age(logs_base, glob, age, now) if age > 0 else 0
+            root_quota += _purge_dir_by_quota(logs_base, glob, quota)
+        result["root"] = {"removed_by_age": root_age, "removed_by_quota": root_quota}
+    else:
+        result["root"] = {"removed_by_age": 0, "removed_by_quota": 0}
     result["retention_hours"] = round(age / 3600.0, 2)
     result["dir_quota_bytes"] = quota
     return result

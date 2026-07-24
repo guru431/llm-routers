@@ -76,24 +76,42 @@ class ResponseCache:
         return h.hexdigest()
 
     def get(self, model: Optional[str], system_prompt: Optional[str], prompt: str) -> Optional[str]:
-        """Возвращает кэшированный ответ или None если miss/expired."""
+        """Возвращает кэшированный ответ или None если miss/expired.
+        Считает hit/miss в статистику `/health`."""
+        return self._lookup(model, system_prompt, prompt, count=True)
+
+    def peek(self, model: Optional[str], system_prompt: Optional[str], prompt: str) -> Optional[str]:
+        """То же, что `get`, но БЕЗ счётчиков статистики.
+
+        Нужен для повторной проверки кэша после ожидания слота в очереди: это
+        второй взгляд на ТОТ ЖЕ запрос, а не новое обращение. Через `get` обычный
+        некэшированный запрос без конкурента давал два miss'а, тогда как
+        request-level `METRICS.cache_misses` рос на единицу — hit/miss rate в
+        `/health` переставал сходиться с request-метриками сервера."""
+        return self._lookup(model, system_prompt, prompt, count=False)
+
+    def _lookup(self, model: Optional[str], system_prompt: Optional[str], prompt: str,
+                *, count: bool) -> Optional[str]:
         key = self._make_key(model, system_prompt, prompt)
         now = time.monotonic()
         with self._lock:
             entry = self._data.get(key)
             if entry is None:
-                self._misses += 1
+                if count:
+                    self._misses += 1
                 return None
             timestamp, value, nbytes = entry
             if now - timestamp > self._ttl:
                 # Expired — удаляем
                 del self._data[key]
                 self._total_bytes -= nbytes
-                self._misses += 1
+                if count:
+                    self._misses += 1
                 return None
             # MRU: переносим в конец
             self._data.move_to_end(key)
-            self._hits += 1
+            if count:
+                self._hits += 1
             return value
 
     def put(self, model: Optional[str], system_prompt: Optional[str], prompt: str, value: str) -> None:

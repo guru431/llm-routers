@@ -92,25 +92,54 @@ def _load_dotenv() -> None:
 _load_dotenv()
 
 
-# Names whose upper-cased form ends with one of these (or contains SECRET/
-# PASSWORD/TOKEN) are treated as secrets and stripped from any child-process env.
-# The child codex/claude CLI authenticates via its own ~/.codex / ~/.claude login,
-# never via these, so removing them is safe — and it closes the /proc/self/environ
-# and `echo $VAR` exfiltration vectors for provider keys AND this server's own
-# bearer tokens (a read-only prompt-injection must not be able to harvest the
-# workspace-write token and self-escalate).
-_SECRET_ENV_SUFFIXES = ("_TOKEN", "_KEY", "_SECRET", "_PASSWORD", "_APIKEY", "_CREDENTIALS")
-_SECRET_ENV_SUBSTRINGS = ("SECRET", "PASSWORD", "TOKEN")
+# The child env is an ALLOW-list, not a deny-list. Guessing secret NAMES does not
+# work: `DATABASE_URL`, `GITHUB_PAT`, `AWS_SESSION`, `STRIPE_SK` and every
+# in-house naming convention carry credentials while matching no suffix or
+# substring rule, so the old denylist happily handed them to the child CLI. That
+# matters most for codex, where even the read-only sandbox executes commands and
+# can read its own environment — one prompt injection was enough to print any
+# credential the denylist missed.
+#
+# So: only names the CLI actually needs to run are passed through. The child
+# codex/claude CLI authenticates via its own ~/.codex / ~/.claude login, never via
+# environment credentials, so nothing else is required.
+_CHILD_ENV_ALLOWLIST = frozenset({
+    # Process / shell basics
+    "PATH", "PATHEXT", "COMSPEC", "SHELL", "TERM", "COLORTERM", "NO_COLOR",
+    # Windows system layout
+    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "OS", "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER", "NUMBER_OF_PROCESSORS",
+    "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432",
+    "COMMONPROGRAMFILES", "COMMONPROGRAMFILES(X86)", "COMMONPROGRAMW6432",
+    # Home / config / scratch — the CLI reads ~/.claude or ~/.codex from these
+    "HOME", "HOMEDRIVE", "HOMEPATH", "USERPROFILE", "USERNAME", "USERDOMAIN",
+    "APPDATA", "LOCALAPPDATA", "TEMP", "TMP", "TMPDIR",
+    "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+    # Locale / time / TLS trust
+    "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+})
+
+# Extra names to pass through, comma-separated. For deployments that genuinely
+# need something else (a proxy, a corporate CA path). Proxy variables are NOT in
+# the default allowlist on purpose: an authenticated proxy URL embeds
+# credentials, so passing it to the child has to be a deliberate choice.
+_CHILD_ENV_PASSTHROUGH_VAR = "AGENT_CHILD_ENV_PASSTHROUGH"
+
+
+def _child_env_allowlist() -> frozenset:
+    extra = os.getenv(_CHILD_ENV_PASSTHROUGH_VAR, "")
+    names = {n.strip().upper() for n in extra.split(",") if n.strip()}
+    return _CHILD_ENV_ALLOWLIST | names
 
 
 def _child_env_without_secrets(**overrides: str) -> dict:
-    """Copy os.environ with every secret-looking var removed, then apply
-    overrides. Pass to subprocess `env=` so a spawned CLI can't leak our keys."""
-    env = {
-        k: v for k, v in os.environ.items()
-        if not (k.upper().endswith(_SECRET_ENV_SUFFIXES)
-                or any(s in k.upper() for s in _SECRET_ENV_SUBSTRINGS))
-    }
+    """Build the child-process environment from an ALLOW-list, then apply
+    overrides. Pass to subprocess `env=` so a spawned CLI sees only what it needs
+    to run — never this server's tokens, nor any unrelated credential that
+    happens not to look like one."""
+    allowed = _child_env_allowlist()
+    env = {k: v for k, v in os.environ.items() if k.upper() in allowed}
     env.update(overrides)
     return env
 
@@ -152,7 +181,14 @@ DEFAULT_SANDBOX = os.getenv("CODEX_AGENT_DEFAULT_SANDBOX", "read-only")
 if DEFAULT_SANDBOX not in SANDBOX_MODES:
     DEFAULT_SANDBOX = "read-only"
 
-REASONING = os.getenv("CODEX_AGENT_REASONING", "medium") or None
+# Reasoning effort. The per-request override is validated against this set, but
+# the ENV value used to skip validation entirely — an invalid one only surfaced
+# as a codex CLI failure on every call, with /ready reporting green. Fall back to
+# the default and record it so readiness can report the misconfiguration.
+REASONING_LEVELS = ("minimal", "low", "medium", "high")
+_REASONING_RAW = os.getenv("CODEX_AGENT_REASONING", "medium") or None
+REASONING_ENV_VALID = _REASONING_RAW is None or _REASONING_RAW in REASONING_LEVELS
+REASONING = _REASONING_RAW if REASONING_ENV_VALID else "medium"
 WORKDIR = os.getenv("CODEX_AGENT_WORKDIR") or None
 WORKDIR_ROOT = os.getenv("CODEX_AGENT_WORKDIR_ROOT") or WORKDIR
 
@@ -612,10 +648,16 @@ def validate_structured_output(text: str, schema) -> tuple:
 
 
 def tool_calls_schema_errors(tool_calls: list, tools: list) -> list:
-    """For each parsed tool call, check its arguments carry the required keys of
-    the matching tool's parameters schema. Returns a flat list of human-readable
-    errors (empty = ok). Calls whose name isn't in `tools`, or whose tool has no
-    object schema, are skipped."""
+    """For each parsed tool call, check the tool EXISTS in `tools` and that its
+    arguments carry the required keys of that tool's parameters schema. Returns a
+    flat list of human-readable errors (empty = ok).
+
+    An unknown name is an error, not something to skip: the emulation layer puts
+    the offered functions in the system prompt and parses whatever comes back, so
+    a model that invents `delete_everything` used to sail straight through this
+    validator and reach the client as a legitimate `finish_reason=tool_calls`.
+    A tool with no object schema still can't be argument-checked — but its NAME
+    is now verified."""
     schemas: dict = {}
     for t in tools or []:
         if isinstance(t, dict):
@@ -624,8 +666,14 @@ def tool_calls_schema_errors(tool_calls: list, tools: list) -> list:
                 schemas[fn["name"]] = fn.get("parameters") or {}
     errors: list = []
     for tc in tool_calls:
-        fn = tc.get("function", {})
-        name = fn.get("name", "")
+        fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+        name = fn.get("name", "") if isinstance(fn, dict) else ""
+        if name not in schemas:
+            errors.append(
+                f"tool {name!r}: not one of the offered tools "
+                f"({', '.join(sorted(schemas)) or 'none'})"
+            )
+            continue
         schema = schemas.get(name)
         if not isinstance(schema, dict) or not schema:
             continue
@@ -808,9 +856,27 @@ def extract_content(content) -> str:
 # Real streaming (Idea 11) — line-by-line JSON events + cancellation
 # ============================================================
 
+# Process-wide memo of whether `codex exec --json` actually streams events on
+# this machine: None = unknown, True/False = learned from a real attempt. Once we
+# know it doesn't, streaming is skipped up front so no request pays for a doomed
+# first pass — and a workspace-write request never starts one it can't retry.
+_STREAM_JSON_SUPPORTED = [None]
+
+
 class StreamUnsupported(Exception):
     """Raised (before any SSE byte is sent) when the CLI's streaming JSON output
     can't be used, so _handle_chat falls back to the buffered path."""
+
+
+class StreamFailed(Exception):
+    """Raised AFTER deltas have been emitted when the run did not actually
+    succeed — watchdog timeout, non-zero exit, or a CLI error event.
+
+    Distinct from StreamUnsupported (which means "nothing ran usefully, retry
+    buffered"): here the run started and failed, so the SSE writer must emit an
+    error and NOT a clean `[DONE]`. Without this, a killed or crashed CLI whose
+    stdout simply reached EOF after one recognized delta was reported to the
+    client as a completed answer, with timeout/kill metrics left at zero."""
 
 
 def _codex_event_text(evt) -> tuple[str, bool]:
@@ -909,7 +975,16 @@ def run_codex_stream(prompt, *, model_base, sandbox, workdir=None, reasoning=Non
         cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding="utf-8", **popen_kwargs,
     )
-    watchdog = threading.Timer(timeout, _kill_process_tree, args=(proc,))
+    # The watchdog used to kill the tree and leave NO trace: stdout hit EOF, the
+    # loop ended normally and the caller emitted a successful `[DONE]`. Record the
+    # kill so the post-loop check can tell "finished" from "was killed".
+    killed = {"timeout": False}
+
+    def _on_timeout():
+        killed["timeout"] = True
+        _kill_process_tree(proc)
+
+    watchdog = threading.Timer(timeout, _on_timeout)
     watchdog.daemon = True
     watchdog.start()
 
@@ -921,6 +996,21 @@ def run_codex_stream(prompt, *, model_base, sandbox, workdir=None, reasoning=Non
             pass
 
     threading.Thread(target=_feed, daemon=True).start()
+
+    # Drain stderr concurrently. Undrained, a chatty CLI fills the pipe buffer and
+    # DEADLOCKS on write while we wait on stdout; it also gives the failure path
+    # something to log.
+    stderr_lines: list = []
+
+    def _drain_stderr():
+        try:
+            for line in proc.stderr:
+                if len(stderr_lines) < 200:
+                    stderr_lines.append(line.rstrip())
+        except (OSError, ValueError):
+            pass
+
+    threading.Thread(target=_drain_stderr, daemon=True).start()
 
     emitted = ""
     usage_meta = None
@@ -952,6 +1042,27 @@ def run_codex_stream(prompt, *, model_base, sandbox, workdir=None, reasoning=Non
                 yield ("text", txt)
         if not saw_json:
             raise StreamUnsupported("no --json output")
+
+        # EOF on stdout is NOT success. Wait for the real exit status before
+        # calling the run complete.
+        try:
+            returncode = proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            _kill_process_tree(proc)
+            returncode = proc.poll()
+        if killed["timeout"]:
+            logger.error("codex stream timed out after %ss; stderr: %s",
+                         timeout, " | ".join(stderr_lines[-5:]) or "(empty)")
+            raise StreamFailed(f"codex timed out after {timeout}s")
+        if returncode not in (0, None):
+            logger.error("codex stream exit code %s; stderr: %s",
+                         returncode, " | ".join(stderr_lines[-5:]) or "(empty)")
+            raise StreamFailed("codex command failed")
+
+        # The `-o` outfile is authoritative. Reconcile it against what the events
+        # produced even when deltas WERE emitted — a single early delta used to
+        # suppress this entirely, so a truncated event stream silently became the
+        # whole answer.
         try:
             with open(outfile, encoding="utf-8") as f:
                 final = f.read().strip()
@@ -960,14 +1071,29 @@ def run_codex_stream(prompt, *, model_base, sandbox, workdir=None, reasoning=Non
         if final and not emitted:
             emitted = final
             yield ("text", final)
+        elif final and final != emitted:
+            if final.startswith(emitted):
+                remainder = final[len(emitted):]
+                emitted = final
+                yield ("text", remainder)
+            else:
+                # Diverged (not merely truncated) — don't double-emit prose the
+                # client already has; hand the authoritative text to the caller
+                # via meta and say so in the log.
+                logger.warning(
+                    "codex stream text diverges from the -o outfile "
+                    "(streamed %d chars, file %d chars)", len(emitted), len(final)
+                )
+                emitted = final
         yield ("meta", {"usage": usage_meta, "stop_reason": stop_reason, "text": emitted})
     finally:
         watchdog.cancel()
         _kill_process_tree(proc)
-        try:
-            proc.stdout.close()
-        except Exception:
-            pass
+        for pipe in (proc.stdout, proc.stderr):
+            try:
+                pipe.close()
+            except Exception:
+                pass
         try:
             proc.wait(timeout=5)
         except Exception:
@@ -1052,10 +1178,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_ready(self):
         """Readiness probe (Idea 13): 200 {ready:true,...} when the server can
-        actually serve, else 503 {ready:false, checks:{...}}. Unauthenticated
-        (like /health) and exposes only booleans, never paths. Checks: bearer
-        token configured, codex CLI resolvable, workdir root exists (when
-        configured), and the concurrency pool isn't saturated."""
+        actually serve the route it DEFAULTS to, else 503 {ready:false,
+        checks:{...}}. Unauthenticated (like /health) and exposes only booleans,
+        never paths.
+
+        Readiness has to reflect the configuration the default route actually
+        uses. Checking only "CLI resolvable" left it green while every request
+        failed: a READ_ROOT pointing at a missing/непapка directory makes codex
+        fail on `-C`, and an invalid CODEX_AGENT_REASONING made it fail on `-c`.
+        Both are checked here, and when the default sandbox is workspace-write
+        the workdir/agent-token config it needs is required too."""
         snap = METRICS.snapshot(int(time.monotonic() - SERVER_START_MONO))
         checks = {
             "auth_token_configured": bool(AUTH_TOKEN),
@@ -1063,10 +1195,20 @@ class Handler(BaseHTTPRequestHandler):
             # Only required when configured — an unset root just disables
             # workspace-write, read-only keeps working, so treat unset as OK.
             "workdir_root_exists": (WORKDIR_ROOT is None) or os.path.isdir(WORKDIR_ROOT),
+            # Passed as `-C` on every read-only call: a bad path fails them ALL.
+            "read_root_exists": (READ_ROOT is None) or os.path.isdir(READ_ROOT),
+            # An out-of-range env value is rejected by the CLI, not by us.
+            "reasoning_valid": REASONING_ENV_VALID,
             "not_overloaded": snap["active"] < MAX_CONCURRENCY,
         }
+        if DEFAULT_SANDBOX == "workspace-write":
+            # The default route is agentic: it needs a containment root and the
+            # separate agent bearer, or every default request is refused.
+            checks["default_route_workdir_configured"] = bool(WORKDIR_ROOT or WORKDIR)
+            checks["default_route_agent_token_configured"] = bool(AGENT_AUTH_TOKEN)
         ready = all(checks.values())
-        self._send(200 if ready else 503, {"ready": ready, "checks": checks})
+        self._send(200 if ready else 503, {"ready": ready, "checks": checks,
+                                           "default_sandbox": DEFAULT_SANDBOX})
 
     def do_GET(self):
         if self.path == "/health":
@@ -1155,6 +1297,42 @@ class Handler(BaseHTTPRequestHandler):
                             "type": "invalid_request_error"}})
                         return
 
+                    # Nested schema shape: build_tools_system_prompt and
+                    # json_schema_errors walk `parameters`/`properties`/`required`
+                    # assuming dict/list. A scalar there crashed rendering and
+                    # surfaced as a 500 — the client's JSON is the client's error.
+                    params = t.get("function", {}).get("parameters")
+                    if params is not None and not isinstance(params, dict):
+                        self._send(400, {"error": {
+                            "message": "tool function.parameters must be an object",
+                            "type": "invalid_request_error"}})
+                        return
+                    if isinstance(params, dict):
+                        props = params.get("properties")
+                        if props is not None and not isinstance(props, dict):
+                            self._send(400, {"error": {
+                                "message": "tool parameters.properties must be an object",
+                                "type": "invalid_request_error"}})
+                            return
+                        req = params.get("required")
+                        if req is not None and not isinstance(req, list):
+                            self._send(400, {"error": {
+                                "message": "tool parameters.required must be a list",
+                                "type": "invalid_request_error"}})
+                            return
+            # Assistant `tool_calls` are rendered into the prompt with
+            # tc.get("id") — a dict instead of a list iterates its KEYS, and a
+            # non-dict element has no .get, both raising inside rendering.
+            for m in messages:
+                tcs = m.get("tool_calls")
+                if tcs is None:
+                    continue
+                if not isinstance(tcs, list) or not all(isinstance(tc, dict) for tc in tcs):
+                    self._send(400, {"error": {
+                        "message": "message.tool_calls must be a list of objects",
+                        "type": "invalid_request_error"}})
+                    return
+
             try:
                 timeout = int(body.get("timeout", 300))
             except (TypeError, ValueError):
@@ -1165,7 +1343,7 @@ class Handler(BaseHTTPRequestHandler):
             # Token-sensitive consumers (code-review) can request 'low'/'minimal'
             # без смены глобального дефолта для council/CCR. Невалидное → дефолт.
             req_reasoning = body.get("reasoning")
-            if req_reasoning not in ("minimal", "low", "medium", "high"):
+            if req_reasoning not in REASONING_LEVELS:
                 req_reasoning = None
             effective_reasoning = req_reasoning or REASONING
 
@@ -1273,7 +1451,11 @@ class Handler(BaseHTTPRequestHandler):
 
             # Real streaming (Idea 11) — only for plain text: tools and structured
             # output must buffer the whole answer to parse/validate/repair it.
-            if stream and not tools and not structured:
+            # `_STREAM_JSON_SUPPORTED` remembers a previous StreamUnsupported so a
+            # CLI without `--json` doesn't burn a doomed first pass on EVERY
+            # request (which matters most for workspace-write, where that pass can
+            # already have edited files).
+            if stream and not tools and not structured and _STREAM_JSON_SUPPORTED[0] is not False:
                 base_usage = {
                     "prompt_tokens": len(prompt) // 4,
                     "completion_tokens": 0,
@@ -1287,14 +1469,31 @@ class Handler(BaseHTTPRequestHandler):
                 first_item = None
                 try:
                     first_item = next(gen)
+                    _STREAM_JSON_SUPPORTED[0] = True
                 except StreamUnsupported:
-                    # No SSE byte sent yet — fall back to the buffered path below.
-                    logger.warning("codex --json streaming unsupported; falling back to buffered mode")
+                    # No SSE byte sent yet — the buffered path could re-run the
+                    # same prompt. That is safe ONLY when the run is idempotent.
+                    # A workspace-write run is not: the first CLI process may
+                    # already have edited files before its stdout turned out to
+                    # carry no JSON, and re-running would apply the agent's
+                    # changes a second time. Report the failure instead.
+                    _STREAM_JSON_SUPPORTED[0] = False
+                    logger.warning("codex --json streaming unsupported")
                     try:
                         gen.close()
                     except Exception:
                         pass
                     gen = None
+                    if sandbox == "workspace-write":
+                        self._send(502, {"error": {
+                            "message": (
+                                "codex --json streaming is unavailable and this is a "
+                                "workspace-write request: the run already started and "
+                                "may have modified files, so it will NOT be retried "
+                                "automatically. Re-issue with stream=false."
+                            ),
+                            "type": "upstream_error"}})
+                        return
                 except StopIteration:
                     gen = None
                     first_item = None
@@ -1307,7 +1506,10 @@ class Handler(BaseHTTPRequestHandler):
             result = run_codex(prompt, model_base=model_base, sandbox=sandbox,
                                workdir=workdir, reasoning=effective_reasoning, timeout=timeout)
 
-            # Structured output: validate + ONE repair-retry (Idea 12).
+            # Structured output: validate + ONE repair-retry (Idea 12). The
+            # REPAIRED payload is validated again — without that, a second
+            # invalid response still returned 200 with structured_output=true,
+            # i.e. the server asserted a contract it had just seen violated.
             if structured and result:
                 ok, err = validate_structured_output(result, structured_schema)
                 if not ok:
@@ -1316,20 +1518,38 @@ class Handler(BaseHTTPRequestHandler):
                               + err + "\nReturn ONLY the corrected JSON value, nothing else.")
                     result = run_codex(repair, model_base=model_base, sandbox=sandbox,
                                        workdir=workdir, reasoning=effective_reasoning, timeout=timeout)
+                    ok, err = validate_structured_output(result or "", structured_schema)
+                    if not ok:
+                        logger.warning("structured output still invalid after repair: %s", err)
+                        self._send(502, {"error": {
+                            "message": ("model did not produce output matching the "
+                                        f"requested response_format after one repair: {err}"),
+                            "type": "upstream_error"}})
+                        return
 
             tool_calls = []
             content = result
             if tools and result:
                 tool_calls, content = parse_tool_calls(result)
-                # Validate required args are present + ONE repair-retry (Idea 12).
+                # Validate the call (known tool + required args) + ONE repair-retry
+                # (Idea 12), then re-validate the repaired call for the same reason
+                # as above.
                 errs = tool_calls_schema_errors(tool_calls, tools)
                 if errs:
-                    logger.info("tool call missing required args (%s); one repair-retry", "; ".join(errs))
+                    logger.info("invalid tool call (%s); one repair-retry", "; ".join(errs))
                     repair = (prompt + "\n\n# REPAIR — YOUR PREVIOUS TOOL CALL WAS INVALID\n"
                               + "; ".join(errs) + "\nReissue the <tool_call> block with ALL required fields set.")
                     result = run_codex(repair, model_base=model_base, sandbox=sandbox,
                                        workdir=workdir, reasoning=effective_reasoning, timeout=timeout)
                     tool_calls, content = parse_tool_calls(result)
+                    errs = tool_calls_schema_errors(tool_calls, tools)
+                    if errs:
+                        logger.warning("tool call still invalid after repair: %s", "; ".join(errs))
+                        self._send(502, {"error": {
+                            "message": ("model did not produce a valid tool call after "
+                                        f"one repair: {'; '.join(errs)}"),
+                            "type": "upstream_error"}})
+                        return
 
             resp_message = {"role": "assistant"}
             if tool_calls:
@@ -1487,6 +1707,24 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"data: [DONE]\n\n")
         except (ConnectionError, BrokenPipeError):
             disconnected = True
+        except StreamFailed as e:
+            # The run started and FAILED (timeout / non-zero exit). Deltas may
+            # already be on the wire, so we can't switch to a JSON error response
+            # — but we must not sign off with a successful finish chunk and
+            # `[DONE]` either, which is exactly how a killed CLI used to look
+            # indistinguishable from a completed answer.
+            METRICS.inc("timeouts")
+            METRICS.inc("killed_processes")
+            logger.error("live stream failed after %d chars: %s", len(str(usage)), e)
+            try:
+                emit({}, finish="error", usage=usage)
+                self.wfile.write(
+                    ("data: " + json.dumps(
+                        {"error": {"message": str(e), "type": "upstream_error"}},
+                        ensure_ascii=False) + "\n\n").encode("utf-8")
+                )
+            except (ConnectionError, BrokenPipeError):
+                disconnected = True
         finally:
             # Cancellation: closing the generator throws GeneratorExit into it, so
             # its finally kills the CLI tree. Harmless if it already finished.

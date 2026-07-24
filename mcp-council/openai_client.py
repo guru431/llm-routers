@@ -71,9 +71,12 @@ class CouncilHTTPError(Exception):
     """Любая ошибка вызова OpenAI-compatible endpoint.
 
     `attempts` carries the number of HTTP attempts actually spent before failing
-    (None when no request was made, e.g. a short-circuited open breaker). Council
-    usage-accounting reads it so a member that exhausted its retries still counts
-    its real calls instead of showing up as 0."""
+    (None ONLY when no request was made, e.g. the breaker was already open on
+    entry). Every failure raised AFTER a request went out carries the real count
+    — including the post-200 body failures (invalid JSON / shape / empty content)
+    and a breaker that trips mid-retry, which used to raise with attempts=None
+    and made usage accounting see 0 calls for work that really happened. Council
+    usage-accounting reads it so budgets bound the calls actually spent."""
 
     def __init__(self, *args, attempts: int | None = None) -> None:
         super().__init__(*args)
@@ -251,7 +254,10 @@ async def call_openai_compat(
             # one provider outage doesn't make every co-hosted member burn its
             # full retry budget before the breaker helps.
             if circuit_breaker.open_for(host):
-                raise CouncilHTTPError(f"circuit_open for {host}: tripped mid-retry")
+                raise CouncilHTTPError(
+                    f"circuit_open for {host}: tripped mid-retry",
+                    attempts=attempt + 1,
+                )
             await asyncio.sleep(_backoff_delay(attempt))
             last_error = f"timeout {detail} (retry)"
             continue
@@ -284,7 +290,10 @@ async def call_openai_compat(
             # See the timeout branch: short-circuit if a sibling already opened
             # the breaker for this host mid-retry.
             if circuit_breaker.open_for(host):
-                raise CouncilHTTPError(f"circuit_open for {host}: tripped mid-retry")
+                raise CouncilHTTPError(
+                    f"circuit_open for {host}: tripped mid-retry",
+                    attempts=attempt + 1,
+                )
             await asyncio.sleep(_backoff_delay(attempt, _parse_retry_after(resp)))
             last_error = f"http {resp.status_code} (retry)"
             continue
@@ -304,13 +313,17 @@ async def call_openai_compat(
         try:
             data = resp.json()
         except ValueError as e:
-            raise CouncilHTTPError(f"invalid JSON in response: {e}") from e
+            raise CouncilHTTPError(
+                f"invalid JSON in response: {e}", attempts=attempt + 1
+            ) from e
 
         try:
             choice = data["choices"][0]
             msg = choice["message"]
         except (KeyError, IndexError, TypeError) as e:
-            raise CouncilHTTPError(f"invalid response structure: {e}") from e
+            raise CouncilHTTPError(
+                f"invalid response structure: {e}", attempts=attempt + 1
+            ) from e
 
         content = msg.get("content")
         tool_calls = msg.get("tool_calls")
@@ -329,7 +342,7 @@ async def call_openai_compat(
         # a degenerate response (often max_tokens spent on hidden reasoning).
         if not content and not tool_calls:
             raise CouncilHTTPError(
-                f"empty content (finish_reason={finish_reason})"
+                f"empty content (finish_reason={finish_reason})", attempts=attempt + 1
             )
 
         usage = data.get("usage", {}) or {}
@@ -345,4 +358,6 @@ async def call_openai_compat(
             "attempts": attempt + 1,
         }
 
-    raise CouncilHTTPError(last_error or "unreachable")  # pragma: no cover
+    raise CouncilHTTPError(
+        last_error or "unreachable", attempts=max_retries + 1
+    )  # pragma: no cover

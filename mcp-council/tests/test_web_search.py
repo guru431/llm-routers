@@ -142,3 +142,69 @@ def test_tool_spec_shape():
     assert params["type"] == "object"
     assert "query" in params["properties"]
     assert params["required"] == ["query"]
+
+
+# --- Malformed provider tool_calls must stay fail-soft -----------------------
+
+
+@pytest.mark.asyncio
+async def test_tool_loop_survives_malformed_tool_calls(monkeypatch):
+    """`tool_calls=[None]` / a scalar / a non-object `function` used to raise
+    AttributeError in the loop right after the (safe) executor, killing the whole
+    member instead of degrading to a tool-call error."""
+    from web_search_tool import run_with_tool_loop
+
+    member = {"id": "m1", "model": "M1", "base_url": "u"}
+    turns = {"n": 0}
+
+    async def fake_call(**kwargs):
+        turns["n"] += 1
+        if turns["n"] == 1:
+            return {"content": None, "tool_calls": [None, "oops", {"function": 5}],
+                    "tokens_in": 1, "tokens_out": 1, "attempts": 1}
+        return {"content": "final answer", "tool_calls": None,
+                "tokens_in": 1, "tokens_out": 1, "attempts": 1}
+
+    # No exception: the malformed payload is logged and the turn ends (the caller
+    # then marks the member "no final content"), instead of an AttributeError
+    # propagating out of the fan-out.
+    result, log = await run_with_tool_loop(
+        member=member, api_key="k", messages=[{"role": "user", "content": "q"}],
+        max_tokens=100, call_fn=fake_call,
+    )
+    assert result["content"] is None
+    assert len(log) == 3 and all(e["ok"] is False for e in log)
+    assert all("malformed" in e["error"] for e in log)
+
+
+@pytest.mark.asyncio
+async def test_tool_loop_accepts_non_list_tool_calls(monkeypatch):
+    """A single tool_call object (not wrapped in a list) is normalized, executed
+    and answered instead of iterating the dict's keys."""
+    import web_search_tool
+    from web_search_tool import run_with_tool_loop
+
+    async def fake_search(query):
+        return {"query": query, "cost_dollars": 0.0, "latency_ms": 1,
+                "results": [{"url": "https://a.example", "title": "t",
+                             "summary": "x", "highlights": []}]}
+
+    monkeypatch.setattr(web_search_tool, "web_search_exa", fake_search)
+    member = {"id": "m1", "model": "M1", "base_url": "u"}
+    turns = {"n": 0}
+
+    async def fake_call(**kwargs):
+        turns["n"] += 1
+        if turns["n"] == 1:
+            return {"content": None, "tokens_in": 1, "tokens_out": 1, "attempts": 1,
+                    "tool_calls": {"id": "1", "function": {
+                        "name": "web_search", "arguments": '{"query": "q"}'}}}
+        return {"content": "done", "tool_calls": None,
+                "tokens_in": 1, "tokens_out": 1, "attempts": 1}
+
+    result, log = await run_with_tool_loop(
+        member=member, api_key="k", messages=[{"role": "user", "content": "q"}],
+        max_tokens=100, call_fn=fake_call,
+    )
+    assert result["content"] == "done"
+    assert log[0]["ok"] is True and log[0]["name"] == "web_search"

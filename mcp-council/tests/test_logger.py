@@ -61,3 +61,35 @@ def test_new_call_id_unique():
     b = logger._new_call_id()
     assert a != b
     assert len(a) >= len("2026-05-20-120000-aaaa")
+
+
+def test_full_dump_is_redacted(tmp_path, monkeypatch):
+    """A key pasted into the question must not sit in the on-disk dump: the dump
+    holds the whole prompt + provider bodies for the full retention window."""
+    monkeypatch.setattr(logger, "CALLS_DIR", tmp_path)
+    fake = "sk-" + "ABCDEF0123456789ghij"
+    path = logger.write_full_dump("cid", {"question": "use " + fake + " please"})
+    text = path.read_text(encoding="utf-8")
+    assert fake not in text
+    assert "redacted" in text
+
+
+def test_log_call_record_is_redacted(tmp_path, monkeypatch):
+    """`status` carries provider error text, which can echo a key-bearing URL."""
+    monkeypatch.setattr(logger, "LOG_DIR", tmp_path)
+    fake = "sk-" + "ABCDEF0123456789ghij"
+    logger.log_call(
+        call_id="cid", members_total=1, members_ok_stage1=0, members_ok_stage2=0,
+        prompt_size_bytes=1, total_latency_ms=1,
+        status="error: https://api.example/v1?key=" + fake, log_dump=None,
+    )
+    written = list(tmp_path.glob("council_*.log"))[0].read_text(encoding="utf-8")
+    assert fake not in written
+
+
+def test_redaction_can_be_disabled(tmp_path, monkeypatch):
+    monkeypatch.setattr(logger, "CALLS_DIR", tmp_path)
+    monkeypatch.setenv("COUNCIL_LOG_REDACT", "0")
+    fake = "sk-" + "ABCDEF0123456789ghij"
+    path = logger.write_full_dump("cid2", {"question": fake})
+    assert fake in path.read_text(encoding="utf-8")

@@ -76,3 +76,52 @@ def test_read_files_decodes_utf8_bom(tmp_path):
     p.write_bytes(b"\xef\xbb\xbf" + "hello".encode("utf-8"))
     (_, text), = read_files_with_limit([p])
     assert text == "hello"
+
+
+def test_read_rejects_secret_swapped_in_after_validation(tmp_path, monkeypatch):
+    """TOCTOU: the validated path is replaced with a private key between
+    resolve_and_validate() and the read. The read must reject it — the sandbox
+    boundary has to hold for the bytes actually shipped, not just for the object
+    that happened to be there at validation time."""
+    from sandbox import read_files_with_limit
+
+    monkeypatch.setenv(_CONTEXT_ROOTS_ENV, str(tmp_path))
+    f = tmp_path / "note.txt"
+    f.write_text("harmless", encoding="utf-8")
+    validated = resolve_and_validate([str(f)])
+
+    # …swap happens here… (header assembled at runtime so the source literal
+    # doesn't trip the repo's own pre-commit secret scanner)
+    header = b"-----BEGIN OPENSSH " + b"PRIVATE KEY-----"
+    f.write_bytes(header + b"\nAAAA\n")
+
+    with pytest.raises(SandboxError, match="private-key"):
+        read_files_with_limit(validated)
+
+
+def test_read_rejects_path_moved_outside_allowed_root(tmp_path, monkeypatch):
+    """A validated Path object whose target now sits outside the allow-list is
+    refused at read time, not silently read."""
+    from sandbox import read_files_with_limit
+
+    root = tmp_path / "allowed"
+    root.mkdir()
+    inside = root / "note.txt"
+    inside.write_text("hello", encoding="utf-8")
+    monkeypatch.setenv(_CONTEXT_ROOTS_ENV, str(root))
+    validated = resolve_and_validate([str(inside)])
+
+    outside = tmp_path / "elsewhere.txt"
+    outside.write_text("secret", encoding="utf-8")
+    with pytest.raises(SandboxError, match="outside allowed roots"):
+        read_files_with_limit([outside.resolve()])
+    # The legitimately-validated path still reads fine.
+    assert read_files_with_limit(validated)[0][1] == "hello"
+
+
+def test_read_rejects_directory(tmp_path):
+    from sandbox import read_files_with_limit
+    d = tmp_path / "adir"
+    d.mkdir()
+    with pytest.raises(SandboxError):
+        read_files_with_limit([d])

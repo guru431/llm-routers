@@ -173,13 +173,19 @@ def call_openai(client: httpx.Client, endpoint: str, model: str, system: str, us
         reasoning = "".join(reasoning_buf)
         if tok_out is None and text:
             tok_out = max(1, len(text) // 4)
-        # A stream that produced no content AND never reached a terminal marker
-        # ([DONE] or a finish_reason) was truncated/dropped/malformed — do NOT
-        # record it as a clean "success-empty". (Reasoning-only models still emit
-        # [DONE]/finish_reason, so a legit empty content is not flagged.)
+        # A stream that never reached a terminal marker ([DONE] or a
+        # finish_reason) was truncated/dropped/malformed — regardless of how much
+        # partial text arrived. The old guard only fired when the text was EMPTY,
+        # so "half an answer, then the connection dropped" was recorded as a clean
+        # success and entered latency/quality rankings as a completed response.
+        # The partial text is still stored for diagnosis; `error` keeps it out of
+        # the comparative metrics.
         err = None
-        if not text and not saw_done and finish_reason is None:
-            err = "stream ended without [DONE]/finish_reason (no content)"
+        if not saw_done and finish_reason is None:
+            err = (
+                f"stream ended without [DONE]/finish_reason "
+                f"({len(text)} chars of partial text kept for diagnosis)"
+            )
         return {
             "ttft_s": ttft, "ttft_reasoning_s": ttft_reasoning,
             "total_s": total, "text": text, "reasoning_text": reasoning,
@@ -225,6 +231,7 @@ def call_gemini(client: httpx.Client, endpoint: str, model: str, system: str, us
     buf: list[str] = []
     tok_out: int | None = None
     http_status: int = 0
+    finish_reason: str | None = None
     try:
         with client.stream(
             "POST", url, headers=headers, json=body,
@@ -253,6 +260,10 @@ def call_gemini(client: httpx.Client, endpoint: str, model: str, system: str, us
                 cands = chunk.get("candidates") or []
                 if not cands:
                     continue
+                # Gemini's terminal marker: `finishReason` on the candidate.
+                # Without checking it, ANY EOF looked like a completed answer.
+                if cands[0].get("finishReason"):
+                    finish_reason = cands[0]["finishReason"]
                 parts = (cands[0].get("content") or {}).get("parts") or []
                 for p in parts:
                     txt = p.get("text")
@@ -267,11 +278,22 @@ def call_gemini(client: httpx.Client, endpoint: str, model: str, system: str, us
         text = "".join(buf)
         if tok_out is None and text:
             tok_out = max(1, len(text) // 4)
+        # Require the protocol's OWN terminal success, like the OpenAI path.
+        # `STOP` is a normal completion; MAX_TOKENS/SAFETY/RECITATION are real
+        # truncations and must not be compared against complete answers.
+        err = None
+        if finish_reason is None:
+            err = (
+                f"stream ended without finishReason "
+                f"({len(text)} chars of partial text kept for diagnosis)"
+            )
+        elif finish_reason not in ("STOP", "FINISH_REASON_STOP"):
+            err = f"truncated by provider (finishReason={finish_reason})"
         return {
             "ttft_s": ttft, "ttft_reasoning_s": None,
             "total_s": total, "text": text, "reasoning_text": "",
             "tok_out": tok_out, "http_status": http_status,
-            "streaming": True, "error": None,
+            "streaming": True, "error": err,
         }
     except httpx.TimeoutException as e:
         return {
@@ -310,6 +332,7 @@ def call_ollama(client: httpx.Client, endpoint: str, model: str, system: str, us
     thinking_buf: list[str] = []
     tok_out: int | None = None
     http_status: int = 0
+    saw_done = False
     try:
         with client.stream(
             "POST", url, headers={"Content-Type": "application/json"}, json=body,
@@ -344,6 +367,7 @@ def call_ollama(client: httpx.Client, endpoint: str, model: str, system: str, us
                         ttft = time.perf_counter() - t0
                     buf.append(content)
                 if chunk.get("done"):
+                    saw_done = True
                     tok_out = chunk.get("eval_count")
                     break
         total = time.perf_counter() - t0
@@ -351,11 +375,19 @@ def call_ollama(client: httpx.Client, endpoint: str, model: str, system: str, us
         thinking_text = "".join(thinking_buf)
         if tok_out is None and text:
             tok_out = max(1, len(text) // 4)
+        # Ollama's terminal marker is `done: true`. Exiting the loop on EOF
+        # without it means the NDJSON stream was cut — not a finished answer.
+        err = None
+        if not saw_done:
+            err = (
+                f"stream ended without done=true "
+                f"({len(text)} chars of partial text kept for diagnosis)"
+            )
         return {
             "ttft_s": ttft, "ttft_reasoning_s": ttft_thinking,
             "total_s": total, "text": text, "reasoning_text": thinking_text,
             "tok_out": tok_out, "http_status": http_status,
-            "streaming": True, "error": None,
+            "streaming": True, "error": err,
         }
     except httpx.TimeoutException as e:
         return {
@@ -423,7 +455,11 @@ def main():
     ap.add_argument("--task", help="run only this task id")
     ap.add_argument("--model", help="run only this model id")
     ap.add_argument("--providers", help="comma-separated provider filter")
-    ap.add_argument("--skip-existing", action="store_true", help="skip (model,task) if already in results")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="skip a (model,task,repeat) cell already recorded in the run dir")
+    ap.add_argument("--resume", metavar="RUN_ID",
+                    help="continue an existing run instead of creating a new one "
+                         "(implies --skip-existing; reuses its manifest/settings)")
     ap.add_argument("--include-broken", action="store_true", help="include models with skip_reason set")
     ap.add_argument("--repeats", type=int, default=1,
                     help="run each (model,task) N times (statistical protocol, idea 16)")
@@ -487,14 +523,43 @@ def main():
     if args.task:
         tasks = [t for t in tasks if t["id"] == args.task]
 
-    # === Immutable run directory + manifest (idea 15) ===
-    run_id = uuid.uuid4().hex
-    started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    run_dir = _store.RUNS_DIR / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
+    # === Statistical protocol: randomized (model,task,repeat) interleaving (idea 16) ===
+    # Spreading repeats and models across time (rather than looping model-by-model)
+    # keeps a transient provider hiccup from biasing one model's whole row.
+    cells = [(m, t, rep) for m in models for t in tasks for rep in range(args.repeats)]
+    rng = random.Random(args.seed)
+    rng.shuffle(cells)
+
+    # === Run directory + manifest with a real lifecycle (idea 15) ===
+    # The manifest records status/expected_cells up front and is REWRITTEN with
+    # status="completed" + completed_cells at the end. Only then does
+    # latest-complete.txt move. Previously the run dir and latest.txt were created
+    # before the first cell and never updated, so an interrupted run was
+    # indistinguishable from a finished one and judge/report happily built
+    # rankings from a partial matrix.
+    resume_id = args.resume
+    if resume_id:
+        run_dir = _store.resolve_run_dir(resume_id)
+        if run_dir is None:
+            ap.error(f"--resume: unknown run id {resume_id!r}")
+        run_id = run_dir.name
+        prior = _store.load_manifest(run_dir) or {}
+        started_at = prior.get("started_at") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        args.skip_existing = True
+        sys.stderr.write(f"RESUME {run_id} → {run_dir}\n")
+    else:
+        run_id = uuid.uuid4().hex
+        started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        run_dir = _store.RUNS_DIR / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+
     manifest = {
         "run_id": run_id,
+        "status": "started",
         "started_at": started_at,
+        "completed_at": None,
+        "expected_cells": len(cells),
+        "completed_cells": 0,
         "git_sha": _git_sha(),
         "models_json_sha": _sha16(MODELS_JSON.read_bytes()),
         "tasks_json_sha": _sha16(TASKS_JSON.read_bytes()),
@@ -505,33 +570,32 @@ def main():
         "seed": args.seed,
         "python_version": platform.python_version(),
     }
-    (run_dir / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    # Point latest.txt at this run up front, so report.py/judge.py can pick up a
-    # partial (still-valid, immutable) run even if it is interrupted mid-way.
+
+    def _write_manifest() -> None:
+        (run_dir / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    _write_manifest()
+    # latest.txt = "most recently STARTED run" (may be partial). The
+    # latest-complete pointer only moves on success, below.
     _store.LATEST_TXT.write_text(run_id, encoding="utf-8")
     sys.stderr.write(f"RUN {run_id} → {run_dir}\n")
 
-    # === Statistical protocol: randomized (model,task,repeat) interleaving (idea 16) ===
-    # Spreading repeats and models across time (rather than looping model-by-model)
-    # keeps a transient provider hiccup from biasing one model's whole row.
-    cells = [(m, t, rep) for m in models for t in tasks for rep in range(args.repeats)]
-    rng = random.Random(args.seed)
-    rng.shuffle(cells)
     order = ", ".join(f"{m['id']}/{t['id']}#{rep}" for m, t, rep in cells)
     sys.stderr.write(f"ORDER (seed={args.seed}, {len(cells)} cells): {order}\n")
 
-    # Skip-existing works within the (fresh) run dir: on a normal invocation the
-    # run dir starts empty so nothing is skipped; if the same run dir is re-run
-    # (resume), a task with a prior non-error record for a model is skipped.
-    existing: dict[str, set[str]] = {}
+    # Skip-existing works within the run dir: on a fresh invocation the dir starts
+    # empty so nothing is skipped; with --resume (or an explicitly reused dir) a
+    # cell with a prior non-error record is skipped. Keyed by (task_id, repeat_idx)
+    # so resuming a --repeats=3 run doesn't collapse the three repeats into one.
+    existing: dict[str, set[tuple[str, int]]] = {}
     if args.skip_existing:
         for m in models:
             f = run_dir / f"{m['id']}.jsonl"
             if not f.exists():
                 continue
-            latest: dict[str, dict] = {}
+            latest: dict[tuple[str, int], dict] = {}
             for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
                 try:
                     r = json.loads(line)
@@ -539,8 +603,8 @@ def main():
                     continue
                 tid = r.get("task_id")
                 if tid is not None:
-                    latest[tid] = r
-            existing[m["id"]] = {tid for tid, r in latest.items() if not r.get("error")}
+                    latest[(tid, r.get("repeat_idx") or 0)] = r
+            existing[m["id"]] = {k for k, r in latest.items() if not r.get("error")}
 
     # One reusable HTTP client for every call — persistent connection pool instead
     # of a fresh TCP/TLS handshake per request (idea 16).
@@ -550,6 +614,7 @@ def main():
     handles: dict[str, Any] = {}
     total_cells = len(cells)
     cell = 0
+    done_cells = 0
     try:
         # Warmup: one discarded call per model to warm the connection / model
         # weights before the scored cells (idea 16). Not written to results.
@@ -563,8 +628,9 @@ def main():
         for m, t, rep in cells:
             cell += 1
             mid = m["id"]
-            if args.skip_existing and t["id"] in existing.get(mid, set()):
-                sys.stderr.write(f"[{cell}/{total_cells}] SKIP {mid} / {t['id']} (exists)\n")
+            if args.skip_existing and (t["id"], rep) in existing.get(mid, set()):
+                sys.stderr.write(f"[{cell}/{total_cells}] SKIP {mid} / {t['id']} #{rep} (exists)\n")
+                done_cells += 1
                 continue
             sys.stderr.write(f"[{cell}/{total_cells}] {mid} / {t['id']} #{rep}... ")
             sys.stderr.flush()
@@ -604,10 +670,31 @@ def main():
                 handles[mid] = fh
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
             fh.flush()
+            done_cells += 1
+        completed = True
+    except BaseException:
+        # Ctrl-C, a crash, anything: the run did NOT finish, so it must never be
+        # published as the complete one.
+        completed = False
+        raise
     finally:
         for fh in handles.values():
             fh.close()
         client.close()
+        manifest["completed_cells"] = done_cells
+        manifest["completed_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        manifest["status"] = "completed" if completed and done_cells >= total_cells else "failed"
+        _write_manifest()
+        if manifest["status"] == "completed":
+            # Only NOW does the complete-pointer move — judge.py / report.py
+            # default to it, so an interrupted run can't be silently ranked.
+            _store.LATEST_COMPLETE_TXT.write_text(run_id, encoding="utf-8")
+            sys.stderr.write(f"RUN {run_id} completed ({done_cells}/{total_cells} cells)\n")
+        else:
+            sys.stderr.write(
+                f"RUN {run_id} INCOMPLETE ({done_cells}/{total_cells} cells) — "
+                f"resume with: python run.py --resume {run_id}\n"
+            )
 
 
 if __name__ == "__main__":

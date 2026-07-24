@@ -49,6 +49,42 @@ fi
 git reset -q
 rm -f id_rsa
 
+# 2b) A sensitive file inside a directory whose NAME contains ".example." must
+# still be BLOCKED. The template exemption used to be applied to the whole path,
+# so any such directory exempted everything under it.
+mkdir -p foo.example.bar
+echo "x" > foo.example.bar/id_rsa
+git add -f foo.example.bar/id_rsa
+if git commit -q -m "sensitive file under .example. dir" 2>/dev/null; then
+  echo "FAIL: hook did NOT block a sensitive file under a *.example.* directory"; fails=1
+else
+  echo "ok: hook blocked sensitive file under a *.example.* directory"
+fi
+git reset -q
+rm -rf foo.example.bar
+
+# 2c) Every sensitive basename must be blocked, not just id_rsa.
+for name in .env vault.env server.pem server.key cert.p12 cert.pfx id_ed25519 id_dsa; do
+  echo "x" > "$name"
+  git add -f "$name"
+  if git commit -q -m "sensitive $name" 2>/dev/null; then
+    echo "FAIL: hook did NOT block $name"; fails=1
+  else
+    echo "ok: hook blocked $name"
+  fi
+  git reset -q
+  rm -f "$name"
+done
+
+# 2d) …but a real template (`<name>.example`) must still PASS.
+echo "TOKEN=" > .env.example
+git add .env.example
+if git commit -q -m "env template"; then
+  echo "ok: hook allowed .env.example template"
+else
+  echo "FAIL: hook wrongly blocked a .env.example template"; fails=1
+fi
+
 # 3) Clean content must PASS.
 rm -f leak.py
 echo "print('hello world')" > clean.py

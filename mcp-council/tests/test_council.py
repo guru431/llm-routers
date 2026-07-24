@@ -252,7 +252,7 @@ async def test_run_council_stage2_invalid_json_marked_error():
                 return {"content": "not json at all", "tokens_in": 1, "tokens_out": 1}
             return {
                 "content": json.dumps(
-                    {"rankings": [{"member": "A", "score": 8, "reasoning": ""}]}
+                    {"rankings": [{"member": "A", "score": 8, "reasoning": ""}, {"member": "B", "score": 4, "reasoning": "weaker"}]}
                 ),
                 "tokens_in": 1,
                 "tokens_out": 1,
@@ -454,7 +454,7 @@ async def test_run_council_returns_usage_and_summary():
         user = kwargs["messages"][1]["content"]
         if "=== ANSWERS TO RANK ===" in user:
             return {"content": json.dumps(
-                {"rankings": [{"member": "A", "score": 8, "reasoning": ""}]}),
+                {"rankings": [{"member": "A", "score": 8, "reasoning": ""}, {"member": "B", "score": 4, "reasoning": "weaker"}]}),
                 "tokens_in": 5, "tokens_out": 3, "attempts": 1}
         return {"content": "ans", "tokens_in": 7, "tokens_out": 4, "attempts": 1}
 
@@ -485,7 +485,7 @@ async def test_run_council_stage2_all_invalid_entries_marked_error():
                 }
             return {
                 "content": json.dumps(
-                    {"rankings": [{"member": "A", "score": 8, "reasoning": ""}]}
+                    {"rankings": [{"member": "A", "score": 8, "reasoning": ""}, {"member": "B", "score": 4, "reasoning": "weaker"}]}
                 ),
                 "tokens_in": 1,
                 "tokens_out": 1,
@@ -512,7 +512,7 @@ async def test_stage2_uses_pseudonyms_no_model_names_in_user_prompt():
             seen_user_prompts.append(user_msg)
             return {
                 "content": json.dumps(
-                    {"rankings": [{"member": "A", "score": 7, "reasoning": ""}]}
+                    {"rankings": [{"member": "A", "score": 7, "reasoning": ""}, {"member": "B", "score": 4, "reasoning": "weaker"}]}
                 ),
                 "tokens_in": 1,
                 "tokens_out": 1,
@@ -543,7 +543,7 @@ async def test_self_ranking_excluded():
             other_answers_seen_by[ranker_model] = user_msg
             return {
                 "content": json.dumps(
-                    {"rankings": [{"member": "A", "score": 5, "reasoning": ""}]}
+                    {"rankings": [{"member": "A", "score": 5, "reasoning": ""}, {"member": "B", "score": 4, "reasoning": "weaker"}]}
                 ),
                 "tokens_in": 1,
                 "tokens_out": 1,
@@ -581,7 +581,7 @@ async def test_web_search_disabled_no_tools_in_payload():
         if "=== ANSWERS TO RANK ===" in user_msg:
             return {
                 "content": json.dumps(
-                    {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}]}
+                    {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}, {"member": "B", "score": 4, "reasoning": "weaker"}]}
                 ),
                 "tokens_in": 1, "tokens_out": 1,
             }
@@ -605,7 +605,7 @@ async def test_web_search_enabled_passes_tools_in_stage1_only(monkeypatch):
             stage2_tool_specs.append(kwargs.get("tools"))
             return {
                 "content": json.dumps(
-                    {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}]}
+                    {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}, {"member": "B", "score": 4, "reasoning": "weaker"}]}
                 ),
                 "tokens_in": 1, "tokens_out": 1,
             }
@@ -634,7 +634,7 @@ async def test_tool_loop_executes_web_search_then_returns_content(monkeypatch):
         if "=== ANSWERS TO RANK ===" in user_msg:
             return {
                 "content": json.dumps(
-                    {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}]}
+                    {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}, {"member": "B", "score": 4, "reasoning": "weaker"}]}
                 ),
                 "tokens_in": 1, "tokens_out": 1,
             }
@@ -688,7 +688,7 @@ async def test_tool_loop_max_iterations_marks_error():
             # We shouldn't reach stage 2 — only one member, anyway.
             return {
                 "content": json.dumps(
-                    {"rankings": [{"member": "A", "score": 7, "reasoning": ""}]}
+                    {"rankings": [{"member": "A", "score": 7, "reasoning": ""}, {"member": "B", "score": 4, "reasoning": "weaker"}]}
                 ),
                 "tokens_in": 1, "tokens_out": 1,
             }
@@ -729,7 +729,7 @@ async def test_tool_loop_final_turn_forces_no_tools_to_salvage_answer():
         if "=== ANSWERS TO RANK ===" in user_msg:
             return {
                 "content": json.dumps(
-                    {"rankings": [{"member": "A", "score": 7, "reasoning": ""}]}
+                    {"rankings": [{"member": "A", "score": 7, "reasoning": ""}, {"member": "B", "score": 4, "reasoning": "weaker"}]}
                 ),
                 "tokens_in": 1, "tokens_out": 1,
             }
@@ -779,7 +779,7 @@ async def test_tool_loop_echoes_reasoning_content_for_deepseek():
         if "=== ANSWERS TO RANK ===" in user_msg:
             return {
                 "content": json.dumps(
-                    {"rankings": [{"member": "A", "score": 7, "reasoning": ""}]}
+                    {"rankings": [{"member": "A", "score": 7, "reasoning": ""}, {"member": "B", "score": 4, "reasoning": "weaker"}]}
                 ),
                 "tokens_in": 1, "tokens_out": 1,
             }
@@ -833,7 +833,7 @@ async def test_tool_loop_search_error_passed_back_to_model():
         if "=== ANSWERS TO RANK ===" in user_msg:
             return {
                 "content": json.dumps(
-                    {"rankings": [{"member": "A", "score": 7, "reasoning": ""}]}
+                    {"rankings": [{"member": "A", "score": 7, "reasoning": ""}, {"member": "B", "score": 4, "reasoning": "weaker"}]}
                 ),
                 "tokens_in": 1, "tokens_out": 1,
             }
@@ -883,7 +883,7 @@ async def test_run_council_synthesis_disabled_by_default():
         if "=== ANSWERS TO RANK ===" in user_msg:
             return {
                 "content": json.dumps(
-                    {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}]}
+                    {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}, {"member": "B", "score": 4, "reasoning": "weaker"}]}
                 ),
                 "tokens_in": 1,
                 "tokens_out": 1,
@@ -954,7 +954,7 @@ async def test_synthesis_no_web_chairman_gets_no_tools():
             return {"content": "## Synthesis", "tokens_in": 1, "tokens_out": 1}
         if "=== ANSWERS TO RANK ===" in user_msg:
             return {"content": json.dumps(
-                {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}]}),
+                {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}, {"member": "B", "score": 4, "reasoning": "weaker"}]}),
                 "tokens_in": 1, "tokens_out": 1}
         return {"content": "answer", "tokens_in": 1, "tokens_out": 1}
 
@@ -992,7 +992,7 @@ async def test_synthesis_web_chairman_searches_then_synthesizes():
                     "tokens_in": 1, "tokens_out": 1}
         if "=== ANSWERS TO RANK ===" in user_msg:
             return {"content": json.dumps(
-                {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}]}),
+                {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}, {"member": "B", "score": 4, "reasoning": "weaker"}]}),
                 "tokens_in": 1, "tokens_out": 1}
         return {"content": "answer", "tokens_in": 1, "tokens_out": 1}
 
@@ -1036,7 +1036,7 @@ async def test_synthesis_web_chairman_loop_exhaust_marks_error_not_raise():
                 "finish_reason": "tool_calls", "tokens_in": 1, "tokens_out": 1}
         if "=== ANSWERS TO RANK ===" in user_msg:
             return {"content": json.dumps(
-                {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}]}),
+                {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}, {"member": "B", "score": 4, "reasoning": "weaker"}]}),
                 "tokens_in": 1, "tokens_out": 1}
         return {"content": "answer", "tokens_in": 1, "tokens_out": 1}
 
@@ -1148,7 +1148,7 @@ async def test_synthesis_produces_structured_analysis():
                     "tokens_in": 1, "tokens_out": 1}
         if "=== ANSWERS TO RANK ===" in user_msg:
             return {"content": json.dumps(
-                {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}]}),
+                {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}, {"member": "B", "score": 4, "reasoning": "weaker"}]}),
                 "tokens_in": 1, "tokens_out": 1}
         return {"content": "answer", "tokens_in": 1, "tokens_out": 1}
 
@@ -1172,7 +1172,7 @@ async def test_synthesis_missing_analysis_block_notes_and_summary_none():
                     "tokens_in": 1, "tokens_out": 1}
         if "=== ANSWERS TO RANK ===" in user_msg:
             return {"content": json.dumps(
-                {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}]}),
+                {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}, {"member": "B", "score": 4, "reasoning": "weaker"}]}),
                 "tokens_in": 1, "tokens_out": 1}
         return {"content": "answer", "tokens_in": 1, "tokens_out": 1}
 
@@ -1191,7 +1191,7 @@ async def test_summary_analysis_none_when_no_synthesis():
         user_msg = kwargs["messages"][1]["content"]
         if "=== ANSWERS TO RANK ===" in user_msg:
             return {"content": json.dumps(
-                {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}]}),
+                {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}, {"member": "B", "score": 4, "reasoning": "weaker"}]}),
                 "tokens_in": 1, "tokens_out": 1}
         return {"content": "answer", "tokens_in": 1, "tokens_out": 1}
 
@@ -1215,7 +1215,7 @@ async def test_run_council_rounds_2_does_second_pass():
             counts["stage2"] += 1
             return {
                 "content": json.dumps(
-                    {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}]}
+                    {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}, {"member": "B", "score": 4, "reasoning": "weaker"}]}
                 ),
                 "tokens_in": 1,
                 "tokens_out": 1,
@@ -1254,7 +1254,7 @@ async def test_run_council_round2_all_fail_restores_round1_as_final():
                     "tokens_in": 1, "tokens_out": 1}
         if "=== ANSWERS TO RANK ===" in user_msg:
             return {"content": json.dumps(
-                {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}]}),
+                {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}, {"member": "B", "score": 4, "reasoning": "weaker"}]}),
                 "tokens_in": 1, "tokens_out": 1}
         # Round 2 stage1 (carries prior answer) → every member fails.
         if "=== YOUR PREVIOUS ANSWER ===" in user_msg:
@@ -1301,7 +1301,7 @@ async def test_run_council_synthesis_error_noted_not_raised():
         if "=== ANSWERS TO RANK ===" in user_msg:
             return {
                 "content": json.dumps(
-                    {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}]}
+                    {"rankings": [{"member": "A", "score": 7, "reasoning": "ok"}, {"member": "B", "score": 4, "reasoning": "weaker"}]}
                 ),
                 "tokens_in": 1,
                 "tokens_out": 1,

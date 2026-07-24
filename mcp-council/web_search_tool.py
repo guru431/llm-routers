@@ -240,6 +240,25 @@ async def run_with_tool_loop(
         loop_tout += result.get("tokens_out") or 0
         loop_attempts += result.get("attempts") or 1
         tool_calls = result.get("tool_calls")
+        # A provider can return a malformed `tool_calls`: a bare object instead
+        # of a list, a null element, a scalar, or `function` set to a non-object.
+        # execute_tool_call() tolerates all of those, but the loop around it used
+        # to call `tc.get(...)` unconditionally right after — turning a local
+        # tool-call error into an AttributeError that killed the whole member,
+        # exactly the opposite of the fail-soft contract. Normalize here so the
+        # rest of the turn only ever sees well-formed calls.
+        if tool_calls and not isinstance(tool_calls, list):
+            tool_calls = [tool_calls]
+        if isinstance(tool_calls, list):
+            malformed = [tc for tc in tool_calls
+                         if not isinstance(tc, dict) or not isinstance(tc.get("function"), dict)]
+            for bad in malformed:
+                tool_log.append({
+                    "name": "", "ok": False,
+                    "error": f"malformed tool_call from provider ({type(bad).__name__})",
+                })
+            tool_calls = [tc for tc in tool_calls
+                          if isinstance(tc, dict) and isinstance(tc.get("function"), dict)]
         if not tool_calls or force_no_tools:
             # Stop here when there are no tool calls OR this is the forced-final
             # turn: any tool_calls a provider returns despite tool_choice="none"
@@ -276,7 +295,9 @@ async def run_with_tool_loop(
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.get("id", ""),
-                "name": (tc.get("function") or {}).get("name", ""),
+                # Reuse the name the executor already normalized rather than
+                # re-digging into the (possibly odd) provider payload.
+                "name": log_entry.get("name") or "",
                 "content": tool_msg,
             })
     # Hit the cap. Return whatever the model said last, even if it's another

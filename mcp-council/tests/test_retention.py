@@ -43,3 +43,23 @@ def test_redact_masks_secrets():
     red = retention.redact("token " + fake + " and text")
     assert fake not in red
     assert "redacted" in red
+
+
+def test_purge_covers_call_dumps_and_root_journal(tmp_path):
+    """The two artifact sets that carry the most prompt text were exempt: the
+    full call dumps live in logs/calls (not logs/dumps, which nothing writes)
+    and the per-day JSONL journal sits directly in the logs root."""
+    (tmp_path / "calls").mkdir()
+    dump = tmp_path / "calls" / "2026-01-01-000000-abc.json"
+    journal = tmp_path / "council_2026-01-01.log"
+    dump.write_text("{}", encoding="utf-8")
+    journal.write_text("{}\n", encoding="utf-8")
+    past = time.time() - 10_000
+    os.utime(dump, (past, past))
+    os.utime(journal, (past, past))
+
+    res = retention.purge_all(tmp_path, max_age_seconds=3600, quota_bytes=0)
+    assert res["calls"]["removed_by_age"] == 1
+    assert res["root"]["removed_by_age"] == 1
+    assert not dump.exists()
+    assert not journal.exists()

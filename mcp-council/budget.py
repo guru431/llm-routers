@@ -93,6 +93,19 @@ class RunBudget:
                     return f"max reference-PAYG cost reached (${self.max_cost_usd:.4f})"
         return None
 
+    def as_dict_key(self) -> dict:
+        """The CEILINGS only — no clock. Used as part of the response-cache
+        fingerprint: two runs with different ceilings can stop at different
+        points and are not interchangeable, but `as_dict()` also carries
+        elapsed/remaining seconds, which change every call and would make every
+        key unique (i.e. disable caching outright)."""
+        return {
+            "deadline_seconds": self.deadline_seconds,
+            "max_llm_calls": self.max_llm_calls,
+            "max_web_searches": self.max_web_searches,
+            "max_cost_usd": self.max_cost_usd,
+        }
+
     def as_dict(self) -> dict:
         return {
             "deadline_seconds": self.deadline_seconds,

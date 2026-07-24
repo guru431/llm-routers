@@ -154,6 +154,10 @@ def load_run(run_arg: str | None = None):
 
     records_by_model keeps EVERY record (all repeats) for bootstrap CIs;
     last_by_cell keeps the last record per (model,task) for per-task tables.
+    `judges` maps (model,task) → {"last": record, "scores": [score per repeat]}:
+    judge.py now scores EVERY repeat, so quality has as many samples per cell as
+    latency does. Collapsing them to one record here would recreate exactly the
+    mismatch the per-repeat judging was added to fix.
     """
     run_dir = _store.resolve_run_dir(run_arg)
     records_by_model: dict[str, list[dict]] = defaultdict(list)
@@ -175,14 +179,24 @@ def load_run(run_arg: str | None = None):
     judges: dict[tuple[str, str], dict] = {}
     jf = _store.judge_file(run_dir)
     if jf.exists():
+        by_repeat: dict[tuple[str, str], dict[int, dict]] = defaultdict(dict)
         for line in jf.read_text(encoding="utf-8", errors="replace").splitlines():
             if not line.strip():
                 continue
             try:
                 d = json.loads(line)
-                judges[(d["model_id"], d["task_id"])] = d
             except Exception:
-                pass
+                continue
+            key = (d.get("model_id"), d.get("task_id"))
+            if None in key:
+                continue
+            # Last write wins PER REPEAT (a rescore of that repeat), so repeats
+            # accumulate instead of overwriting each other.
+            by_repeat[key][d.get("repeat_idx") or 0] = d
+        for key, per_rep in by_repeat.items():
+            recs = [per_rep[k] for k in sorted(per_rep)]
+            scores = [r["score"] for r in recs if r.get("score") is not None]
+            judges[key] = {"last": recs[-1], "scores": scores, "n_repeats": len(recs)}
     manifest = _store.load_manifest(run_dir)
     return records_by_model, last_by_cell, judges, manifest, run_dir
 
@@ -219,8 +233,8 @@ def main():
                      if not r.get("error") and (r.get("text") or "").strip() and r.get("total_s") is not None]
             if b_tot:
                 baseline_total[mid] = statistics.median(b_tot)
-            b_sc = [j["score"] for (jm, jt), j in b_judges.items()
-                    if jm == mid and j.get("score") is not None]
+            b_sc = [s for (jm, _jt), j in b_judges.items() if jm == mid
+                    for s in j["scores"]]
             if b_sc:
                 baseline_q[mid] = statistics.mean(b_sc)
 
@@ -255,7 +269,13 @@ def main():
                 ttfts_r.append(r["ttft_reasoning_s"])
             if r.get("total_s") is not None:
                 totals.append(r["total_s"])
+        # Quality samples now mirror latency: EVERY judged repeat is a sample
+        # (`scores`), so the bootstrap CI below is a real repeat-based interval
+        # rather than a spread across different tasks. `task_means` keeps one
+        # value per task so quality_avg weights tasks equally regardless of how
+        # many repeats each happened to complete.
         scores: list[float] = []
+        task_means: list[float] = []
         ok = 0
         empty_text = 0
         errors = []
@@ -271,10 +291,11 @@ def main():
                 continue
             ok += 1
             j = judges.get((mid, tid))
-            if j and j.get("score") is not None:
-                scores.append(j["score"])
+            if j and j["scores"]:
+                scores.extend(j["scores"])
+                task_means.append(statistics.mean(j["scores"]))
         total_p50 = statistics.median(totals) if totals else None
-        quality_avg = statistics.mean(scores) if scores else None
+        quality_avg = statistics.mean(task_means) if task_means else None
         # Regression flags vs baseline (idea 16/18).
         regressed = False
         if mid in baseline_total and total_p50 is not None and baseline_total[mid] > 0:
@@ -311,13 +332,17 @@ def main():
             "total_p90": statistics.quantiles(totals, n=10, method="inclusive")[8] if len(totals) >= 5 else None,
             "quality_avg": quality_avg,
             "quality_ci": bootstrap_ci(scores, repeats),
+            # Judged samples (all repeats) and how many TASKS they cover — the
+            # two are different denominators and are reported separately.
             "quality_n": len(scores),
+            "quality_tasks": len(task_means),
             # Coverage-penalized quality: a model that answered 2/8 tasks at Q5
-            # should NOT outrank a stable 8/8 model at Q4.6. Used for ranking;
-            # quality_avg is still shown verbatim (with a '*' when partial).
+            # should NOT outrank a stable 8/8 model at Q4.6. Coverage is measured
+            # in TASKS (not samples) — with repeats>1 the sample count exceeds the
+            # task count and would inflate the penalty term above 1.
             "quality_eff": (
-                statistics.mean(scores) * len(scores) / len(task_ids)
-                if scores and task_ids else None
+                quality_avg * len(task_means) / len(task_ids)
+                if task_means and task_ids else None
             ),
             # claude-opus-4-8 is also the judge — its own family's scores are
             # self-assessed and prone to self-preference bias. Flagged with '†'.
@@ -338,10 +363,24 @@ def main():
         lines.append(
             f"**Run:** `{manifest.get('run_id', '?')}` · started {manifest.get('started_at', '?')} · "
             f"git `{(manifest.get('git_sha') or '—')[:12]}` · repeats={manifest.get('repeats', 1)} · "
-            f"seed={manifest.get('seed', 0)}"
+            f"seed={manifest.get('seed', 0)} · status={manifest.get('status', 'unknown')}"
         )
     elif run_dir is None:
         lines.append("**Run:** legacy flat `results/*.jsonl` (no manifest)")
+    # A run dir is created before the first cell, so an interrupted run is
+    # indistinguishable from a finished one unless the lifecycle is checked. Say
+    # so IN THE REPORT — rankings built from a partial matrix used to read as
+    # final.
+    run_state = _store.run_status(run_dir)
+    if run_dir is not None and not run_state["complete"]:
+        lines.append("")
+        lines.append(
+            f"> ⚠️ **Неполный прогон:** run `{run_dir.name}` в статусе "
+            f"`{run_state['status']}` ({run_state['completed_cells']}/"
+            f"{run_state['expected_cells']} ячеек). Таблицы и ранжирование ниже "
+            f"построены на НЕПОЛНОЙ матрице. Дособрать: "
+            f"`python run.py --resume {run_dir.name}`."
+        )
     if run_dates:
         if len(run_dates) == 1:
             lines.append(f"**Даты прогонов (из raw-данных):** {run_dates[0]}")
@@ -357,7 +396,7 @@ def main():
         "семейства `claude_agent` судят сами себя (помечены `†`). Их Q могут быть завышены "
         "из-за self-preference — это правдоподобная гипотеза, но без контрольного judge она "
         "не подтверждена; сравнивать их с другими провайдерами с осторожностью. "
-        "`*` у Q = оценка по неполному покрытию задач (quality_n < задач) — "
+        "`*` у Q = оценка по неполному покрытию задач (quality_tasks < задач) — "
         "ранжирование использует покрытие-взвешенный Q, не сырой средний."
     )
     lines.append("")
@@ -399,6 +438,14 @@ def main():
         "- **CI** — `median [lo–hi]` = 95%-перцентильный bootstrap CI медианы "
         f"(1000 ресемплов, seed {BOOTSTRAP_SEED}); показывается только при repeats≥2 или ≥5 семплах"
     )
+    lines.append(
+        "- **Sampling (latency vs quality):** обе метрики берут ВСЕ повторы. "
+        "Латенси — один семпл на каждую (модель, задача, повтор); качество — одна "
+        "судейская оценка на тот же кортеж (judge оценивает каждый повтор отдельно). "
+        "`quality_n` = число оценённых семплов, `quality_tasks` = сколько ЗАДАЧ они "
+        "покрывают; `Q` усредняется сначала внутри задачи, потом по задачам — чтобы "
+        "задача с бо́льшим числом удачных повторов не весила больше остальных."
+    )
     lines.append(f"- Параметры запросов: `temperature=0.2`, `max_tokens={max_output_tokens}` (Ollama: `num_predict={max_output_tokens * 2}`)")
     lines.append("- Запуск последовательный (не параллельный — чтобы не искажать TTFT rate-limit'ами)")
     lines.append("- Источники: `bench/run.py` (раннер), `bench/judge.py` (judge), `bench/results/*.jsonl` (сырые данные)")
@@ -424,8 +471,8 @@ def main():
             q = fmt_ci(r["quality_avg"], r.get("quality_ci"))
         else:
             q = "—"
-        if r["quality_avg"] is not None and r["quality_n"] < r["n"]:
-            q += "*"  # partial coverage
+        if r["quality_avg"] is not None and r.get("quality_tasks", 0) < r["n"]:
+            q += "*"  # partial TASK coverage (repeats inflate quality_n)
         if r.get("self_judged"):
             q += "†"  # self-judged family
         ok_str = f"{r['ok']}/{r['n']}"
@@ -487,7 +534,9 @@ def main():
             err = r.get("error")
             text = r.get("text") or ""
             h = heuristic(tid, text) if not err else ""
-            score = j.get("score") if j else None
+            # Per-task table shows the LAST repeat's score (one row per cell);
+            # the aggregate tables above use every repeat.
+            score = j["last"].get("score") if j else None
             if err:
                 display = "✗ " + err[:30]
             elif not text.strip():
@@ -536,7 +585,7 @@ def main():
         lines.append("")
         lines.append("**Топ-5 по качеству (покрытие-взвешенному):**")
         for r in by_quality:
-            mark = ("*" if r["quality_n"] < r["n"] else "") + ("†" if r.get("self_judged") else "")
+            mark = ("*" if r.get("quality_tasks", 0) < r["n"] else "") + ("†" if r.get("self_judged") else "")
             lines.append(
                 f"- `{r['id']}` — quality {r['quality_avg']:.2f}{mark} "
                 f"(eff {r['quality_eff']:.2f}), TTFT p50 {fmt_s_unit(r['ttft_p50'])}"

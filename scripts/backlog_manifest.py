@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Private backlog lifecycle manifest + stale reminder.
 
-FINDINGS.md and IDEAS.md are gitignored (private working notes); FINDINGS-archive.md
-(and IDEAS-archive.md) are the tracked audit trail. Nothing tracked the LIFECYCLE
-of the open items — which are still open, and which have gone stale. This script
-scans those files, builds a status manifest, and flags any still-open item older
-than the stale horizon (default 90 days) so it doesn't silently rot.
+All four backlog files — FINDINGS.md, IDEAS.md and their `-archive.md` siblings —
+are gitignored private working notes (see .gitignore and backlog/README.md; this
+is a PUBLIC repo and every one of them can name internal hosts/projects/people).
+The archives are the local audit trail of what was consciously turned down, not a
+tracked one. Nothing tracked the LIFECYCLE of the open items — which are still
+open, and which have gone stale. This script scans those files, builds a status
+manifest, and flags any still-open item older than the stale horizon (default 90
+days) so it doesn't silently rot.
 
 It writes `backlog/manifest.json` (gitignored — it echoes private titles) and
 prints a summary + the stale list. Run it from a cron / MonthlyStratReview, or

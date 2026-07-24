@@ -19,6 +19,7 @@ CODEX = Path(__file__).resolve().parents[1] / "codex-agent-server" / "server.py"
 # Functions that MUST be code-identical in both servers.
 IDENTICAL_FUNCS = [
     "_load_dotenv",
+    "_child_env_allowlist",
     "_child_env_without_secrets",
     "build_tools_system_prompt",
     "parse_tool_calls",
@@ -28,7 +29,7 @@ IDENTICAL_FUNCS = [
 ]
 
 # Module constants that must match.
-IDENTICAL_CONSTS = ["_SECRET_ENV_SUFFIXES", "_SECRET_ENV_SUBSTRINGS"]
+IDENTICAL_CONSTS = ["_CHILD_ENV_ALLOWLIST", "_CHILD_ENV_PASSTHROUGH_VAR"]
 
 
 def _tree(path: Path) -> ast.Module:

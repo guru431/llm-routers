@@ -1,10 +1,12 @@
 ﻿# Install Codex Agent Server as a Windows Scheduled Task (auto-start on boot).
 #
-# ⚠️ If a central task-registry/syncer manages this scheduled task on your machine,
-#    do NOT register it by hand here: re-registering drifts from the registry and the
-#    next sync reverts it. Change the schedule/delay/restart in your registry and
-#    re-sync instead. Use this script only for a STANDALONE deploy with no such
-#    central task management.
+# ⚠️ OWNERSHIP — ONE rule, no exceptions:
+#    If a central task-registry/syncer exists on the machine, THE REGISTRY OWNS
+#    THIS TASK. Do not register it by hand: re-registering drifts from the
+#    registry and the next sync reverts it. Declare the task in the registry
+#    (including LogonType/schedule/delay/restart) and run the syncer.
+#    This script is for a STANDALONE host with NO central task management —
+#    that is its only supported use.
 #
 # Usage:
 #   .\install_task.ps1                                  # interactive (asks for password)
@@ -24,9 +26,12 @@
 #   schtasks /end /tn \codex_agent_server
 #   schtasks /run /tn \codex_agent_server
 #
-# NOTE: like claude_agent_server, this task is managed separately from any
-# central task registry (LogonType=Password; the registry syncer does not
-# store passwords). Do NOT add it to such a registry.
+# (The old note here claimed the opposite of the ⚠️ block above — that this task
+# must always be managed outside a central registry because the syncer can't
+# store a Password logon. It is removed: a syncer that supports Password logons
+# owns this task like any other, and having two contradictory rules is exactly
+# how a managed host ends up with the configuration drift the registry exists to
+# prevent.)
 
 param(
     [switch]$Uninstall,
