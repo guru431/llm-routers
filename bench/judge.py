@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -255,7 +256,6 @@ def _exec_parse_duration(code: str) -> bool | None:
 def deterministic_score(task: dict, text: str, exec_code: bool) -> tuple[int, bool] | None:
     """Objective score for a response, or None → defer to the LLM panel."""
     tid = task["id"]
-    cat = task["category"]
     t = text.strip()
     if not t:
         return (0, False)
@@ -329,21 +329,14 @@ def deterministic_score(task: dict, text: str, exec_code: bool) -> tuple[int, bo
             return (2, False)
         return None  # single line → LLM judges correctness
 
-    # T2/T3 — summarization. Bullet count is a format CAP, not a score: any
-    # non-zero wrong count used to force exactly 3/5 regardless of content, so a
-    # single nonsense bullet scored the same as a near-perfect 4-bullet summary
-    # and never reached the semantic judge at all. Now the wrong count only marks
-    # the format failure; the LLM still scores the content, and score_pair caps
-    # the result.
-    if cat == "summarization":
-        want = (task.get("expected") or {}).get("bullets", 5)
-        bullets = re.findall(r"^\s*(?:[-•*]|\d+[.)])\s", text, flags=re.MULTILINE)
-        n = len(bullets)
-        if n == 0:
-            return None  # prose / no recognizable bullets → LLM
-        if n != want:
-            return None  # format miss recorded via format_cap below → LLM scores
-        return None  # exact count → coverage needs LLM
+    # T2/T3 — summarization has NO deterministic score on purpose. Bullet count
+    # is a format CAP, not a score: a non-zero wrong count used to force exactly
+    # 3/5 regardless of content, so a single nonsense bullet scored the same as a
+    # near-perfect 4-bullet summary and never reached the semantic judge at all.
+    # The count is now handled solely by `format_cap` (which caps the LLM score);
+    # coverage is always the LLM's call. Nothing to compute here — falling
+    # through to the implicit `return None` is the whole behaviour.
+    return None
 
 
 def format_cap(task: dict, text: str) -> tuple[int, str] | None:
@@ -361,19 +354,25 @@ def format_cap(task: dict, text: str) -> tuple[int, str] | None:
             return (3, f"format: {n} bullets, expected {want}")
     return None
 
-    return None
-
 
 def adjudicate(scores: list[int]) -> tuple[int, bool]:
-    """Median of judge scores (even count → rounded mean of the two middles) plus
-    a disagreement flag when the spread (max-min) is >= 3."""
+    """Median of judge scores plus a disagreement flag.
+
+    Even judge count → mean of the two middles, rounded HALF UP (`floor(x+0.5)`).
+    Plain `round()` is banker's rounding: it sends (2,3) down to 2 but (3,4) up
+    to 4, i.e. a systematic asymmetry on exactly the split pairs a panel exists
+    to resolve. Half-up is one explicit, documented rule instead.
+
+    Disagreement threshold scales with the panel: with 2 judges a spread of 3 on
+    a 0-5 scale only fires on 0-3/1-4/2-5 (near-never), so a 2-judge panel flags
+    at >= 2. Three or more judges keep the >= 3 threshold."""
     s = sorted(scores)
     n = len(s)
     if n % 2 == 1:
         med = s[n // 2]
     else:
-        med = round((s[n // 2 - 1] + s[n // 2]) / 2)
-    disagree = (s[-1] - s[0]) >= 3
+        med = math.floor((s[n // 2 - 1] + s[n // 2]) / 2 + 0.5)
+    disagree = (s[-1] - s[0]) >= (2 if n <= 2 else 3)
     return med, disagree
 
 
@@ -473,6 +472,10 @@ def main():
     run_dir = _store.resolve_run_dir(args.run)
     result_files = _store.result_files(run_dir)
     judge_file = _store.judge_file(run_dir)
+    # Record the panel that actually scores this run. report.py reads it back for
+    # the header and the self-judge marker; without it the report always claimed
+    # the legacy single judge no matter what --judges was set to.
+    _store.update_manifest(run_dir, judge_panel=list(JUDGE_MODELS))
     sys.stderr.write(f"Scoring {'run ' + run_dir.name if run_dir else 'flat results/'} "
                      f"({len(result_files)} model files)\n")
     # A run dir exists from before its first cell, so an interrupted run looks

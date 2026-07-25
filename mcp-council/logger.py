@@ -73,6 +73,7 @@ def log_call(
     status: str,
     log_dump: str | None,
     tool: str = "council_ask",
+    web_search: dict | None = None,
 ) -> None:
     """Append one JSONL summary record to logs/council_YYYY-MM-DD.log.
 
@@ -80,6 +81,9 @@ def log_call(
     log_dump = relative path to the full dump (or None on hard failure before any dump).
     tool = which MCP tool produced this record ("council_ask" default; callers
         pass "model_ask" etc. so log analysis can split by tool).
+    web_search = optional {calls, ok, blocked, cost_usd} aggregate. `model_ask`
+        writes no full dump, so without this its Exa spend and DLP blocks were
+        recorded nowhere at all.
     """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / f"council_{datetime.now().strftime('%Y-%m-%d')}.log"
@@ -96,6 +100,8 @@ def log_call(
         "status": status,
         "log_dump": log_dump,
     }
+    if web_search is not None:
+        record["web_search"] = web_search
 
     with log_path.open("a", encoding="utf-8") as f:
         # `status` carries provider error text, which can echo a key-bearing URL.

@@ -650,7 +650,7 @@ def cluster_findings(critic_records: list[dict]) -> list[dict]:
 
 
 def pick_verifiers(
-    finding: dict, members: list[dict], k: int
+    finding: dict, members: list[dict], k: int, *, angle_offset: int = 0
 ) -> list[tuple[dict, dict]]:
     """Choose k (member, angle) pairs to attack `finding`.
 
@@ -662,6 +662,14 @@ def pick_verifiers(
     Falls back to raisers only when there are not enough other members; those
     picks are flagged `self_review` in the record so the report never presents a
     model confirming its own claim as independent corroboration.
+
+    `angle_offset` rotates which refutation angles are used. Without it the angle
+    was picked purely by the verifier's position within a finding, so the default
+    `verifiers_per_finding=2` meant EVERY finding in EVERY run was attacked by
+    the same two angles (`does-not-reproduce`, `already-handled`) and the other
+    three were dead code — while the docs sell the five-angle set as the point of
+    the mode. Callers pass the finding index, so a run covers all five at the
+    same call budget.
     """
     raiser_ids = set(finding["raised_by_models"])
     raiser_domains = set(finding["raised_by_domains"])
@@ -697,7 +705,7 @@ def pick_verifiers(
         _take(fallback)
 
     return [
-        (m, REFUTE_ANGLES[i % len(REFUTE_ANGLES)])
+        (m, REFUTE_ANGLES[(angle_offset + i) % len(REFUTE_ANGLES)])
         for i, m in enumerate(picked[:k])
     ]
 
@@ -1031,7 +1039,11 @@ async def run_critique(
 
         tasks = []
         for idx, finding in enumerate(to_verify):
-            for member, angle in pick_verifiers(finding, members, verifiers_per_finding):
+            # angle_offset=idx — rotate the attack angles across findings so a
+            # run with the default 2 verifiers still exercises all five.
+            for member, angle in pick_verifiers(
+                finding, members, verifiers_per_finding, angle_offset=idx,
+            ):
                 tasks.append(_verify_wrap(idx, finding, member, angle))
         verifiers = list(await asyncio.gather(*tasks)) if tasks else []
 

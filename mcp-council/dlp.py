@@ -40,7 +40,15 @@ _SECRET_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
     ("bearer header", re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._-]{20,}")),
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}\b")),
     ("private key header", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
-    ("generic api_key=…", re.compile(r"(?i)\b(?:api[_-]?key|secret|password|passwd|token)\s*[=:]\s*\S{8,}")),
+    # Generic `key: <value>`. The value must LOOK like a credential — no
+    # whitespace, >=8 chars, and containing BOTH a letter and a digit. A bare
+    # `\S{8,}` also matched prose like "token: [REDACTED]", "password: см. вики"
+    # or "api_key: unavailable", which blocked legitimate searches and masked
+    # ordinary log lines under the same rule.
+    ("generic api_key=…", re.compile(
+        r"(?i)\b(?:api[_-]?key|secret|password|passwd|token)\s*[=:]\s*"
+        r"(?=[^\s]*[A-Za-z])(?=[^\s]*\d)[^\s]{8,}"
+    )),
 )
 
 # Sensitive absolute paths a model should never be searching the web for — these

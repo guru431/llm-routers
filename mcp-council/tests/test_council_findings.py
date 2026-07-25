@@ -52,9 +52,35 @@ def test_classify_risk_matches_russian_questions(question):
 @pytest.mark.parametrize("question", [
     "какой шрифт выбрать для заголовков",
     "как отсортировать список в python",
+    # Frequency corpus: ordinary technical phrasing that the broad Cyrillic stems
+    # (прод\w* / ключ\w* / доступ\w* / удал\w* / затр\w* / auth\w*) all matched.
+    # With every one of these classified `high`, human_review_required was a
+    # constant and the gate measured nothing.
+    "Как лучше продолжить рефакторинг парсера?",
+    "Какие ключевые метрики выбрать для дашборда?",
+    "Что доступно в новой версии библиотеки?",
+    "продукт готов к релизу?",
+    "это затронет другие модули?",
+    "какие затраты на CI",
+    "правильно ли я понял задачу",
+    "как продумать структуру каталогов",
+    "кто автор этой библиотеки",
+    "who is the author of this paper",
 ])
 def test_classify_risk_normal_questions_stay_normal(question):
     assert _classify_risk(question) == "normal"
+
+
+@pytest.mark.parametrize("question", [
+    "сбросить пароль пользователя",
+    "как удалить старые записи",
+    "деплой на продакшн",
+    "как настроить удалённый доступ по ssh",  # "доступ" is the marker, not "удалённый"
+])
+def test_classify_risk_narrowed_stems_still_catch_real_risk(question):
+    """Narrowing the stems must not blunt the gate: the destructive / secret /
+    deploy forms these lookaheads were written around still classify high."""
+    assert _classify_risk(question) == "high"
 
 
 def test_classify_risk_still_matches_english():
@@ -273,6 +299,10 @@ async def test_adaptive_usage_accumulates_across_passes():
     )
     attempts = result["adaptive"]["attempts"]
     assert len(attempts) >= 2, "escalation should record a pass per run"
-    # Cumulative: the final total is at least the first pass's own spend.
+    # The top-level usage is the TOTAL across probes + every pass …
     assert result["usage"]["llm_calls"] >= attempts[0]["usage"]["llm_calls"]
-    assert result["usage"]["llm_calls"] == attempts[-1]["usage"]["llm_calls"]
+    # … and the attempts trail is PER-PASS, so the rows sum to that total. It
+    # used to carry the running total in every row, which made each escalation
+    # look as expensive as the whole operation.
+    assert sum(a["usage"]["llm_calls"] for a in attempts) == result["usage"]["llm_calls"]
+    assert attempts[-1]["usage"]["llm_calls"] < result["usage"]["llm_calls"]

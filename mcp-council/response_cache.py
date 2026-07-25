@@ -158,23 +158,27 @@ class ResponseCache:
         Returns (value, provenance_dict_or_None). provenance is non-None on a hit.
         A compute() exception propagates to every waiter and is NOT cached.
         """
-        prov = self.provenance(key)
-        if prov is not None:
-            self.hits += 1
-            return self._store[key].value, prov
+        while True:
+            prov = self.provenance(key)
+            if prov is not None:
+                self.hits += 1
+                return self._store[key].value, prov
 
-        # Singleflight: if an identical run is already in flight, await it.
-        inflight = self._inflight.get(key)
-        if inflight is not None:
+            # Singleflight: if an identical run is already in flight, await it.
+            inflight = self._inflight.get(key)
+            if inflight is None:
+                break
             try:
                 value = await inflight
             except asyncio.CancelledError:
                 if not inflight.cancelled():
                     raise  # THIS task was cancelled — propagate our own.
                 # The owner was cancelled; a waiter must not inherit that. The
-                # owner already removed the key, so this retry takes the owner
-                # path and computes for real.
-                return await self.get_or_compute(key, compute)
+                # owner already removed the key, so looping round takes the owner
+                # path (or picks up a newer in-flight run) and computes for real.
+                # A loop, not recursion: a key whose owners keep getting
+                # cancelled would otherwise grow the stack one frame per retry.
+                continue
             # Served off a concurrent computation — count as a hit and attach
             # provenance if the winner cached it.
             self.hits += 1

@@ -133,18 +133,31 @@ def estimate_run(
 
     Per round: n stage-1 + n stage-2 calls; ×rounds; +1 synthesis. web_search can
     add up to a few extra stage-1 turns per member (estimated at +2 per member per
-    round). Returns expected calls / tokens / minutes and, when a per-token
-    reference price is given, a reference-PAYG dollar estimate (NOT billed spend —
-    council members are flat-rate; this mirrors usage.reference_payg_cost_usd).
+    round) — those turns are sequential within a member, so they count toward
+    `expected_minutes` as well as toward the call/token totals. Returns expected
+    calls / tokens / minutes and, when a per-token reference price is given, a
+    reference-PAYG dollar estimate (NOT billed spend — council members are
+    flat-rate; this mirrors usage.reference_payg_cost_usd).
     """
     per_round = 2 * n_members
-    web_extra = (2 * n_members * rounds) if web_search else 0
+    # ~2 extra tool turns per member per round when searching.
+    web_turns_per_member = 2 if web_search else 0
+    web_extra = web_turns_per_member * n_members * rounds
     calls = per_round * rounds + (1 if synthesis else 0) + web_extra
     tokens_in = calls * _EST_TOKENS_IN_PER_CALL
     tokens_out = calls * _EST_TOKENS_OUT_PER_CALL
     # Stage 1 and stage 2 within a round run concurrently, so wall-time ≈ the
-    # sequential sum of round latencies, not the per-call sum.
-    est_minutes = round((_EST_SECONDS_PER_CALL * 2 * rounds + (_EST_SECONDS_PER_CALL if synthesis else 0)) / 60.0, 1)
+    # sequential sum of round latencies, not the per-call sum. The web_search
+    # turns, however, are SEQUENTIAL INSIDE a member (tool loop: answer → search
+    # → answer), so they add to the critical path — leaving them out understated
+    # the estimate in the one mode that is slowest, which is the mode the caller
+    # most needs the estimate for.
+    est_seconds = (
+        _EST_SECONDS_PER_CALL * 2 * rounds
+        + (_EST_SECONDS_PER_CALL if synthesis else 0)
+        + _EST_SECONDS_PER_CALL * web_turns_per_member * rounds
+    )
+    est_minutes = round(est_seconds / 60.0, 1)
     ref_cost = None
     if price_in is not None or price_out is not None:
         ref_cost = round(

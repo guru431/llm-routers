@@ -312,7 +312,7 @@ def test_model_ask_happy_path(monkeypatch):
     """model_ask wires sandbox + run_single + logger."""
     monkeypatch.setenv("DEEPSEEK_KEY", "fake")
 
-    async def fake_run_single(cfg, *, prompt, max_tokens, web_search=False):
+    async def fake_run_single(cfg, *, prompt, max_tokens, web_search=False, **kw):
         assert cfg["id"] == "deepseek-flash"
         assert "the question" in prompt
         return "answer text"
@@ -339,7 +339,7 @@ def test_model_ask_with_context_and_examples(monkeypatch, tmp_path):
 
     captured = {}
 
-    async def fake_run_single(cfg, *, prompt, max_tokens, web_search=False):
+    async def fake_run_single(cfg, *, prompt, max_tokens, web_search=False, **kw):
         captured["prompt"] = prompt
         return "ok"
 

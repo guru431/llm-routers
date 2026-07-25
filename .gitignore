@@ -48,3 +48,8 @@ bench/results/
 # Agent-side backlog files (private to maintainer, never published)
 FINDINGS-archive.md
 IDEAS-archive.md
+
+# Generated bench report. The LIVING document (with hand-written addenda) is kept
+# outside this repo; `python bench/report.py` without --out drops a copy here that
+# would immediately diverge from it — and this repo is public.
+LLM_MODELS_BENCH_*.md

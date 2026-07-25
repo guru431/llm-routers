@@ -8,12 +8,16 @@ would then read the new target — the sandbox boundary held for the object that
 was checked, not for the object that was read.
 
 So the boundary lives in `read_files_with_limit()` now: it opens each file ONCE
-and re-runs every guard against what it actually opened — the file descriptor
-(regular-file check via `fstat`) and the bytes it actually read (private-key
-sniff, binary sniff, size), plus the path guards (deny-list, allowed roots). A
-swap after validation therefore can't smuggle content past the checks; the
-worst case is a rejected read. `resolve_and_validate()` stays the early,
-cheap-failure gate (and the count/ordering contract its callers rely on).
+and re-runs the guards there — the deny-list and the allowed roots against the
+path, `fstat` on the descriptor (regular file), the bytes actually read
+(private-key sniff, binary sniff, size), and an identity pin that ties the two
+together: `(st_dev, st_ino)` from the path check must equal `fstat` of the
+descriptor. A swap BEFORE the path check is caught by that check (it inspects
+the new target); a swap AFTER it is caught by the identity pin. Note the path
+guards remain path-based — a descriptor cannot be mapped back to a path
+portably — so the pin, not `O_NOFOLLOW`, is what makes them hold.
+`resolve_and_validate()` stays the early, cheap-failure gate (and the
+count/ordering contract its callers rely on).
 """
 
 import os
@@ -190,19 +194,25 @@ def _has_secret_header(p: Path) -> bool:
     return _has_secret_header_bytes(chunk)
 
 
-def resolve_and_validate(paths: list[str]) -> list[Path]:
+def resolve_and_validate(paths: list[str], *, already_validated: int = 0) -> list[Path]:
     """Нормализовать и провалидировать список путей. Возвращает list[Path].
 
     Порядок результата соответствует порядку входных paths (consumers, например
     server._do_draft, опираются на этот invariant для разделения context/examples).
 
+    `already_validated` — сколько файлов уже прошло валидацию в ЭТОМ же вызове
+    tool'а (model_ask валидирует context_paths и example_paths двумя вызовами).
+    Лимит считается по сумме, чтобы потолок оставался здесь, а не дублировался
+    ручной проверкой на стороне вызывающего.
+
     Raises:
         SandboxError если: количество > MAX_FILE_COUNT, путь в blacklist,
         путь не существует или не является файлом.
     """
-    if len(paths) > MAX_FILE_COUNT:
+    total = len(paths) + already_validated
+    if total > MAX_FILE_COUNT:
         raise SandboxError(
-            f"file count limit exceeded: {len(paths)} > {MAX_FILE_COUNT}"
+            f"file count limit exceeded: {total} > {MAX_FILE_COUNT}"
         )
     roots = _allowed_roots()
     # Fail-closed: with no allowed roots and no explicit opt-out, refuse to read
@@ -293,15 +303,23 @@ def read_files_with_limit(paths: list[Path]) -> list[tuple[Path, str]]:
 
     Порядок результата соответствует порядку входных paths.
 
-    Каждый файл открывается РОВНО ОДИН раз, и ВСЕ гарантии проверяются по этому
-    открытию, а не по отдельному stat()/open():
+    Каждый файл открывается РОВНО ОДИН раз, и проверки применяются к этому
+    открытию:
       * `fstat` на дескрипторе — обычный ли это файл (не каталог/устройство);
-      * deny-list и allowed roots — по пути, который открыли;
+      * deny-list и allowed roots — ПО ПУТИ (`is_blocked`, `resolve()`), потому
+        что связать открытый дескриптор обратно с путём кроссплатформенно
+        нельзя;
+      * identity-pin — `(st_dev, st_ino)` файла, по которому проверялся путь,
+        сверяется с `fstat` открытого дескриптора: если между проверкой пути и
+        `open` подставили другой объект (symlink/junction swap), содержимое
+        наружу не уходит;
       * private-key sniff и binary sniff — по прочитанным байтам;
       * размер — по фактически прочитанным байтам (read budget+1).
-    Это и закрывает TOCTOU-окно: подмена пути на symlink/junction после
-    `resolve_and_validate` не даёт прочитать чужой файл — проверки применяются
-    к содержимому, которое уходит наружу. Декодирование BOM-aware.
+
+    Гарантия ровно такая: подмена ДО проверки пути ловится самой проверкой
+    (проверяется новая цель), подмена ПОСЛЕ неё — identity-pin'ом. `O_NOFOLLOW`
+    не используется намеренно: на Windows его нет, а на POSIX он сломал бы
+    легитимно симлинкнутые workspace'ы. Декодирование BOM-aware.
 
     Raises SandboxError при нарушении любого из правил.
     """
@@ -314,13 +332,14 @@ def read_files_with_limit(paths: list[Path]) -> list[tuple[Path, str]]:
         # name/dir-segment rules in case the path changed since validation.
         if is_blocked(str(p)):
             raise SandboxError(f"blocked by sandbox: {p}")
+        try:
+            st_path = os.stat(str(p))  # follows links — the object the path names NOW
+        except OSError as e:
+            raise SandboxError(f"cannot read file: {p} ({e})")
         if roots and not _within_allowed_roots(Path(p).resolve(), roots):
             raise SandboxError(
                 f"path outside allowed roots ({_CONTEXT_ROOTS_ENV}): {p}"
             )
-        # O_NOFOLLOW is deliberately NOT used: it doesn't exist on Windows and
-        # would break legitimately symlinked workspaces. The guarantee comes from
-        # checking the OPENED object instead of the path.
         try:
             fd = os.open(str(p), os.O_RDONLY | getattr(os, "O_BINARY", 0))
         except OSError as e:
@@ -329,6 +348,14 @@ def read_files_with_limit(paths: list[Path]) -> list[tuple[Path, str]]:
             st = os.fstat(fd)
             if not _stat.S_ISREG(st.st_mode):
                 raise SandboxError(f"not a regular file: {p}")
+            # Identity pin: the object we opened must be the one whose path just
+            # passed the deny-list / roots checks. st_ino is populated on Windows
+            # too (0 only on filesystems that can't report it — then this check
+            # degrades to st_dev, which is the pre-existing behaviour).
+            if st_path.st_ino and (st.st_dev, st.st_ino) != (st_path.st_dev, st_path.st_ino):
+                raise SandboxError(
+                    f"file changed identity between validation and read: {p}"
+                )
             # Read one byte past the remaining budget so overflow is detected
             # from the bytes actually read — no separate stat() involved.
             raw = _read_fd(fd, remaining + 1)

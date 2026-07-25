@@ -82,17 +82,29 @@ def pick_starting_subset(
 def should_escalate(summary: dict | None) -> tuple[bool, str]:
     """Decide whether to add the held-back members after the first pass.
 
-    Escalate when the cheap first pass did NOT reach a corroborated, confident
-    verdict: no quorum, low agreement, an unresolved high-risk topic needing more
-    independent eyes, or a live top disagreement. Returns (escalate, reason)."""
+    Escalate only on deficits MORE MEMBERS CAN FIX: no quorum, low agreement, an
+    incomplete ranking, mean/Borda disagreement, or a live top disagreement.
+
+    `human_review_required` is deliberately NOT a trigger, even though it reads
+    like the obvious one. It ORs in `risk_class == "high"`, which depends on the
+    question's wording and on nothing the council does — no number of extra
+    members ever clears it. Gating on the aggregate meant every question the risk
+    classifier called high (i.e. most of them, before the pattern was narrowed)
+    deterministically burned a second full pass — exactly the cost adaptive mode
+    exists to avoid — while the trail reported it as a corroboration deficit.
+    Risk stays a reason for a HUMAN to look, not a reason to re-run the council.
+
+    Returns (escalate, reason)."""
     if not summary:
         return True, "no summary from first pass"
     if not summary.get("quorum_ok"):
         return True, "first pass not independently corroborated (no quorum)"
     if summary.get("agreement_confidence") == "low":
         return True, "low agreement in first pass"
-    if summary.get("human_review_required"):
-        return True, "first pass flagged human_review_required"
+    if summary.get("incomplete_rankings"):
+        return True, "a ranker skipped peers in first pass (incomplete rankings)"
+    if summary.get("ranking_methods_agree") is False:
+        return True, "mean and Borda winners disagree in first pass"
     if summary.get("top_disagreements"):
         return True, "unresolved disagreement in first pass"
     return False, "first pass reached a corroborated, confident verdict"

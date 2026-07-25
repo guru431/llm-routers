@@ -889,7 +889,7 @@ def _compute_usage(
     tokens; the loop_* aggregates (summed across every tool-loop iteration) are
     used instead when present, so multi-turn members aren't undercounted.
     """
-    calls = tin = tout = retries = web = 0
+    calls = tin = tout = retries = web = web_ok = 0
     cost = 0.0
     web_cost = 0.0
     priced_calls = 0
@@ -903,7 +903,7 @@ def _compute_usage(
         return rec.get("id") or rec.get("ranker_id") or rec.get("chairman_id")
 
     def _acc(rec: dict) -> None:
-        nonlocal calls, tin, tout, retries, web, cost, web_cost, priced_calls
+        nonlocal calls, tin, tout, retries, web, web_ok, cost, web_cost, priced_calls
         # Prefer the tool-loop aggregates for web_search members (calls/tokens/
         # attempts summed across every iteration); fall back to the single-call
         # figures for plain (non-web) members.
@@ -932,7 +932,12 @@ def _compute_usage(
         tin += rec_in
         tout += rec_out
         tool_log = rec.get("tool_calls_log") or []
+        # `web_search_calls` counts ATTEMPTS to use the tool — including failed
+        # and DLP-blocked ones. `web_search_ok` counts the ones that actually
+        # returned results, so a run whose searches were all blocked is no longer
+        # indistinguishable from one that searched successfully.
         web += len(tool_log)
+        web_ok += sum(1 for e in tool_log if isinstance(e, dict) and e.get("ok"))
         for entry in tool_log:
             if not isinstance(entry, dict):
                 continue
@@ -980,7 +985,10 @@ def _compute_usage(
         "llm_calls": calls,
         "tokens_in": tin,
         "tokens_out": tout,
+        # Attempts to invoke the tool (errors + DLP blocks included) …
         "web_search_calls": web,
+        # … and how many of them returned results.
+        "web_search_ok": web_ok,
         "web_search_cache_hits": search_cache.hits if search_cache is not None else 0,
         "web_search_cost_usd": round(web_cost, 6),
         "retries": retries,
@@ -1021,20 +1029,34 @@ def _council_failure_reason(error: str | None) -> str:
 # токен" classify as `normal` and earn human_review_required=false while their
 # English equivalents were gated. Cyrillic stems use the same \b + \w* form —
 # Python's `re` is Unicode-aware for str patterns, so \w covers Cyrillic.
+#
+# The Russian stems are NARROWED with negative lookaheads. A bare `прод\w*` /
+# `ключ\w*` / `доступ\w*` / `удал\w*` also matched "продолжить", "ключевой",
+# "доступно", "удалённый" — the most ordinary words in a technical question. The
+# gate then returned `high` for nearly every Russian prompt, so
+# `human_review_required` became a constant and the recommendation was stuck on
+# "HIGH-RISK … do NOT auto-adopt". A gate that fires always discriminates never;
+# the point is to keep it firing on the destructive/secret/money questions only.
+# Same for English `auth\w*`, which matched "author".
 _HIGH_RISK_PATTERN = re.compile(
     r"\b(security|vulnerab\w*|exploit|cve|credential\w*|password|secret|token|"
     r"delete|drop\s+table|truncate|rm\s+-rf|migrat\w*|production|prod|deploy\w*|"
     r"payment|money|financ\w*|billing|invoice|irreversible|data[\s-]*loss|"
-    r"encrypt\w*|auth\w*|permission\w*|privilege\w*|rotate\s+key|"
+    r"encrypt\w*|auth(?!or)\w*|permission\w*|privilege\w*|rotate\s+key|"
     # --- Russian: security / secrets ---
+    # ключ(?!ев) — "ключ/ключи/ключом", not "ключевой/ключевые".
+    # доступ(?!н)  — "доступ/доступа", not "доступно/доступный".
     r"безопасност\w*|уязвим\w*|эксплойт\w*|взлом\w*|парол\w*|секрет\w*|токен\w*|"
-    r"учётн\w*|учетн\w*|доступ\w*|прав[ао]\w*|привилег\w*|аутентифик\w*|"
-    r"авториз\w*|шифр\w*|ключ\w*|ротаци\w*|"
+    r"учётн\w*|учетн\w*|доступ(?!н)\w*|прав[ао]\w*|привилег\w*|аутентифик\w*|"
+    r"авториз\w*|шифр\w*|ключ(?!ев)\w*|ротаци\w*|"
     # --- Russian: destructive / irreversible ---
-    r"удал\w*|снос\w*|сброс\w*|очист\w*|затр\w*|перезапис\w*|дроп\w*|"
-    r"необрати\w*|безвозвратн\w*|потер\w*\s+данн\w*|"
+    # удал(?![её]нн) — "удалить/удаление/удаляем", not "удалённый/удаленный".
+    # затрёт/затирание only — a bare затр\w* swallowed "затронуть"/"затраты".
+    r"удал(?![её]нн)\w*|снос\w*|сброс\w*|очист\w*|затр[её]т\w*|затира\w*|"
+    r"перезапис\w*|дроп\w*|необрати\w*|безвозвратн\w*|потер\w*\s+данн\w*|"
     # --- Russian: prod / migrations / deploy ---
-    r"прод\w*|боев\w*|миграц\w*|деплой\w*|развёртыв\w*|развертыв\w*|"
+    # прод(?:акш\w*)? + \b — "прод/проде/продакшн", not "продолжить/продукт".
+    r"прод(?:акш\w*)?|боев\w*|миграц\w*|деплой\w*|развёртыв\w*|развертыв\w*|"
     # --- Russian: money ---
     r"платёж\w*|платеж\w*|деньг\w*|финанс\w*|биллинг\w*|счёт\w*|оплат\w*)\b",
     re.IGNORECASE,
@@ -1886,8 +1908,8 @@ async def run_adaptive_council(
     `usage_offset`. The returned `usage` is therefore the TOTAL across probes and
     every attempt, and the budget guard inside the final pass sees that total —
     without this a 2-pass escalation could spend ~2× its `max_llm_calls` ceiling
-    while both the guard and the report saw only the last pass. Per-pass figures
-    stay visible in `adaptive.attempts`."""
+    while both the guard and the report saw only the last pass. `adaptive.attempts`
+    carries the PER-PASS figures (total minus what was already spent)."""
     members = members if members is not None else resolve_members(None)
     call_fn = call_fn or call_openai_compat
     adaptive_notes: list[str] = []
@@ -1903,6 +1925,25 @@ async def run_adaptive_council(
                 continue
             cur = spent.get(k)
             spent[k] = (cur + v) if isinstance(cur, (int, float)) else v
+
+    def _numeric(u: dict) -> dict:
+        return {k: v for k, v in u.items()
+                if isinstance(v, (int, float)) and not isinstance(v, bool)}
+
+    def _pass_delta(total: dict, before: dict) -> dict:
+        """This pass's OWN spend = reported total − what was already spent.
+
+        `run_council` folds `usage_offset` into the usage it reports, so the raw
+        figure is a running total. Putting that straight into the attempts trail
+        made every escalation look like it cost as much as the whole operation,
+        and the per-pass breakdown could not be recovered afterwards — while the
+        `healthcheck` row in the same list WAS per-pass, so the entries weren't
+        even comparable. Now every row is per-pass."""
+        out = {}
+        for k, v in _numeric(total).items():
+            b = before.get(k)
+            out[k] = v - b if isinstance(b, (int, float)) and not isinstance(b, bool) else v
+        return out
 
     if healthcheck:
         rows = await healthcheck_models([m["id"] for m in members], call_fn=call_fn)
@@ -1959,10 +2000,9 @@ async def run_adaptive_council(
     pass_usage = result.get("usage") or {}
     attempts_usage.append({
         "pass": f"subset:{sorted(used_ids)}",
-        "usage": {k: v for k, v in pass_usage.items() if isinstance(v, (int, float))},
+        "usage": _pass_delta(pass_usage, spent),
     })
-    spent = {k: v for k, v in pass_usage.items()
-             if isinstance(v, (int, float)) and not isinstance(v, bool)}
+    spent = _numeric(pass_usage)
 
     escalation_trail: list[dict] = []
     escalations = 0
@@ -1983,10 +2023,9 @@ async def run_adaptive_council(
         pass_usage = result.get("usage") or {}
         attempts_usage.append({
             "pass": f"escalation:{sorted(used_ids)}",
-            "usage": {k: v for k, v in pass_usage.items() if isinstance(v, (int, float))},
+            "usage": _pass_delta(pass_usage, spent),
         })
-        spent = {k: v for k, v in pass_usage.items()
-                 if isinstance(v, (int, float)) and not isinstance(v, bool)}
+        spent = _numeric(pass_usage)
         escalations += 1
 
     result.setdefault("notes", [])
@@ -1997,8 +2036,8 @@ async def run_adaptive_council(
         "starting_subset": sorted(start_ids),
         "final_members": sorted(used_ids),
         "escalations": escalation_trail,
-        # Cumulative usage after each pass (probes first). The top-level `usage`
-        # is the total; these show where it went.
+        # PER-PASS usage (probes first), not a running total — each row is what
+        # that pass alone cost. The top-level `usage` is the sum.
         "attempts": attempts_usage,
     }
     return result

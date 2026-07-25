@@ -103,6 +103,24 @@ def judge_file(run_dir: Path | None) -> Path:
     return base / "_judge.jsonl"
 
 
+def update_manifest(run_dir: Path | None, **fields) -> None:
+    """Merge `fields` into a run's manifest.json. No-op for the flat layout.
+
+    judge.py records the ACTIVE judge panel through this, so report.py can name
+    the judges that actually scored the run instead of printing the legacy
+    default in the header of every report."""
+    if run_dir is None:
+        return
+    data = load_manifest(run_dir) or {}
+    data.update(fields)
+    try:
+        (run_dir / "manifest.json").write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        pass  # a read-only/archived run dir must not fail the judging pass
+
+
 def load_manifest(run_dir: Path | None) -> dict | None:
     """Parse manifest.json from a run dir, or None (flat layout / missing/broken)."""
     if run_dir is None:

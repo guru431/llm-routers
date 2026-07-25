@@ -254,9 +254,13 @@ _write_locks: "dict[str, threading.Lock]" = {}
 _write_locks_meta = threading.Lock()
 
 
-# Ceiling on the per-session lock table. Sessions are never explicitly
+# SOFT ceiling on the per-session lock table. Sessions are never explicitly
 # unregistered here (the dump can outlive the session object), so without this
 # the dict grows for the lifetime of the process — one dead entry per session.
+# Soft, not hard: only IDLE locks are evictable (see _write_lock_for), so if
+# every entry is held the table is allowed to exceed the limit rather than hand
+# a concurrent writer a fresh lock for a session already being written. Bounded
+# in practice by MAX_ACTIVE_SESSIONS concurrent writers.
 _MAX_WRITE_LOCKS = 256
 
 

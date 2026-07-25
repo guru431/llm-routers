@@ -12,6 +12,7 @@ import os
 import time
 from urllib.parse import urlparse
 
+from dlp import redact_secrets
 from models import CATALOG, UnknownModelError
 from openai_client import call_openai_compat
 
@@ -107,10 +108,18 @@ async def _check_one(mid: str, cfg: dict, call_fn, timeout: float) -> dict:
         # Always return a dict so asyncio.gather (no return_exceptions) never
         # sees a raise: any non-cancellation failure (HTTP, unexpected probe
         # error) becomes this model's status row and the other probes survive.
+        #
+        # Redact BEFORE the text is classified or handed back: an HTTP library
+        # can echo the full request URL (possibly carrying `api_key=`) or an
+        # Authorization header into the exception text, and this row goes
+        # straight to the MCP client. The council path already redacts the same
+        # class of error — the same provider failure must not be safe there and
+        # leaky here.
+        msg = redact_secrets(str(e))
         return {**base, "enabled": True, "key_present": True, "ok": False,
-                "status": _classify_error(str(e)),
+                "status": _classify_error(msg),
                 "latency_ms": int((time.monotonic() - start) * 1000),
-                "error": str(e)}
+                "error": msg}
 
     return {**base, "enabled": True, "key_present": True, "ok": True,
             "status": "ok", "latency_ms": int((time.monotonic() - start) * 1000),

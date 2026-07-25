@@ -7,12 +7,15 @@ Reads:
     bench/results/_judge.jsonl
 
 Writes:
-    LLM_MODELS_BENCH_2026-05-15.md  (repo root)
+    the markdown report to `--out`, else $BENCH_REPORT_OUT, else
+    LLM_MODELS_BENCH_2026-05-15.md in the repo root (gitignored — the living
+    document with hand-written addenda is kept outside this public repo).
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
 import statistics
@@ -26,7 +29,16 @@ MODELS_JSON = ROOT / "models.json"
 TASKS_JSON = ROOT / "prompts" / "tasks.json"
 RESULTS = ROOT / "results"
 JUDGE_FILE = RESULTS / "_judge.jsonl"
-OUT = ROOT.parent / "LLM_MODELS_BENCH_2026-05-15.md"
+# Where the report is written. The LIVING document (with hand-written addenda)
+# lives outside this repo, so the destination is configurable: `--out` wins, then
+# $BENCH_REPORT_OUT, then a copy inside the repo. The in-repo default is
+# gitignored on purpose — regenerating a report must not push a second, diverging
+# copy into a PUBLIC repository.
+OUT = Path(os.environ.get("BENCH_REPORT_OUT") or (ROOT.parent / "LLM_MODELS_BENCH_2026-05-15.md"))
+
+# Judge panel assumed when the run's manifest carries none (legacy runs judged
+# before judge.py started recording `judge_panel`).
+DEFAULT_JUDGE_PANEL = ["claude-opus-4-8"]
 
 # Regression thresholds vs a baseline run (ideas 16 & 18).
 LATENCY_REGRESSION_PCT = 25      # median latency grew by more than this % → flag
@@ -97,6 +109,91 @@ def bootstrap_ci(samples: list[float], repeats: int,
         return meds[max(0, min(len(meds) - 1, idx))]
 
     return (pct(lo), pct(hi))
+
+
+def bootstrap_ci_task_mean(groups: list[list[float]], repeats: int,
+                           lo: float = 2.5, hi: float = 97.5,
+                           seed: int = BOOTSTRAP_SEED,
+                           resamples: int = BOOTSTRAP_RESAMPLES) -> tuple[float, float] | None:
+    """Hierarchical percentile bootstrap CI for the MEAN OF TASK MEANS.
+
+    `groups` is one inner list of judge scores per TASK. Each resample redraws
+    tasks with replacement and, inside every drawn task, redraws its repeats —
+    mirroring exactly how `quality_avg` is computed (average within a task, then
+    across tasks).
+
+    This replaced a flat `bootstrap_ci(all_scores)`, which reported the CI of the
+    MEDIAN of one pooled sample: a different estimator than the mean shown next
+    to it, and one dominated by between-TASK variance — i.e. precisely the
+    "spread across tasks" the per-repeat judging was meant to stop reporting.
+    """
+    n = len(groups)
+    if n < 2:
+        return None
+    total = sum(len(g) for g in groups)
+    if not (repeats >= 2 or total >= 5):
+        return None
+    rng = random.Random(seed)
+    means: list[float] = []
+    for _ in range(resamples):
+        acc = 0.0
+        for _ in range(n):
+            g = groups[rng.randrange(n)]
+            k = len(g)
+            acc += sum(g[rng.randrange(k)] for _ in range(k)) / k
+        means.append(acc / n)
+    means.sort()
+
+    def pct(p: float) -> float:
+        idx = int(round(p / 100 * (len(means) - 1)))
+        return means[max(0, min(len(means) - 1, idx))]
+
+    return (pct(lo), pct(hi))
+
+
+def task_score_groups(judges: dict, model_id: str, task_ids: list[str]) -> list[list[float]]:
+    """Per-task judge scores for one model: one inner list per task with scores.
+
+    The single place both the current run and the `--baseline` run go through, so
+    the two quality numbers compared by the regression gate are the SAME
+    statistic. The baseline used to be a flat mean over every score (weighting a
+    task by how many repeats it happened to complete) while the current run
+    averaged per task first — so the ⚠️REGRESSION flag could fire purely because
+    the repeat count changed."""
+    groups = []
+    for tid in task_ids:
+        j = judges.get((model_id, tid))
+        if j and j.get("scores"):
+            groups.append(list(j["scores"]))
+    return groups
+
+
+def quality_from_groups(groups: list[list[float]]) -> float | None:
+    """mean(task means) — the Q shown in the table."""
+    if not groups:
+        return None
+    return statistics.mean([statistics.mean(g) for g in groups])
+
+
+def self_judged(model: dict, panel: list[str]) -> bool:
+    """True when a benched model is (or is family of) one of the ACTUAL judges.
+
+    Derived from the panel recorded in the manifest instead of a hardcoded
+    `provider == "claude_agent"`: with `--judges` the judge can be any model, and
+    the old test both mis-flagged claude models judged by someone else and missed
+    a real self-judge from another family."""
+    names = {str(model.get("id") or "").lower(), str(model.get("model") or "").lower()}
+    names.discard("")
+    for jm in panel:
+        j = str(jm).lower().strip()
+        if not j:
+            continue
+        if j in names:
+            return True
+        family = j.split("-")[0]
+        if family and any(family in n for n in names):
+            return True
+    return False
 
 
 def fmt_ci(median_val, ci, unit: str = "") -> str:
@@ -205,7 +302,8 @@ def main():
     ap = argparse.ArgumentParser(description="Generate the markdown benchmark report.")
     ap.add_argument("--run", help="run id / run dir / manifest.json to report (default: latest run)")
     ap.add_argument("--baseline", help="run id / run dir / manifest.json to flag regressions against")
-    ap.add_argument("--out", help="output markdown path (default: repo-root LLM_MODELS_BENCH_2026-05-15.md)")
+    ap.add_argument("--out", help="output markdown path (default: $BENCH_REPORT_OUT, else the "
+                                  "gitignored repo-root LLM_MODELS_BENCH_2026-05-15.md)")
     args = ap.parse_args()
     out_path = Path(args.out) if args.out else OUT
 
@@ -222,6 +320,9 @@ def main():
     records_by_model, results, judges, manifest, run_dir = load_run(args.run)
     repeats = int(manifest.get("repeats", 1)) if manifest else 1
 
+    # Judges that actually scored this run (recorded by judge.py in the manifest).
+    judge_panel = (manifest or {}).get("judge_panel") or DEFAULT_JUDGE_PANEL
+
     baseline_q: dict[str, float] = {}
     baseline_total: dict[str, float] = {}
     baseline_dir = None
@@ -233,10 +334,11 @@ def main():
                      if not r.get("error") and (r.get("text") or "").strip() and r.get("total_s") is not None]
             if b_tot:
                 baseline_total[mid] = statistics.median(b_tot)
-            b_sc = [s for (jm, _jt), j in b_judges.items() if jm == mid
-                    for s in j["scores"]]
-            if b_sc:
-                baseline_q[mid] = statistics.mean(b_sc)
+            # Same estimator as the current run (mean of task means) — see
+            # task_score_groups.
+            b_q = quality_from_groups(task_score_groups(b_judges, mid, task_ids))
+            if b_q is not None:
+                baseline_q[mid] = b_q
 
     # Actual run-date span of the loaded raw records (ts = "YYYY-MM-DDT..."). The
     # report title/filename is a fixed 2026-05-15 snapshot, so surface when the
@@ -269,13 +371,10 @@ def main():
                 ttfts_r.append(r["ttft_reasoning_s"])
             if r.get("total_s") is not None:
                 totals.append(r["total_s"])
-        # Quality samples now mirror latency: EVERY judged repeat is a sample
-        # (`scores`), so the bootstrap CI below is a real repeat-based interval
-        # rather than a spread across different tasks. `task_means` keeps one
-        # value per task so quality_avg weights tasks equally regardless of how
-        # many repeats each happened to complete.
-        scores: list[float] = []
-        task_means: list[float] = []
+        # Quality: EVERY judged repeat is a sample, grouped BY TASK. quality_avg
+        # averages within a task first, then across tasks, so a task with more
+        # completed repeats does not weigh more; the CI bootstraps that same
+        # two-level structure (see bootstrap_ci_task_mean).
         ok = 0
         empty_text = 0
         errors = []
@@ -290,12 +389,11 @@ def main():
                 empty_text += 1
                 continue
             ok += 1
-            j = judges.get((mid, tid))
-            if j and j["scores"]:
-                scores.extend(j["scores"])
-                task_means.append(statistics.mean(j["scores"]))
+        groups = task_score_groups(judges, mid, task_ids)
+        scores = [s for g in groups for s in g]
+        task_means = [statistics.mean(g) for g in groups]
         total_p50 = statistics.median(totals) if totals else None
-        quality_avg = statistics.mean(task_means) if task_means else None
+        quality_avg = quality_from_groups(groups)
         # Regression flags vs baseline (idea 16/18).
         regressed = False
         if mid in baseline_total and total_p50 is not None and baseline_total[mid] > 0:
@@ -331,7 +429,7 @@ def main():
             "total_ci": bootstrap_ci(totals, repeats),
             "total_p90": statistics.quantiles(totals, n=10, method="inclusive")[8] if len(totals) >= 5 else None,
             "quality_avg": quality_avg,
-            "quality_ci": bootstrap_ci(scores, repeats),
+            "quality_ci": bootstrap_ci_task_mean(groups, repeats),
             # Judged samples (all repeats) and how many TASKS they cover — the
             # two are different denominators and are reported separately.
             "quality_n": len(scores),
@@ -344,9 +442,10 @@ def main():
                 quality_avg * len(task_means) / len(task_ids)
                 if task_means and task_ids else None
             ),
-            # claude-opus-4-8 is also the judge — its own family's scores are
-            # self-assessed and prone to self-preference bias. Flagged with '†'.
-            "self_judged": m["provider"] == "claude_agent",
+            # A model from the judging panel's own family scores itself — prone
+            # to self-preference bias. Flagged with '†'. Derived from the panel
+            # actually used for this run, not a hardcoded provider.
+            "self_judged": self_judged(m, judge_panel),
             "errors": errors,
             "regressed": regressed,
         })
@@ -358,7 +457,9 @@ def main():
     lines.append(f"**Запущен с:** локальная Windows-машина")
     lines.append(f"**Моделей:** {len(rows)} ({sum(1 for r in rows if not r.get('skip'))} активных)")
     lines.append(f"**Задач:** {len(tasks)} (RU-edit, YT-summary EN/RU, JSON-extract, RU→EN translate, classify, bash one-liner, Python function)")
-    lines.append(f"**Judge:** claude-opus-4-8 (через agent server, температура 0)")
+    judge_str = ", ".join(f"`{j}`" for j in judge_panel)
+    panel_note = "" if (manifest or {}).get("judge_panel") else " (панель не записана в manifest — предполагается дефолтная)"
+    lines.append(f"**Judge:** {judge_str} (через agent server, температура 0){panel_note}")
     if manifest:
         lines.append(
             f"**Run:** `{manifest.get('run_id', '?')}` · started {manifest.get('started_at', '?')} · "
@@ -392,8 +493,8 @@ def main():
             )
     lines.append("")
     lines.append(
-        "> ⚠️ **Self-judge bias (гипотеза, не измерено):** judge — claude-opus-4-8, и модели "
-        "семейства `claude_agent` судят сами себя (помечены `†`). Их Q могут быть завышены "
+        f"> ⚠️ **Self-judge bias (гипотеза, не измерено):** judge — {judge_str}, и модели "
+        "того же семейства судят сами себя (помечены `†`). Их Q могут быть завышены "
         "из-за self-preference — это правдоподобная гипотеза, но без контрольного judge она "
         "не подтверждена; сравнивать их с другими провайдерами с осторожностью. "
         "`*` у Q = оценка по неполному покрытию задач (quality_tasks < задач) — "
@@ -435,8 +536,13 @@ def main():
     lines.append("- **Quality (0-5)** — LLM-as-judge по рубрикам категории (rubric на каждую категорию см. `bench/judge.py::RUBRIC`)")
     lines.append("- **OK** — задач с непустым финальным `text` (reasoning-only ответы считаются empty)")
     lines.append(
-        "- **CI** — `median [lo–hi]` = 95%-перцентильный bootstrap CI медианы "
-        f"(1000 ресемплов, seed {BOOTSTRAP_SEED}); показывается только при repeats≥2 или ≥5 семплах"
+        "- **CI (латенси)** — `median [lo–hi]` = 95%-перцентильный bootstrap CI МЕДИАНЫ "
+        f"({BOOTSTRAP_RESAMPLES} ресемплов, seed {BOOTSTRAP_SEED}); показывается только при repeats≥2 или ≥5 семплах"
+    )
+    lines.append(
+        "- **CI (Q)** — интервал для ТОЙ ЖЕ величины, что в колонке: среднее по задачам. "
+        "Иерархический bootstrap (ресемпл задач, внутри задачи — ресемпл повторов), "
+        "поэтому это интервал среднего, а не медианы общего пула оценок"
     )
     lines.append(
         "- **Sampling (latency vs quality):** обе метрики берут ВСЕ повторы. "

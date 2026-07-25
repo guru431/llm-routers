@@ -1685,6 +1685,7 @@ class Handler(BaseHTTPRequestHandler):
         finish_reason = "stop"
         usage = dict(base_usage)
         disconnected = False
+        emitted_chars = 0
         try:
             emit({"role": "assistant"})
             item = first_item
@@ -1692,6 +1693,7 @@ class Handler(BaseHTTPRequestHandler):
                 kind, payload = item
                 if kind == "text":
                     if payload:
+                        emitted_chars += len(payload)
                         emit({"content": payload})
                 elif kind == "meta":
                     meta = payload or {}
@@ -1715,7 +1717,10 @@ class Handler(BaseHTTPRequestHandler):
             # indistinguishable from a completed answer.
             METRICS.inc("timeouts")
             METRICS.inc("killed_processes")
-            logger.error("live stream failed after %d chars: %s", len(str(usage)), e)
+            # emitted_chars, not len(str(usage)): the message says "chars", and
+            # the length of a stringified usage dict is unrelated to how much of
+            # the answer actually reached the client before the run died.
+            logger.error("live stream failed after %d chars: %s", emitted_chars, e)
             try:
                 emit({}, finish="error", usage=usage)
                 self.wfile.write(

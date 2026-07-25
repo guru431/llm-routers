@@ -10,6 +10,7 @@ Exposes two flavours of the council deliberation:
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import string
 import sys
@@ -816,12 +817,18 @@ async def _run_job(
     web_search: bool,
     members: list[dict],
     context_in_stage2: bool = True,
+    *,
+    adaptive: bool = False,
+    deadline_seconds: float | None = None,
+    max_cost_usd: float | None = None,
+    max_web_searches: int | None = None,
 ) -> None:
     """Background entry point — runs the council and stores the result on state."""
     start = time.monotonic()
     call_id = _new_call_id()
     prompt_size = 0
     log_dump_rel: str | None = None
+    budget = _make_budget(deadline_seconds, max_cost_usd, max_web_searches, None)
     # Built inside the try so a setup failure (open_writer mkdir/open) marks the
     # job terminal (error) and frees its MAX_ACTIVE_JOBS slot, instead of letting
     # the exception escape _run_job and leave the job stuck non-terminal until TTL.
@@ -839,17 +846,31 @@ async def _run_job(
             prompt_for_size = (files_section or "") + question
             prompt_size = len(prompt_for_size.encode("utf-8"))
 
-            result = await run_council(
-                question=question,
-                files_section=files_section,
-                max_response_tokens=max_tokens,
-                synthesis=synthesis,
-                rounds=rounds,
-                web_search=web_search,
-                members=members,
-                on_progress=on_progress,
-                context_in_stage2=context_in_stage2,
-            )
+            if adaptive:
+                result = await run_adaptive_council(
+                    question, members=members, healthcheck=True,
+                    files_section=files_section,
+                    max_response_tokens=max_tokens,
+                    synthesis=synthesis,
+                    rounds=rounds,
+                    web_search=web_search,
+                    on_progress=on_progress,
+                    context_in_stage2=context_in_stage2,
+                    budget=budget,
+                )
+            else:
+                result = await run_council(
+                    question=question,
+                    files_section=files_section,
+                    max_response_tokens=max_tokens,
+                    synthesis=synthesis,
+                    rounds=rounds,
+                    web_search=web_search,
+                    members=members,
+                    on_progress=on_progress,
+                    context_in_stage2=context_in_stage2,
+                    budget=budget,
+                )
         except asyncio.CancelledError:
             # cancel_job intentionally leaves phase alone now (it used to set
             # phase='cancelled' eagerly and could overwrite an in-flight
@@ -977,6 +998,10 @@ async def council_ask_async(
     models: list[str] | None = None,
     models_preset: str | None = None,
     context_in_stage2: bool = True,
+    adaptive: bool = False,
+    deadline_seconds: float | None = None,
+    max_cost_usd: float | None = None,
+    max_web_searches: int | None = None,
 ) -> dict:
     """Start a council deliberation in the background and return a job_id
     immediately (within ~50ms). Poll progress with `council_status(job_id)`
@@ -994,6 +1019,14 @@ async def council_ask_async(
     `models_preset` — str | None. "full" | "diverse-3" | "fast-2-single-provider"
         (descriptive, not a quality ranking) instead of a hand-listed `models`
         (mutually exclusive). Legacy best/balanced/cheap still accepted as aliases.
+
+    `adaptive` — health-filter + start-small-escalate, same as council_ask.
+    `deadline_seconds` / `max_cost_usd` / `max_web_searches` — run-budget. These
+        matter MORE here than on the blocking call: the async path is the one the
+        docs recommend for long runs, and without them a background run had no
+        wall-time or spend ceiling at all — only a manual `council_cancel`.
+        `cache` stays blocking-only (a cache hit is instant, so there is nothing
+        to background).
     """
     # Validate + resolve BEFORE creating job state, so bad inputs fail fast
     # (a bad rounds reaching the background task would otherwise leave the job
@@ -1011,6 +1044,8 @@ async def council_ask_async(
         _run_job(
             state, question, context_paths or [], max_response_tokens,
             synthesis, rounds, web_search, members, context_in_stage2,
+            adaptive=adaptive, deadline_seconds=deadline_seconds,
+            max_cost_usd=max_cost_usd, max_web_searches=max_web_searches,
         )
     )
     job_state.attach_task(state, task)
@@ -1187,11 +1222,15 @@ async def _do_critique_async(
     deadline_seconds: float | None = None,
     max_cost_usd: float | None = None,
     max_web_searches: int | None = None,
-) -> str:
-    """Validate paths, read files, run the critique, log, return markdown.
+) -> tuple[str, dict | None, dict | None]:
+    """Validate paths, read files, run the critique, log, return
+    (markdown, usage, summary).
 
     Shared by the blocking tool and the background job so both go through exactly
-    one sandbox + audit path.
+    one sandbox + audit path. The background job needs `usage`/`summary` too —
+    returning only markdown left `council_result` reporting usage=None,
+    summary=None for every async critique, forcing automation that branches on
+    `findings_kept` / `panel_quorum_ok` to parse the markdown back.
     """
     start = time.monotonic()
     call_id = _new_call_id()
@@ -1232,7 +1271,7 @@ async def _do_critique_async(
             total_latency_ms=int((time.monotonic() - start) * 1000),
             status="ok", log_dump=str(dump_path.relative_to(Path(__file__).parent)),
         )
-        return format_critique_markdown(subject, result)
+        return format_critique_markdown(subject, result), result.get("usage"), summary
     except SandboxError as e:
         log_call(
             call_id=call_id, members_total=len(lens_ids), members_ok_stage1=0,
@@ -1344,12 +1383,13 @@ async def council_critique(
         models, models_preset, lenses, lenses_preset, verifiers_per_finding,
         max_verified_findings,
     )
-    return await _do_critique_async(
+    markdown, _usage, _summary = await _do_critique_async(
         subject, context_paths or [], max_response_tokens, members, lens_ids,
         verifiers_per_finding, max_verified_findings, web_search,
         deadline_seconds=deadline_seconds, max_cost_usd=max_cost_usd,
         max_web_searches=max_web_searches,
     )
+    return markdown
 
 
 async def _run_critique_job(
@@ -1362,6 +1402,10 @@ async def _run_critique_job(
     verifiers_per_finding: int,
     max_verified_findings: int,
     web_search: bool,
+    *,
+    deadline_seconds: float | None = None,
+    max_cost_usd: float | None = None,
+    max_web_searches: int | None = None,
 ) -> None:
     """Background entry point for council_critique_async.
 
@@ -1373,10 +1417,12 @@ async def _run_critique_job(
     try:
         on_progress = _make_progress_callback(state)
         try:
-            markdown = await _do_critique_async(
+            markdown, usage, summary = await _do_critique_async(
                 subject, context_paths, max_response_tokens, members, lens_ids,
                 verifiers_per_finding, max_verified_findings, web_search,
                 on_progress=on_progress,
+                deadline_seconds=deadline_seconds, max_cost_usd=max_cost_usd,
+                max_web_searches=max_web_searches,
             )
         except asyncio.CancelledError:
             job_state.mark_phase(state, "cancelled")
@@ -1388,6 +1434,10 @@ async def _run_critique_job(
             on_progress("result_ready", {"status": "error", "error": state.error})
             return
         state.result_markdown = markdown
+        # Same fields council_ask_async fills, so council_status / council_result
+        # answer the same shape for both job kinds.
+        state.usage = usage
+        state.summary = summary
         job_state.mark_phase(state, "done")
         try:
             on_progress("result_ready", {"status": "ok"})
@@ -1425,12 +1475,21 @@ async def council_critique_async(
     max_verified_findings: int = 24,
     max_response_tokens: int = 8192,
     web_search: bool = False,
+    deadline_seconds: float | None = None,
+    max_cost_usd: float | None = None,
+    max_web_searches: int | None = None,
 ) -> dict:
     """Запустить `council_critique` в фоне и сразу вернуть job_id.
 
     Прогресс — `council_status(job_id)` (критики видны как stage1, верификаторы
-    как stage2), результат — `council_result(job_id)` при phase == "done".
-    Отмена — `council_cancel(job_id)`. Тот же job-store, что у council_ask_async.
+    как stage2), результат — `council_result(job_id)` при phase == "done"
+    (вместе с `usage` и `summary`). Отмена — `council_cancel(job_id)`. Тот же
+    job-store, что у council_ask_async.
+
+    `deadline_seconds` / `max_cost_usd` / `max_web_searches` — тот же run-budget,
+    что у блокирующего `council_critique`. Фоновый прогон длиннее блокирующего,
+    поэтому именно здесь потолки и нужны: без них единственным ограничителем
+    оставался ручной `council_cancel`.
     """
     members, lens_ids = _resolve_critique_args(
         models, models_preset, lenses, lenses_preset, verifiers_per_finding,
@@ -1443,6 +1502,8 @@ async def council_critique_async(
         _run_critique_job(
             state, subject, context_paths or [], max_response_tokens, members,
             lens_ids, verifiers_per_finding, max_verified_findings, web_search,
+            deadline_seconds=deadline_seconds, max_cost_usd=max_cost_usd,
+            max_web_searches=max_web_searches,
         )
     )
     job_state.attach_task(state, task)
@@ -1526,6 +1587,32 @@ def _build_files_sections(
     return "\n\n".join(parts)
 
 
+def _web_search_audit(tool_log: list[dict]) -> dict | None:
+    """Compact per-call web_search aggregate for the audit log, or None if the
+    call did no searching. model_ask writes no full dump, so this line is the
+    only record that a paid Exa query (or a DLP block) happened."""
+    if not tool_log:
+        return None
+    paid: set[str] = set()
+    cost = 0.0
+    for e in tool_log:
+        if not isinstance(e, dict):
+            continue
+        c = e.get("cost_dollars")
+        q = e.get("query")
+        nq = " ".join(str(q).strip().lower().split()) if q else None
+        if isinstance(c, (int, float)) and (nq is None or nq not in paid):
+            if nq is not None:
+                paid.add(nq)
+            cost += c
+    return {
+        "calls": len(tool_log),
+        "ok": sum(1 for e in tool_log if isinstance(e, dict) and e.get("ok")),
+        "blocked": sum(1 for e in tool_log if isinstance(e, dict) and e.get("dlp_blocked")),
+        "cost_usd": round(cost, 6),
+    }
+
+
 @mcp.tool()
 async def model_ask(
     model_id: str,
@@ -1534,6 +1621,7 @@ async def model_ask(
     example_paths: list[str] | None = None,
     max_response_tokens: int = 4096,
     web_search: bool = False,
+    max_web_searches: int | None = None,
 ) -> str:
     """Дёрнуть ОДНУ конкретную модель из CATALOG напрямую (без council deliberation).
 
@@ -1552,6 +1640,11 @@ async def model_ask(
       example_paths — sandbox-файлы стиля, прокидываются как STYLE EXAMPLES.
       max_response_tokens — default 4096, hard cap 16384.
       web_search — если True, даёт модели Exa-based web_search(query) tool.
+      max_web_searches — потолок оплаченных (distinct) Exa-запросов на вызов;
+        None → дефолт MAX_RUN_SEARCHES. Раньше у этого пути потолка не было
+        вообще: run-cap живёт в RunSearchCache, который создавался только в
+        council/critique. Стоимость и DLP-блокировки пишутся в audit-строку
+        (`web_search` в logs/council_*.log) — полного дампа у model_ask нет.
     """
     start = time.monotonic()
     call_id = _new_call_id()
@@ -1563,8 +1656,9 @@ async def model_ask(
 
         # Enforce the 50-file / 500 KB sandbox limit across context + example
         # COMBINED, not per-list (reading each list independently doubled the
-        # documented budget). resolve_and_validate caps count per call, so add
-        # an explicit combined count check, then read both lists through one
+        # documented budget). The count ceiling lives inside resolve_and_validate
+        # (`already_validated` carries the first list's count into the second),
+        # so it isn't restated here; then read both lists through one
         # byte-budgeted pass and split the result back by count.
         # Blocking disk I/O — offload off the event loop.
         validated_ctx = (
@@ -1572,14 +1666,14 @@ async def model_ask(
             if context_paths else []
         )
         validated_ex = (
-            await asyncio.to_thread(resolve_and_validate, example_paths)
+            await asyncio.to_thread(
+                functools.partial(
+                    resolve_and_validate, example_paths,
+                    already_validated=len(validated_ctx),
+                )
+            )
             if example_paths else []
         )
-        if len(validated_ctx) + len(validated_ex) > sandbox.MAX_FILE_COUNT:
-            raise SandboxError(
-                f"file count limit exceeded: "
-                f"{len(validated_ctx) + len(validated_ex)} > {sandbox.MAX_FILE_COUNT}"
-            )
         all_files = await asyncio.to_thread(
             read_files_with_limit, validated_ctx + validated_ex
         )
@@ -1594,11 +1688,14 @@ async def model_ask(
         full_prompt = "\n\n".join(full_prompt_parts)
         prompt_size = len(full_prompt.encode("utf-8"))
 
+        tool_log: list[dict] = []
         answer = await run_single(
             cfg,
             prompt=full_prompt,
             max_tokens=max_tokens,
             web_search=web_search,
+            max_web_searches=max_web_searches,
+            tool_log_out=tool_log,
         )
     except SandboxError as e:
         latency_ms = int((time.monotonic() - start) * 1000)
@@ -1628,6 +1725,7 @@ async def model_ask(
         members_ok_stage1=1, members_ok_stage2=0,
         prompt_size_bytes=prompt_size, total_latency_ms=latency_ms,
         status="ok", log_dump=None, tool="model_ask",
+        web_search=_web_search_audit(tool_log),
     )
     return answer
 
