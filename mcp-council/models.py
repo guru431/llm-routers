@@ -48,15 +48,22 @@ CATALOG: dict[str, dict] = {
         "price_out": None,
     },
     "kimi": {
-        "model": "kimi-k2.7-code",
+        # k3 с 2026-07-30 (было k2.7-code; k2.5/k2.6/k2.7-code ещё живы в OCG).
+        # КВОТА: на OCG-подписке k3 стоит 2× usage и даёт 220 запросов/5ч против
+        # 1150 у k2.7-code — для совета (3-4 вызова на участника за прогон) это с
+        # запасом, но в рутинные/цикличные вызовы k3 ставить не стоит: там берите
+        # kimi-k2.7-code явным `models=[...]` или deepseek-flash.
+        "model": "kimi-k3",
         "base_url": OCG,
         "env_key": "OPENCODE_GO_KEY",
         "provider": "opencode-go",
-        # k2.7-code не поддерживает reasoning_effort="none" (HTTP 400, в отличие
-        # от k2.6) — допустимы minimal|low|medium. minimal — ближайшее к none.
-        # k2.7-code (Moonshot) принимает ТОЛЬКО temperature=1 ("invalid
-        # temperature: only 1 is allowed for this model") — overrides council
-        # default 0.3 через extra (payload.update(extra) wins, см. openai_client).
+        # k3 (в отличие от k2.7-code) принимает reasoning_effort="none", но
+        # minimal оставлен намеренно: k3 всё равно генерит reasoning_content,
+        # и minimal — общий знаменатель с остальным семейством.
+        # k3, как и k2.7-code (Moonshot), принимает ТОЛЬКО temperature=1
+        # (проверено: temperature=0.3 → "Upstream request failed") — overrides
+        # council default 0.3 через extra (payload.update(extra) wins,
+        # см. openai_client).
         "extra": {"reasoning_effort": "minimal", "temperature": 1},
         "min_max_tokens": 30000,
         "price_in": None,
@@ -74,7 +81,9 @@ CATALOG: dict[str, dict] = {
         "price_out": 0.87,
     },
     "qwen": {
-        "model": "qwen3.6-plus",
+        # 3.7-plus с 2026-07-30 (3.6-plus ещё живёт в OCG). Рядом есть
+        # qwen3.7-max — в совет не берём, только в bench/models.json.
+        "model": "qwen3.7-plus",
         "base_url": OCG,
         "env_key": "OPENCODE_GO_KEY",
         "provider": "opencode-go",
@@ -106,12 +115,17 @@ CATALOG: dict[str, dict] = {
         # — без него дефолт сервера тоже read-only, но члену совета агентный режим
         # не нужен ни при каких настройках сервера. Сервер должен быть запущен на
         # :8766; CODEX_AGENT_TOKEN передаётся через окружение MCP-сервера.
-        "model": "gpt-5.5",
+        #
+        # Имя модели — то, что принимает Codex CLI НА ПОДПИСКЕ ChatGPT: голые
+        # `gpt-5.6` и `gpt-5.6-codex` отвечают HTTP 400 "not supported when using
+        # Codex with a ChatGPT account", работает суффиксованный `gpt-5.6-sol`.
+        # Значение должно совпадать с whitelist'ом сервера (CODEX_AGENT_MODELS).
+        "model": "gpt-5.6-sol",
         "base_url": "http://127.0.0.1:8766/v1",
         "env_key": "CODEX_AGENT_TOKEN",
         "provider": "codex-agent",
         "extra": {"sandbox": "read-only"},
-        # `codex exec gpt-5.5` is a reasoning model spawned as a subprocess
+        # `codex exec gpt-5.6-sol` is a reasoning model spawned as a subprocess
         # (cold start) — a real POST, not a light /health GET. The default 12s
         # probe almost always ReadTimeouts on a healthy server, so give this
         # local agent-server member a longer healthcheck ceiling.

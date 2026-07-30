@@ -374,7 +374,7 @@ def run_agentic_tests(url, agent_token):
         url,
         [{"role": "user", "content": f"Create a file named {sentinel} with the exact content: codex-was-here. Then stop."}],
         token=agent_token,
-        extra={"model": "gpt-5.5-agent"},
+        extra={"model": "gpt-5.6-sol-agent"},
         timeout=300,
     )
     ok = os.path.isfile(target)
@@ -393,7 +393,7 @@ def run_agentic_tests(url, agent_token):
         url,
         [{"role": "user", "content": "write a.txt"}],
         token=agent_token,
-        extra={"model": "gpt-5.5-agent", "workdir": outside},
+        extra={"model": "gpt-5.6-sol-agent", "workdir": outside},
         timeout=30,
     )
     # Expect an error string from the server (containment 400).

@@ -12,7 +12,7 @@
  * How per-project model selection works:
  *   In each project's .claude/settings.local.json set:
  *     "env": {
- *       "ANTHROPIC_MODEL": "minimax-m3"   // or glm-5.2, qwen3.6-plus, etc.
+ *       "ANTHROPIC_MODEL": "minimax-m3"   // or glm-5.2, qwen3.7-plus, etc.
  *     }
  *   Claude Code extension reads this and puts the model in the request body.
  *   Our router sees it and routes to opencode provider with that exact model id.
@@ -47,12 +47,13 @@
 // purpose — keep THESE TWO copies in sync (config.example.json + this list), not
 // three; see README "Каталог моделей и трассировка".
 const OPENCODE_MODELS_FALLBACK = new Set([
-  'glm-5.2', 'glm-5',
-  'kimi-k2.5', 'kimi-k2.7-code',
-  'mimo-v2-pro', 'mimo-v2-omni', 'mimo-v2.5-pro', 'mimo-v2.5',
-  'minimax-m3', 'minimax-m2.5',
-  'qwen3.6-plus', 'qwen3.5-plus', 'qwen3.7-plus',
+  'glm-5.2',
+  'kimi-k3', 'kimi-k2.7-code',
   'deepseek-v4-pro', 'deepseek-v4-flash',
+  'qwen3.7-max', 'qwen3.7-plus',
+  'minimax-m3',
+  'mimo-v2.5-pro', 'mimo-v2.5',
+  'grok-4.5', 'hy3',
 ]);
 
 // Emit one structured trace line per routing decision. Kept to a single JSON
@@ -99,7 +100,7 @@ module.exports = async function router(req, config) {
     return `opencode,${model}`;
   }
 
-  // Claude name (claude-opus-4-8, claude-sonnet-4-6, claude-haiku-4-5, etc.)
+  // Claude name (claude-opus-5, claude-sonnet-5, claude-haiku-4-5, etc.)
   // → fall back to built-in routing (Router.default / .background / .think etc.).
   // Single-provider deployment: Router.default IS the only fallback by design.
   if (typeof model === 'string' && model.startsWith('claude-')) {

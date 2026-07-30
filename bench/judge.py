@@ -1,6 +1,6 @@
 """LLM-as-judge scoring for benchmark results.
 
-For each (task, model_response) pair, asks claude-opus-4-8 via agent server
+For each (task, model_response) pair, asks claude-opus-5 via agent server
 to score the response 0-5 with brief reasoning. Writes scores to
 bench/results/_judge.jsonl (key: model_id+task_id).
 
@@ -51,7 +51,7 @@ JUDGE_ENDPOINT = (os.environ.get("JUDGE_ENDPOINT") or _vault().get("JUDGE_ENDPOI
 # claude-agent-server refuses requests without a bearer token; the judge runs
 # through it, so send CLAUDE_AGENT_TOKEN (else every call 401s).
 JUDGE_TOKEN = os.environ.get("CLAUDE_AGENT_TOKEN") or _vault().get("CLAUDE_AGENT_TOKEN")
-JUDGE_MODEL = "claude-opus-4-8"
+JUDGE_MODEL = "claude-opus-5"
 
 # Blinded multi-judge panel (idea 17). Default = the single legacy judge, so
 # behaviour and the resp-hash are byte-identical to the old single-judge run.
@@ -455,7 +455,7 @@ def main():
     ap.add_argument("--rescore", action="store_true")
     ap.add_argument("--task", help="filter by task id")
     ap.add_argument("--run", help="run id / run dir / manifest.json to score (default: latest run)")
-    ap.add_argument("--judges", help="comma-separated judge model ids (default: env JUDGE_MODELS or claude-opus-4-8)")
+    ap.add_argument("--judges", help="comma-separated judge model ids (default: env JUDGE_MODELS or claude-opus-5)")
     ap.add_argument("--exec-code", action="store_true",
                     help="run T8 reference cases in a time-boxed subprocess for a deterministic verdict. "
                          "EXECUTES UNTRUSTED MODEL CODE as this user — not a sandbox (no seccomp/chroot/memory cap); "

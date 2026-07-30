@@ -13,12 +13,12 @@ MCP-сервер: Karpathy 3-stage council из 7 LLM с опционально�
 | id | model | provider | env_key |
 |---|---|---|---|
 | glm | glm-5.2 | OpenCode Go | `OPENCODE_GO_KEY` |
-| kimi | kimi-k2.7-code | OpenCode Go | `OPENCODE_GO_KEY` |
+| kimi | kimi-k3 | OpenCode Go | `OPENCODE_GO_KEY` |
 | deepseek-pro | deepseek-v4-pro | OpenCode Go | `OPENCODE_GO_KEY` |
-| qwen | qwen3.6-plus | OpenCode Go | `OPENCODE_GO_KEY` |
+| qwen | qwen3.7-plus | OpenCode Go | `OPENCODE_GO_KEY` |
 | minimax | minimax-m3 | OpenCode Go | `OPENCODE_GO_KEY` |
 | gemini | gemini-3.1-pro-preview | Helicone AI Gateway | `HELICONE_GATEWAY_KEY` |
-| codex | gpt-5.5 | codex-agent-server :8766 (read-only) | `CODEX_AGENT_TOKEN` |
+| codex | gpt-5.6-sol | codex-agent-server :8766 (read-only) | `CODEX_AGENT_TOKEN` |
 
 `deepseek-pro` теперь идёт через OCG-прокси (DeepSeek direct PAYG исчерпан с 2026-06-07). **Provider-домены** (независимые точки отказа): 5 моделей на OCG (`glm`/`kimi`/`deepseek-pro`/`qwen`/`minimax`) делят один ключ и падают вместе → при OCG outage живыми голосами остаются `gemini` (Helicone) и `codex` (локальный codex-agent-server), т.е. **два независимых домена, а не только Gemini**. Именно поэтому council считает distinct provider-домены, а не число имён: `summary.provider_domains`/`single_provider`/`quorum_ok` гейтят «adopt»-вердикт (см. `_build_summary`). См. также `_pick_chairman` — `deepseek-pro` используется как fallback chairman (это предпочтение по доступности внутри дефолтного состава, а НЕ независимый провайдер: он ходит через тот же OCG-шлюз).
 

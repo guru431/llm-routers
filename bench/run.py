@@ -3,7 +3,7 @@
 Usage:
     python run.py                 # full bench: all models x all tasks
     python run.py --smoke         # 1 task x 1 model per provider (sanity check)
-    python run.py --task T4_json_extract --model ocg-minimax-m2.7   # single cell
+    python run.py --task T4_json_extract --model ocg-minimax-m3    # single cell
     python run.py --providers opencode_go,gemini   # subset by provider
 
 Reads:

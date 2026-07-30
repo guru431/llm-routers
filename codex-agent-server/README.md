@@ -70,7 +70,7 @@ restart/host правкой реестра и повторным запуско�
 
 Это даёт два независимых способа выбрать режим:
 
-- **именем модели** — для клиентов, умеющих задавать только строку (CCR, агентные клиенты с `models.json`): `gpt-5.5` (read-only) vs `gpt-5.5-agent` (workspace-write);
+- **именем модели** — для клиентов, умеющих задавать только строку (CCR, агентные клиенты с `models.json`): `gpt-5.6-sol` (read-only) vs `gpt-5.6-sol-agent` (workspace-write);
 - **полем `sandbox` в body** — для клиентов, умеющих добавлять поля (mcp-council через `extra_payload`).
 
 `tools` всегда форсят `read-only`: клиентские OpenAI-функции несовместимы с агентным режимом, где Codex дёргает собственные инструменты.
@@ -112,7 +112,7 @@ curl -X POST http://localhost:8766/v1/chat/completions \
 
 Параметры body:
 - `messages` (required) — массив `{role, content}` (роли `system`/`user`/`assistant`/`tool`).
-- `model` (optional) — `gpt-5.5` или `gpt-5.5-agent` (см. `/v1/models`).
+- `model` (optional) — `gpt-5.6-sol` или `gpt-5.6-sol-agent` (см. `/v1/models`). Имя модели — то, что принимает Codex CLI **на подписке ChatGPT**: голые `gpt-5.6` / `gpt-5.6-codex` отвечают 400 «not supported when using Codex with a ChatGPT account». Предыдущий дефолт `gpt-5.5` остаётся в whitelist.
 - `sandbox` (optional) — `read-only` | `workspace-write` (приоритет 2).
 - `workdir` / `cwd` (optional) — рабочий корень для агентного режима (внутри `CODEX_AGENT_WORKDIR_ROOT`).
 - `tools` (optional) — OpenAI-функции; форсят read-only, парсятся из `<tool_call>` блоков.
@@ -127,7 +127,7 @@ curl -X POST http://localhost:8766/v1/chat/completions \
 
 ```bash
 curl http://localhost:8766/health
-# {"status":"ok","model":"gpt-5.5","default_sandbox":"read-only","default_profile":"chat","profiles":[...],"uptime":3600,"security":"authenticated"}
+# {"status":"ok","model":"gpt-5.6-sol","default_sandbox":"read-only","default_profile":"chat","profiles":[...],"uptime":3600,"security":"authenticated"}
 ```
 
 ### `GET /ready` — readiness probe
@@ -156,7 +156,7 @@ curl -X POST http://localhost:8766/v1/chat/completions \
   -H "Authorization: Bearer $CODEX_AGENT_AGENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-5.5-agent",
+    "model": "gpt-5.6-sol-agent",
     "messages": [{"role":"user","content":"Создай README в корне проекта"}],
     "workdir": "C:/codex-workspace/myrepo"
   }'
@@ -168,8 +168,8 @@ workspace-write требует заданного `CODEX_AGENT_AGENT_TOKEN` (и�
 
 | Переменная | По умолчанию | Описание |
 |---|---|---|
-| `CODEX_AGENT_MODEL` | `gpt-5.5` | модель по умолчанию |
-| `CODEX_AGENT_MODELS` | `gpt-5.5` | базовые id для whitelist (через запятую) |
+| `CODEX_AGENT_MODEL` | `gpt-5.6-sol` | модель по умолчанию |
+| `CODEX_AGENT_MODELS` | `gpt-5.6-sol,gpt-5.5` | базовые id для whitelist (через запятую) |
 | `CODEX_AGENT_DEFAULT_SANDBOX` | `read-only` | дефолт режима |
 | `CODEX_AGENT_PORT` | `8766` | порт |
 | `CODEX_AGENT_HOST` | `127.0.0.1` | bind-адрес |
@@ -214,8 +214,8 @@ workspace-write требует заданного `CODEX_AGENT_AGENT_TOKEN` (и�
 
 | Потребитель | Как выбрать режим |
 |---|---|
-| Агентный клиент | модель `gpt-5.5-agent` + `workdir` |
-| Чат-клиент | модель `gpt-5.5` |
+| Агентный клиент | модель `gpt-5.6-sol-agent` + `workdir` |
+| Чат-клиент | модель `gpt-5.6-sol` |
 | mcp-council | `extra: {"sandbox": "read-only"}` в `models.py::CATALOG` |
 | claude-code-router | provider config; `tools` форсят read-only |
 
@@ -224,7 +224,7 @@ workspace-write требует заданного `CODEX_AGENT_AGENT_TOKEN` (и�
 ```python
 from openai import OpenAI
 client = OpenAI(base_url="http://localhost:8766/v1", api_key="cas-...")
-resp = client.chat.completions.create(model="gpt-5.5", messages=[{"role":"user","content":"Привет"}])
+resp = client.chat.completions.create(model="gpt-5.6-sol", messages=[{"role":"user","content":"Привет"}])
 print(resp.choices[0].message.content)
 ```
 
@@ -257,7 +257,7 @@ required-полей валидируется; при их отсутствии �
 | `tool_choice` | **игнорируется** — CLI не форсит/запрещает конкретный вызов; модель решает сама |
 | `temperature`, `top_p`, `max_tokens`, `n`, `stop` | **игнорируются** — у `codex exec` нет соответствующих ключей |
 
-`usage` — приблизительная оценка токенов (`len // 4`, `estimate:true`) в буферном режиме; в настоящем стриме чистого текста — реальные счётчики из `codex --json`, когда доступны (`estimate:false`). Поля **`usage.sandbox`** — фактический режим исполнения, **`usage.profile`** — активный профиль, **`usage.structured_output`** — если задан `response_format`. Он может отличаться от запрошенной модели: `gpt-5.5-agent` + `tools` реально исполняется как `read-only` (tools форсят read-only), хотя `model` в ответе эхо-отдаёт `gpt-5.5-agent`. Роутеры/логи должны смотреть на `usage.sandbox`, а не на имя модели.
+`usage` — приблизительная оценка токенов (`len // 4`, `estimate:true`) в буферном режиме; в настоящем стриме чистого текста — реальные счётчики из `codex --json`, когда доступны (`estimate:false`). Поля **`usage.sandbox`** — фактический режим исполнения, **`usage.profile`** — активный профиль, **`usage.structured_output`** — если задан `response_format`. Он может отличаться от запрошенной модели: `gpt-5.6-sol-agent` + `tools` реально исполняется как `read-only` (tools форсят read-only), хотя `model` в ответе эхо-отдаёт `gpt-5.6-sol-agent`. Роутеры/логи должны смотреть на `usage.sandbox`, а не на имя модели.
 
 ## Безопасность
 

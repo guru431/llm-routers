@@ -19,8 +19,11 @@ import server
 # ── pure functions ────────────────────────────────────────────────────────
 
 def test_resolve_model_base_and_agent_suffix():
+    assert server.resolve_model("gpt-5.6-sol") == ("gpt-5.6-sol", None)
+    assert server.resolve_model("gpt-5.6-sol-agent") == ("gpt-5.6-sol", "workspace-write")
+    # предыдущий дефолт остаётся в whitelist — уже настроенные клиенты (CCR,
+    # bench/models.json) не должны сломаться от смены дефолта.
     assert server.resolve_model("gpt-5.5") == ("gpt-5.5", None)
-    assert server.resolve_model("gpt-5.5-agent") == ("gpt-5.5", "workspace-write")
     assert server.resolve_model(None) == (server.DEFAULT_MODEL, None)
 
 

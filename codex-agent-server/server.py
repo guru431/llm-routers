@@ -21,8 +21,8 @@ Endpoints:
     4. env CODEX_AGENT_DEFAULT_SANDBOX  → дефолт (read-only)
 
 Env:
-    CODEX_AGENT_MODEL          — модель по умолчанию (default: gpt-5.5)
-    CODEX_AGENT_MODELS         — базовые id для whitelist через запятую (default: gpt-5.5)
+    CODEX_AGENT_MODEL          — модель по умолчанию (default: gpt-5.6-sol)
+    CODEX_AGENT_MODELS         — базовые id для whitelist через запятую (default: gpt-5.6-sol,gpt-5.5)
     CODEX_AGENT_DEFAULT_SANDBOX— дефолт режима (default: read-only)
     CODEX_AGENT_PORT           — порт (default: 8766)
     CODEX_AGENT_HOST           — bind (default: 127.0.0.1)
@@ -166,8 +166,12 @@ SANDBOX_MODES = ("read-only", "workspace-write")
 # still has full host read — see README security section).
 PROFILES = ("chat", "research", "agent")
 
-DEFAULT_MODEL = os.getenv("CODEX_AGENT_MODEL", "gpt-5.5")
-BASE_MODELS = [m.strip() for m in os.getenv("CODEX_AGENT_MODELS", "gpt-5.5").split(",") if m.strip()]
+# `gpt-5.6-sol` — имя, которое Codex CLI принимает на подписке ChatGPT (голые
+# `gpt-5.6`/`gpt-5.6-codex` → 400 "not supported when using Codex with a ChatGPT
+# account"). `gpt-5.5` остаётся в whitelist для уже настроенных клиентов (CCR,
+# bench/models.json), но дефолтом с 2026-07-30 идёт 5.6.
+DEFAULT_MODEL = os.getenv("CODEX_AGENT_MODEL", "gpt-5.6-sol")
+BASE_MODELS = [m.strip() for m in os.getenv("CODEX_AGENT_MODELS", "gpt-5.6-sol,gpt-5.5").split(",") if m.strip()]
 if DEFAULT_MODEL not in BASE_MODELS:
     BASE_MODELS.insert(0, DEFAULT_MODEL)
 

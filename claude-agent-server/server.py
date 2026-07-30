@@ -11,7 +11,7 @@ Endpoints:
     DELETE /cache              — Очистить response cache
 
 Env:
-    CLAUDE_AGENT_MODEL      — модель (default: claude-opus-4-8)
+    CLAUDE_AGENT_MODEL      — модель (default: claude-opus-5)
     CLAUDE_AGENT_PORT       — порт (default: 8765)
     CLAUDE_AGENT_TOKEN      — bearer-токен (ОБЯЗАТЕЛЕН — без него сервер
                               не стартует). Требуется на всех endpoints
@@ -136,8 +136,15 @@ def _child_env_without_secrets(**overrides: str) -> dict:
     return env
 
 
-MODEL = os.getenv("CLAUDE_AGENT_MODEL", "claude-opus-4-8")
+# Дефолт поднят до opus-5 / sonnet-5 (2026-07-30). Предыдущее поколение
+# (4-8/4-6) осталось в whitelist: на нём завязаны строки bench/models.json и
+# уже настроенные клиенты, а `claude -p --model claude-opus-4-8` продолжает
+# работать. Список — то, что реально принимает CLI на текущей подписке;
+# несуществующее имя CLI отклоняет ("issue with the selected model").
+MODEL = os.getenv("CLAUDE_AGENT_MODEL", "claude-opus-5")
 MODELS = [
+    "claude-opus-5",
+    "claude-sonnet-5",
     "claude-opus-4-8",
     "claude-sonnet-4-6",
     "claude-haiku-4-5-20251001",

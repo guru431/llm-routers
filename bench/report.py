@@ -37,7 +37,9 @@ JUDGE_FILE = RESULTS / "_judge.jsonl"
 OUT = Path(os.environ.get("BENCH_REPORT_OUT") or (ROOT.parent / "LLM_MODELS_BENCH_2026-05-15.md"))
 
 # Judge panel assumed when the run's manifest carries none (legacy runs judged
-# before judge.py started recording `judge_panel`).
+# before judge.py started recording `judge_panel`). НЕ трогать при смене
+# judge.py::JUDGE_MODEL: это подпись ИСТОРИЧЕСКИХ прогонов, а те судились
+# claude-opus-4-8. Новые прогоны пишут реальную панель в manifest сами.
 DEFAULT_JUDGE_PANEL = ["claude-opus-4-8"]
 
 # Regression thresholds vs a baseline run (ideas 16 & 18).

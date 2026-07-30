@@ -18,8 +18,9 @@
   - **Dialogue** (продолжительные диалоги с anti-convergence): `model_debate` / `model_panel` / `model_socratic` + `dialogue_continue/fork/status/result/cancel/list_sessions`. Все starter-tool'ы async-only (5-50 мин). Hard cap rounds=20, активных сессий=20. `dialogue_continue` возобновляет сессию в фазе `done` **или** `interrupted`.
 - `claude-code-router/` — HTTP-прокси `ccr` (npm `@musistudio/claude-code-router` ставится глобально; в репо — только `config.example.json` + `custom_router.js`).
 - `claude-agent-server/` — обёртка `claude -p` в OpenAI-compatible API на :8765.
-- `codex-agent-server/` — обёртка `codex exec` в OpenAI-compatible API на :8766. Два режима: read-only (дефолт, чистый чат) и workspace-write (агент правит файлы); выбирается именем модели (`gpt-5.5` vs `gpt-5.5-agent`) или полем `sandbox` в body, `tools` форсят read-only.
+- `codex-agent-server/` — обёртка `codex exec` в OpenAI-compatible API на :8766. Два режима: read-only (дефолт, чистый чат) и workspace-write (агент правит файлы); выбирается именем модели (`gpt-5.6-sol` vs `gpt-5.6-sol-agent`) или полем `sandbox` в body, `tools` форсят read-only.
 - `bench/` — раннер LLM-бенчмарков, пишет markdown-отчёт в корень репо.
+- `tools/model_freshness.py` — сторож свежести каталога моделей: листинги OCG/Helicone (двусторонний диф — и новые версии, и исчезнувшие id) плюс CLI-пробы `codex`/`claude` на следующие версии (у подписочных CLI листинга нет, а «модель существует» ≠ «аккаунту доступна»). Ничего не переключает — пишет P3 в `FINDINGS.md`. Weekly-таск `ModelFreshnessCheck`, вс 05:00.
 
 ## Точки входа
 
@@ -29,6 +30,7 @@
 
 - **Удалённые пакеты:** `mcp-deepseek` и `mcp-minimax` удалены. Tool refs `mcp__deepseek-helper__*` и `mcp__minimax-helper__*` больше не существуют — использовать `mcp__council__model_ask` с нужным `model_id` из `models.CATALOG`.
 - **`minimax-direct` отключён** в `CATALOG` (billing off) — не передавать как `model_id` в `model_ask`, выпадет ошибка.
+- **Смена модели в каталоге — не только про номер версии, но и про квоту.** На подписке OCG у `kimi-k3` 2× usage и 220 запросов/5ч (у `kimi-k2.7-code` — 1150), у `grok-4.5` — 120. Для рутинных/цикличных вызовов брать дешёвые слоты (`deepseek-flash`), дорогие оставлять совету. У Codex CLI имя модели зависит от типа аккаунта: на подписке ChatGPT работает `gpt-5.6-sol`, голые `gpt-5.6`/`gpt-5.6-codex` → 400.
 - **`claude-agent-server`: tool calling — три состояния** (не «просто не работает»): native Anthropic tool use — нет; эмулируемый через prompt-injection — есть, best-effort (надёжность ≈7/12 на `test_server.py`); для критичных workflow — только text/chat completions. Детали и измеренная надёжность — `claude-agent-server/README.md`.
 - **`codex-agent-server` на Windows:** `codex` резолвится через `shutil.which()` → `codex.CMD`. CreateProcess не дописывает PATHEXT, поэтому `subprocess.run(["codex", ...])` падает с FileNotFoundError — нельзя звать по короткому имени. Агентный `workspace-write` реально пишет файлы: `workdir` обязан быть внутри `CODEX_AGENT_WORKDIR_ROOT` (иначе 400). Глобальные MCP Codex гасятся `-c mcp_servers={}` на каждом вызове.
 - **`mcp-council/dialogue/`: три не-очевидных грабли:**

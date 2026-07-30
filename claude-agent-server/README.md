@@ -72,7 +72,7 @@ curl -X POST http://localhost:8765/v1/chat/completions \
 {
   "id": "chatcmpl-abc123",
   "object": "chat.completion",
-  "model": "claude-opus-4-8",
+  "model": "claude-opus-5",
   "choices": [{
     "index": 0,
     "message": {"role": "assistant", "content": "Привет, мир"},
@@ -84,7 +84,7 @@ curl -X POST http://localhost:8765/v1/chat/completions \
 
 Параметры в body:
 - `messages` (required) — массив `{role, content}`. Роли: `system`, `user`, `assistant`, `tool`
-- `model` (optional) — `claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` (см. `/v1/models`)
+- `model` (optional) — `claude-opus-5`, `claude-sonnet-5`, `claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` (см. `/v1/models`)
 - `tools` (optional) — массив определений функций в OpenAI-формате; вызовы парсятся из `<tool_call>` блоков ответа
 - `timeout` (optional) — таймаут в секундах (default 300)
 - `stream` (optional) — если `true`, ответ отдаётся как OpenAI SSE (`text/event-stream`, чанки `chat.completion.chunk` + `data: [DONE]`). Псевдо-стрим: CLI возвращает ответ целиком, сервер режет его на чанки для совместимости (Open WebUI)
@@ -102,7 +102,7 @@ curl http://localhost:8765/v1/models
 ```bash
 curl http://localhost:8765/health
 # без токена: {"status": "ok"}
-# с токеном:  {"status": "ok", "model": "claude-opus-4-8", "default_profile": "chat", "profiles": [...], "uptime": 3600, "security": "authenticated", "cache": {...}}
+# с токеном:  {"status": "ok", "model": "claude-opus-5", "default_profile": "chat", "profiles": [...], "uptime": 3600, "security": "authenticated", "cache": {...}}
 ```
 
 ### `GET /ready` — readiness probe
@@ -128,7 +128,7 @@ curl -H "Authorization: Bearer $CLAUDE_AGENT_TOKEN" http://localhost:8765/metric
 
 | Переменная | По умолчанию | Описание |
 |---|---|---|
-| `CLAUDE_AGENT_MODEL` | `claude-opus-4-8` | Модель по умолчанию |
+| `CLAUDE_AGENT_MODEL` | `claude-opus-5` | Модель по умолчанию |
 | `CLAUDE_AGENT_PORT` | `8765` | Порт сервера |
 | `CLAUDE_AGENT_TOKEN` | _(обязателен)_ | Bearer-токен. Сервер **не стартует** без него (exit 2). Обязателен в `Authorization: Bearer <token>` на всех endpoints кроме `/health`. |
 | `CLAUDE_AGENT_CACHE` | `1` | Включить response cache (`0`/`false` — выключить) |
@@ -176,7 +176,7 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:8765/v1", api_key="unused")
 resp = client.chat.completions.create(
-    model="claude-opus-4-8",
+    model="claude-opus-5",
     messages=[{"role": "user", "content": "Привет"}],
 )
 print(resp.choices[0].message.content)
@@ -220,7 +220,7 @@ repair-retry. `content` сообщений поддерживается как �
 
 ```python
 client.chat.completions.create(
-    model="claude-opus-4-8",
+    model="claude-opus-5",
     messages=[{"role": "user", "content": "Какая погода в Москве?"}],
     tools=[{
         "type": "function",

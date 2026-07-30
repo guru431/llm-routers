@@ -30,8 +30,9 @@
     - **`dialogue_status/result/cancel/list_sessions`** — наблюдение/выгрузка/отмена. Все 3 starter tool'а async-only (длительность 5-50 мин). Hard cap rounds=20, активных сессий=20.
 - `claude-code-router/` — HTTP-прокси `ccr` (npm `@musistudio/claude-code-router`, ставится глобально). В репо живут `config.example.json` (template без ключей) + `custom_router.js` (симлинк в `~/.claude-code-router/`). Реальный `config.json` с ключами — только в `~/.claude-code-router/`, в git не попадает. См. [claude-code-router/README.md](claude-code-router/README.md) для деталей привязки и потоков запросов.
 - `claude-agent-server/` — обёртка `claude -p` CLI в OpenAI-compatible HTTP API (port 8765). Превращает подписку Claude Max/Pro в локальный endpoint для n8n, чат-ботов и любых OpenAI-клиентов. Опционально — boot-task в Windows Task Scheduler (`install_task.ps1`). **Tool calling — три состояния:** (1) native Anthropic tool use — **нет**; (2) эмулируемый через prompt-injection — **есть, но best-effort** (описания функций в system-prompt, парсинг `<tool_call>`, измеренная надёжность ≈7/12 на `test_server.py`); (3) для критичных workflow — только text/chat completions или другой backend. Источник истины по надёжности — [claude-agent-server/README.md](claude-agent-server/README.md).
-- `codex-agent-server/` — обёртка `codex exec` CLI в OpenAI-compatible HTTP API (port 8766). Превращает подписку ChatGPT/Codex в локальный endpoint. Один API, два режима: **read-only** (чистый чат — дефолт) и **workspace-write** (агент правит файлы). Режим выбирается именем модели (`gpt-5.5` vs `gpt-5.5-agent`) или полем `sandbox` в body; `tools` всегда форсят read-only. Для агентного — containment-проверка `workdir` внутри `CODEX_AGENT_WORKDIR_ROOT`. Дизайн-спека — локально в `docs/superpowers/specs/2026-05-31-codex-agent-server-design.md` (каталог `docs/` в `.gitignore` — в публичный клон не попадает). См. [codex-agent-server/README.md](codex-agent-server/README.md).
+- `codex-agent-server/` — обёртка `codex exec` CLI в OpenAI-compatible HTTP API (port 8766). Превращает подписку ChatGPT/Codex в локальный endpoint. Один API, два режима: **read-only** (чистый чат — дефолт) и **workspace-write** (агент правит файлы). Режим выбирается именем модели (`gpt-5.6-sol` vs `gpt-5.6-sol-agent`) или полем `sandbox` в body; `tools` всегда форсят read-only. Для агентного — containment-проверка `workdir` внутри `CODEX_AGENT_WORKDIR_ROOT`. Дизайн-спека — локально в `docs/superpowers/specs/2026-05-31-codex-agent-server-design.md` (каталог `docs/` в `.gitignore` — в публичный клон не попадает). См. [codex-agent-server/README.md](codex-agent-server/README.md).
 - `bench/` — раннер LLM-бенчмарков (`run.py`, `judge.py`, `report.py`, `models.json`, `prompts/`, `results/`). **Куда пишется отчёт:** живой документ с addendum'ами хранится ВНЕ этого репозитория; путь задаётся `report.py --out <файл>` или env `BENCH_REPORT_OUT`. Дефолтный путь (корень репо) gitignored, чтобы генерация не оставляла в ПУБЛИЧНОМ репо вторую, мгновенно расходящуюся копию. **Lifecycle прогона:** `manifest.json` несёт `status` (`started|completed|failed`) + `expected_cells`/`completed_cells`; `results/runs/latest.txt` = последний ЗАПУЩЕННЫЙ прогон (может быть частичным), `latest-complete.txt` = последний ДОШЕДШИЙ до конца. `judge.py`/`report.py` по умолчанию берут complete-указатель и громко предупреждают, если считают неполную матрицу. Прерванный прогон дособирается `python run.py --resume <run-id>` (не новый UUID). Каждый повтор `--repeats` судится отдельно. **CI качества** — иерархический bootstrap ТОЙ ЖЕ величины, что в колонке Q (среднее по задачам): ресемпл задач, внутри задачи — ресемпл повторов; раньше показывался перцентильный CI медианы плоского пула, где межзадачная дисперсия доминировала. Baseline для `⚠️REGRESSION` считается тем же кодом, что и текущий прогон (`report.task_score_groups`), иначе флаг срабатывал от смены числа повторов. Состав judge-панели пишется в `manifest.json::judge_panel` при `judge.py` и оттуда попадает в шапку отчёта и в метку self-judge `†` — раньше отчёт всегда называл легаси-судью. Ground truth для детерминированного гейта живёт в `prompts/tasks.json::expected` (значения, а не только форма ответа).
+- `tools/model_freshness.py` — сторож свежести каталога (см. «Отслеживание новых моделей» ниже).
 
 ## Реестр моделей (`mcp-council/models.py`)
 
@@ -40,16 +41,28 @@
 | id | model | назначение |
 |---|---|---|
 | `glm` | glm-5.2 | council member (OCG) |
-| `kimi` | kimi-k2.7-code | council member (OCG) |
+| `kimi` | kimi-k3 | council member (OCG) |
 | `deepseek-pro` | deepseek-v4-pro | council member (OCG) |
-| `qwen` | qwen3.6-plus | council member (OCG) |
+| `qwen` | qwen3.7-plus | council member (OCG) |
 | `minimax` | minimax-m3 | council member (OCG) |
 | `gemini` | gemini-3.1-pro-preview | council member (Helicone Gateway) |
-| `codex` | gpt-5.5 | council member (codex-agent-server :8766, read-only) |
+| `codex` | gpt-5.6-sol | council member (codex-agent-server :8766, read-only) |
 | `deepseek-flash` | deepseek-v4-flash | routine worker (model_ask only) |
 | `minimax-direct` | abab7-chat-preview | disabled (billing off) |
 
 `COUNCIL_DEFAULT` = первые 7 (без flash и direct). При `models=None` в `council_ask` совещание идёт ровно по этому списку. **`codex` требует запущенного `codex-agent-server` на :8766** — если он недоступен, member падает с `CouncilHTTPError` и совет продолжает остальными.
+
+## Отслеживание новых моделей (`tools/model_freshness.py`)
+
+Модели обновляются чаще, чем кто-либо перечитывает `models.py`: за месяц вышли Kimi K3, GPT-5.6 и Opus 5, а конфиги продолжали звать k2.7-code / gpt-5.5 / opus-4-8. Сторож — [`tools/model_freshness.py`](tools/model_freshness.py); на рабочей машине он повешен на weekly-таск `ModelFreshnessCheck` (вс 05:00) через локальный реестр cron-задач, а не отдельным `schtasks`.
+
+Проверка идёт двумя разными способами, потому что провайдеры разные:
+- **С листингом** (`GET /v1/models`) — OpenCode Go и Helicone Gateway. Здесь инвентарь известен точно, поэтому диф двусторонний: и новые версии, и **исчезнувшие** id (у OCG легаси-поколения выключают молча — `mimo-v2-pro`/`mimo-v2-omni`/`hy3-preview` уже отдают upstream-ошибку). Сигнал «новое семейство» включён только для OCG (`LISTING_PROVIDERS[...]["new_families"]`): там выдача = каталог подписки, а Helicone — маркетплейс на 111 моделей, где это дало бы 100 строк шума за прогон.
+- **Без листинга** (Codex CLI, Claude CLI — подписочные, каталог наружу не отдают) — **проба**: генерятся правдоподобные следующие имена версий и делается самый дешёвый вызов. Успех = модель есть **и у аккаунта к ней доступ**; это сильнее листинга, потому что `gpt-5.6` существует, но на подписке ChatGPT отвечает 400, а работает `gpt-5.6-sol`.
+
+Скрипт ничего не переключает сам — только пишет P3-запись в `FINDINGS.md` (дедуп через `logs/model_freshness_state.json`, отчёт в `logs/model_freshness.log`). Смена модели совета меняет состав голосов и расход квоты, и это решение человека: у `kimi-k3`, например, **2× usage и 220 запросов/5ч** против 1150 у `kimi-k2.7-code`, а у `grok-4.5` — 120. Поэтому при апдейте каталога сверяйтесь с лимитами подписки, а не только с номером версии.
+
+Ручной прогон: `python tools/model_freshness.py` (полный, с CLI-пробами — минуты) или `--no-probe` (только листинги, секунды).
 
 ## Принципы
 
