@@ -170,8 +170,18 @@ PROFILES = ("chat", "research", "agent")
 # `gpt-5.6`/`gpt-5.6-codex` → 400 "not supported when using Codex with a ChatGPT
 # account"). `gpt-5.5` остаётся в whitelist для уже настроенных клиентов (CCR,
 # bench/models.json), но дефолтом с 2026-07-30 идёт 5.6.
+#
+# `gpt-5.6-terra` — второй профиль того же поколения; добавлен в whitelist, но
+# НЕ дефолтом: он нужен адресно (переводческий консилиум проекта translate
+# обращается к нему по явному id), а менять глобальный дефолт ради одного
+# потребителя значит переключить всех остальных без их ведома.
+#
+# Обе модели 5.6 требуют Codex CLI ≥ 0.146: на 0.137 бэкенд отвечает
+# 400 "requires a newer version of Codex" — причём и на sol тоже, то есть
+# старый CLI ломает не отдельную модель, а весь сервер.
 DEFAULT_MODEL = os.getenv("CODEX_AGENT_MODEL", "gpt-5.6-sol")
-BASE_MODELS = [m.strip() for m in os.getenv("CODEX_AGENT_MODELS", "gpt-5.6-sol,gpt-5.5").split(",") if m.strip()]
+BASE_MODELS = [m.strip() for m in os.getenv(
+    "CODEX_AGENT_MODELS", "gpt-5.6-sol,gpt-5.6-terra,gpt-5.5").split(",") if m.strip()]
 if DEFAULT_MODEL not in BASE_MODELS:
     BASE_MODELS.insert(0, DEFAULT_MODEL)
 

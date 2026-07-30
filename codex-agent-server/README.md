@@ -112,7 +112,7 @@ curl -X POST http://localhost:8766/v1/chat/completions \
 
 Параметры body:
 - `messages` (required) — массив `{role, content}` (роли `system`/`user`/`assistant`/`tool`).
-- `model` (optional) — `gpt-5.6-sol` или `gpt-5.6-sol-agent` (см. `/v1/models`). Имя модели — то, что принимает Codex CLI **на подписке ChatGPT**: голые `gpt-5.6` / `gpt-5.6-codex` отвечают 400 «not supported when using Codex with a ChatGPT account». Предыдущий дефолт `gpt-5.5` остаётся в whitelist.
+- `model` (optional) — `gpt-5.6-sol`, `gpt-5.6-terra` или их `-agent`-варианты (см. `/v1/models`). Имя модели — то, что принимает Codex CLI **на подписке ChatGPT**: голые `gpt-5.6` / `gpt-5.6-codex` отвечают 400 «not supported when using Codex with a ChatGPT account». Предыдущий дефолт `gpt-5.5` остаётся в whitelist.
 - `sandbox` (optional) — `read-only` | `workspace-write` (приоритет 2).
 - `workdir` / `cwd` (optional) — рабочий корень для агентного режима (внутри `CODEX_AGENT_WORKDIR_ROOT`).
 - `tools` (optional) — OpenAI-функции; форсят read-only, парсятся из `<tool_call>` блоков.
@@ -169,7 +169,7 @@ workspace-write требует заданного `CODEX_AGENT_AGENT_TOKEN` (и�
 | Переменная | По умолчанию | Описание |
 |---|---|---|
 | `CODEX_AGENT_MODEL` | `gpt-5.6-sol` | модель по умолчанию |
-| `CODEX_AGENT_MODELS` | `gpt-5.6-sol,gpt-5.5` | базовые id для whitelist (через запятую) |
+| `CODEX_AGENT_MODELS` | `gpt-5.6-sol,gpt-5.6-terra,gpt-5.5` | базовые id для whitelist (через запятую) |
 | `CODEX_AGENT_DEFAULT_SANDBOX` | `read-only` | дефолт режима |
 | `CODEX_AGENT_PORT` | `8766` | порт |
 | `CODEX_AGENT_HOST` | `127.0.0.1` | bind-адрес |
