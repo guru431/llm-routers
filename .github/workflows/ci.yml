@@ -14,8 +14,20 @@ permissions:
 
 jobs:
   tests:
-    name: Quick test suite
+    name: Quick test suite (mcp ${{ matrix.mcp-major }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # server.py supports both SDK majors (`mcp.server.fastmcp` on 1.x,
+      # `mcp.server.mcpserver` on 2.x). Resolution alone would only ever install
+      # the newest one, so the other half of that claim would rot untested —
+      # which is how 2.0.0 broke CI in the first place. Pin each explicitly.
+      matrix:
+        include:
+          - mcp-major: "1.x"
+            mcp-spec: "mcp[cli]>=1,<2"
+          - mcp-major: "2.x"
+            mcp-spec: "mcp[cli]>=2,<3"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -26,6 +38,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e "mcp-council[dev]"
           pip install httpx
+          pip install "${{ matrix.mcp-spec }}"
       - name: Run canonical quick tests
         run: python run_tests.py --quick
 

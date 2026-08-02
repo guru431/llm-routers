@@ -4,14 +4,15 @@ version = "0.1.0"
 description = "MCP server: Karpathy 3-stage council of 7 LLMs (GLM/Kimi/DeepSeek/Qwen/MiniMax/Gemini/Codex). Returns materials for synthesis by main agent."
 requires-python = ">=3.10"
 dependencies = [
-    # ВЕРХНЯЯ ГРАНИЦА ОБЯЗАТЕЛЬНА. `mcp` 2.0.0 (PyPI, конец 2026-07) выкинул
-    # `mcp.server.fastmcp` — на его месте `mcp.server.mcpserver`. server.py
-    # импортирует `from mcp.server.fastmcp import FastMCP`, поэтому на 2.x весь
-    # сьют падает с ModuleNotFoundError ещё на импорте. Спека `>=1.0` без потолка
-    # это и допустила: локально стоял 1.26.0 и всё было зелёным, а CI ставил
-    # зависимости заново и приносил 2.0.0. Снимать потолок только вместе с
-    # миграцией на API 2.x.
-    "mcp[cli]>=1.0,<2",
+    # ПОТОЛОК ПО МАЖОРУ ОБЯЗАТЕЛЕН — спека `>=1.0` без него уже стоила зелёного
+    # CI: `mcp` 2.0.0 (PyPI, конец 2026-07) переименовал `mcp.server.fastmcp` в
+    # `mcp.server.mcpserver`, локально стоял 1.26.0 и всё было зелёным, а CI ставил
+    # зависимости заново и приносил 2.0.0 → ModuleNotFoundError ещё на импорте.
+    # 1.x и 2.x поддерживаются оба (server.py пробует оба имени модуля): у 2.x
+    # нельзя было остаться на 1.x без апстрим-фиксов, а выкинуть 1.x нельзя, пока
+    # тот же интерпретатор обслуживает другие проекты на `mcp.server.fastmcp`.
+    # Оба прогоняются в CI. Ceiling двигать вместе с проверкой на новом мажоре.
+    "mcp[cli]>=1.0,<3",
     "httpx>=0.27",
 ]
 

@@ -18,7 +18,16 @@ import time
 from pathlib import Path
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+# mcp 2.0 renamed the ergonomic server class: `mcp.server.fastmcp.FastMCP` →
+# `mcp.server.mcpserver.MCPServer`. Everything this module uses of it — the
+# constructor, `@tool()`, `_tool_manager.list_tools()`, `run()` — is identical on
+# both, so accept either instead of pinning to 1.x. Pinning is what the ceiling
+# in pyproject.toml used to be for, and it froze us out of upstream fixes; a hard
+# cut to 2.x would instead break the interpreter shared with projects still on 1.x.
+try:  # mcp >= 2.0
+    from mcp.server.mcpserver import MCPServer as _ServerClass
+except ImportError:  # mcp 1.x
+    from mcp.server.fastmcp import FastMCP as _ServerClass
 
 from models import resolve_member, resolve_members, resolve_preset
 from council import _aggregate as _aggregate_helper  # noqa: F401 — re-exported for tests
@@ -72,7 +81,7 @@ def _make_budget(
     )
 
 
-mcp = FastMCP("mcp-council")
+mcp = _ServerClass("mcp-council")
 
 
 def _resolve_models_arg(
@@ -2467,7 +2476,7 @@ def _run_startup_recovery() -> None:
         )
 
 
-# Run recovery for every launch path (`python server.py`, `fastmcp run server.py`,
+# Run recovery for every launch path (`python server.py`, `mcp run server.py`,
 # `mcp dev server.py`) — not just __main__, which a non-direct launcher never
 # triggers. Skipped under pytest so importing the module for tests has no disk
 # side effects on the real logs/ directories.
